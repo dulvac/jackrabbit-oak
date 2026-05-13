@@ -1,0 +1,46 @@
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "enableAllProjectMcpServers": true,
+  "permissions": {
+    "allow": [
+      "Edit",
+      "Write",
+      "Edit(.claude/**)",
+      "Edit(AGENTS.md)",
+      "Edit(CLAUDE.md)",
+      "Edit(PROJECT.md)",
+      "Edit(.mcp.json)",
+      "Write(.claude/**)",
+      "Write(AGENTS.md)",
+      "Write(CLAUDE.md)",
+      "Write(PROJECT.md)",
+      "Write(.mcp.json)",
+      "Bash(mvn:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git blame:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh auth status:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "grep -qE '\\.claude/|CLAUDE\\.md|AGENTS\\.md|\\.mcp\\.json|PROJECT\\.md' && echo 'AI config file — involve Eliza (delegate or review) per project protocol.' || true"
+          }
+        ]
+      }
+    ]
+  },
+  "teammateMode": "auto"
+}
