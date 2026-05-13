@@ -51,11 +51,15 @@ Exercises the `ThreadLocal<Map<String,List<AuditEvent>>>` buffer, its lifecycle 
 Lives in `oak-core/src/test/java/org/apache/jackrabbit/oak/security/audit/WhiteboardAuditEventListenerRegistryTest.java`.
 Uses `org.apache.jackrabbit.oak.spi.whiteboard.DefaultWhiteboard` (real impl, no mocks) per Oak convention — `DefaultWhiteboard` is already used in `oak-core` tests.
 
-- `WhiteboardAuditEventListenerRegistryTest.hasListenersFor_noListeners_returnsFalse` — empty whiteboard; `hasListenersFor("security")` is `false`.
-- `WhiteboardAuditEventListenerRegistryTest.hasListenersFor_listenerRegisteredForDomain_returnsTrue` — register a listener whose `getDomain()` returns `"security"`; `hasListenersFor("security")` is `true`.
-- `WhiteboardAuditEventListenerRegistryTest.hasListenersFor_listenerForOtherDomain_returnsFalse` — register listener for domain `"replication"`; `hasListenersFor("security")` is `false`.
-- `WhiteboardAuditEventListenerRegistryTest.hasListenersFor_listenerDeregistered_returnsFalse` — register listener; `Registration.unregister()`; `hasListenersFor("security")` flips back to `false` (cache invalidation).
-- `WhiteboardAuditEventListenerRegistryTest.hasListenersFor_multipleListenersSameDomain_returnsTrue` — register two listeners both for `"security"`; `hasListenersFor("security")` is `true` after both; remains `true` after deregistering only one; flips `false` after deregistering both.
+- `WhiteboardAuditEventListenerRegistryTest.hasListenerFor_noListeners_returnsFalse` — empty whiteboard; `hasListenerFor("security")` is `false`.
+- `WhiteboardAuditEventListenerRegistryTest.hasListenerFor_listenerRegisteredAfterFirstCall_returnsTrue` — call `hasListenerFor("security")` first (with no listener) → returns `false`. THEN register a listener for `"security"`. Re-call `hasListenerFor("security")` → returns `true`. This is the smoking-gun test that pins live lookup, not stale-cache behavior.
+- `WhiteboardAuditEventListenerRegistryTest.hasListenerFor_listenerRegisteredForDomain_returnsTrue` — register a listener whose `getDomain()` returns `"security"`; `hasListenerFor("security")` is `true`.
+- `WhiteboardAuditEventListenerRegistryTest.hasListenerFor_listenerForOtherDomain_returnsFalse` — register listener for domain `"replication"`; `hasListenerFor("security")` is `false`.
+- `WhiteboardAuditEventListenerRegistryTest.hasListenerFor_listenerDeregistered_returnsFalse` — register listener; `Registration.unregister()`; `hasListenerFor("security")` returns `false` (live state, not cached).
+- `WhiteboardAuditEventListenerRegistryTest.hasListenerFor_multipleListenersSameDomain_returnsTrue` — register two listeners both for `"security"`; `hasListenerFor("security")` is `true` after both; remains `true` after deregistering only one; returns `false` after deregistering both.
+- `WhiteboardAuditEventListenerRegistryTest.hasAnyListener_emptyWhiteboard_returnsFalse` — initial state; `hasAnyListener()` is `false`.
+- `WhiteboardAuditEventListenerRegistryTest.hasAnyListener_listenerRegistered_returnsTrue` — register listener (any domain); `hasAnyListener()` is `true`.
+- `WhiteboardAuditEventListenerRegistryTest.hasAnyListener_listenerDeregistered_returnsFalse` — register, then deregister; `hasAnyListener()` is `false`.
 - `WhiteboardAuditEventListenerRegistryTest.dispatch_singleListener_invokedOnce` — register one listener, dispatch a 1-event list for its domain; listener `onCommit` called exactly once with the same list.
 - `WhiteboardAuditEventListenerRegistryTest.dispatch_multipleListenersSameDomain_allInvoked` — register two listeners; dispatch; both receive the same event list (no second copy semantics — list is immutable view).
 - `WhiteboardAuditEventListenerRegistryTest.dispatch_listenersForOtherDomains_notInvoked` — register listener for `"security"` and `"replication"`; dispatch for `"security"` only; replication listener never called.
@@ -64,9 +68,9 @@ Uses `org.apache.jackrabbit.oak.spi.whiteboard.DefaultWhiteboard` (real impl, no
 - `WhiteboardAuditEventListenerRegistryTest.dispatch_listenerThrowsError_otherListenersStillInvoked` — same with `Error` (e.g., `OutOfMemoryError`); listener isolation must not let an `Error` from one listener bubble up and abort the dispatch chain mid-commit. Catch `Throwable`, log, continue.
 - `WhiteboardAuditEventListenerRegistryTest.dispatch_emptyEventList_listenersNotInvoked` — call dispatch with `events.isEmpty()`; no listener `onCommit` invocation (no point waking them).
 - `WhiteboardAuditEventListenerRegistryTest.dispatch_nullDomainFromListener_skipped` — defensive: a misbehaving listener returning `getDomain() == null` must be skipped (not crash the dispatcher), and a warning logged once.
-- `WhiteboardAuditEventListenerRegistryTest.cache_concurrentRegistrationAndCheck_consistent` — concurrency: 8 threads alternating `register`/`unregister`/`hasListenersFor`; final state matches the actual whiteboard contents (use `CountDownLatch` + asserts after).
+- `WhiteboardAuditEventListenerRegistryTest.concurrentRegistrationAndCheck_consistent` — concurrency: 8 threads alternating `register`/`unregister`/`hasListenerFor`/`getListeners`; final state matches the actual whiteboard contents (use `CountDownLatch` + asserts after). Live-lookup correctness under load — no stale-cache reads possible since there is no cache.
 
-**Coverage:** 100%. The `hasListenersFor` cache is the single most performance-critical piece — cache invalidation tests are non-negotiable.
+**Coverage:** 100%. The `hasListenerFor` live-lookup behavior is the single most correctness-critical piece — the `hasListenerFor_listenerRegisteredAfterFirstCall_returnsTrue` test pins the no-stale-cache invariant.
 
 ### 1.3 `SnapshotAuditBufferHookTest`
 
@@ -80,7 +84,7 @@ Uses `MemoryNodeStore` per Oak convention for hook tests (e.g., `PermissionHookT
 - `SnapshotAuditBufferHookTest.processCommit_bufferEmpty_noOp` — buffer has no entry for sessionId; hook runs; `CommitContext` has no audit key set; assert the hook returns `after` unchanged.
 - `SnapshotAuditBufferHookTest.processCommit_calledTwiceSameCommit_idempotent` — invoke hook twice with same `CommitInfo` (simulates merge retry where validators fail and merge restarts). First call writes events to `CommitContext`. After `ResetCommitAttributeHook` resets `CommitContext` between attempts, second call still sees the same events in the buffer (non-destructive!) and re-writes the same payload to `CommitContext`. Listener-observable behavior is unchanged. Test asserts: `peek` returns events both before and after each invocation, and `CommitContext` payload after the second call matches the payload after the first.
 - `SnapshotAuditBufferHookTest.processCommit_toggleDisabled_noOp` — `Feature` reports disabled; hook short-circuits before touching `AuditBuffer` (verify via spy that `AuditBuffer.peek` was not called).
-- `SnapshotAuditBufferHookTest.processCommit_noListenersForAnyDomain_skipsCommitContextWrite` — toggle on, but `WhiteboardAuditEventListenerRegistry.hasListenersForAnyDomain()` is false; hook short-circuits BEFORE peeking the buffer. Buffer is **not** drained either — `MutableRoot.commit`'s normal lifecycle handles cleanup on the next refresh/failed-commit, and on a successful commit with no listener Dispatch's `finally`-drain still runs (verified in §1.4). This avoids paying the peek cost in the no-listener fast path.
+- `SnapshotAuditBufferHookTest.processCommit_noListenersForAnyDomain_skipsCommitContextWrite` — toggle on, but `WhiteboardAuditEventListenerRegistry.hasAnyListener()` is false; hook short-circuits BEFORE peeking the buffer. Buffer is **not** drained either — `MutableRoot.commit`'s normal lifecycle handles cleanup on the next refresh/failed-commit, and on a successful commit with no listener Dispatch's `finally`-drain still runs (verified in §1.4). This avoids paying the peek cost in the no-listener fast path.
 - `SnapshotAuditBufferHookTest.processCommit_commitContextMissing_logsAndContinues` — defensive: caller forgot to install a `CommitContext` (shouldn't happen — `MutableRoot` always installs — but assert hook doesn't NPE; logs at WARN once).
 - `SnapshotAuditBufferHookTest.processCommit_eventListIsImmutableInCommitContext` — read the stored list from `CommitContext`; verify `add()` throws `UnsupportedOperationException` (prevents the dispatch hook from mutating it under contention).
 - `SnapshotAuditBufferHookTest.processCommit_returnsAfterStateUnchanged` — hook is pure side-effect on `CommitContext`; `processCommit` must return its `after` argument identity-equal (`==`), not a rebuild.
@@ -121,7 +125,7 @@ SPI-level tests for the static façade `AuditEvents.record(Root, AuditEvent)` an
 - `AuditEventsTest.install_nullArg_restoresNoopSink` — install a real sink; record an event; install `null`; `isEnabled()` is `false`; record is no-op (verify via captured count on the previously installed sink — count unchanged after `install(null)`).
 - `AuditEventsTest.install_replacesExistingSink` — install sink A, install sink B, record event; only B's count incremented (A no longer receives). Pins the swap-not-stack semantic.
 - `AuditEventsTest.record_toggleDisabled_noOp` — sink installed but toggle off; `AuditEvents.record(root, event)`; verify `root.getContentSession()` not called, no buffer append.
-- `AuditEventsTest.record_toggleEnabledNoListenerForDomain_noOp` — toggle on, but the sink's `hasListenersFor(event.getDomain())` short-circuit returns `false`; verify buffer not touched (no allocation cost in this case).
+- `AuditEventsTest.record_toggleEnabledNoListenerForDomain_noOp` — toggle on, but the sink's `hasListenerFor(event.getDomain())` short-circuit returns `false`; verify buffer not touched (no allocation cost in this case).
 - `AuditEventsTest.record_toggleEnabledListenerPresent_appendedToBuffer` — toggle on, sink reports listener for `"security"`; record a `MemberAddedEvent`; verify `AuditBuffer.append(sessionId, event)` invoked with the session-derived id from `root.getContentSession().toString()`.
 - `AuditEventsTest.record_rootNotInstanceOfAuditEventAware_noOp` — mock `Root` that does **not** implement the marker; `record` short-circuits gracefully (no `ClassCastException`). Confirms the design's safety net for unusual Root impls (e.g., subclasses in tests).
 - `AuditEventsTest.record_nullEvent_throwsNPE` — defensive: `record(root, null)`.
@@ -292,7 +296,7 @@ mvn -pl oak-benchmarks -DskipTests=false exec:java \
 
 ### 4.1 Modes (CLI flags / system properties)
 - `audit.mode=disabled` — feature toggle off. The hot path includes the single volatile read inside `AuditEvents.isEnabled()` and nothing else.
-- `audit.mode=enabled-no-listener` — toggle on, `AuditConfiguration` deployed, **no listener** registered on the whiteboard. Hot path: toggle check + `hasListenersFor` cache hit + return. Hooks installed but short-circuit.
+- `audit.mode=enabled-no-listener` — toggle on, `AuditConfiguration` deployed, **no listener** registered on the whiteboard. Hot path: toggle check + live `Tracker.getServices()` returns `Collections.emptyList()` + `isEmpty()` short-circuit + return. Hooks installed but short-circuit.
 - `audit.mode=enabled-with-listener` — toggle on, `AuditConfiguration` deployed, 1 `RecordingAuditEventListener` registered. Workload generates 100 events per `save()` burst.
 
 ### 4.2 Workload — membership churn

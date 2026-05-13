@@ -27,7 +27,7 @@ This directory holds the Java skeleton files and unified diffs for the audit-spi
 |------|------|
 | `AuditConfigurationImpl.java` | OSGi DS `@Component(service = {AuditConfiguration.class, SecurityConfiguration.class})`. Owns the toggle, buffer, registry, sink installation. |
 | `AuditBuffer.java` | `ThreadLocal<Map<sessionId, List<AuditEvent>>>`, lazy ArrayList alloc. `peek` + `drain` + `isAllocatedOnCurrentThread` (test). Implements `AuditBufferLifecycle.Listener`. |
-| `WhiteboardAuditEventListenerRegistry.java` | `AbstractServiceTracker<AuditEventListener>` + cached `volatile Set<String> activeDomains` + stable rank sort. |
+| `WhiteboardAuditEventListenerRegistry.java` | `AbstractServiceTracker<AuditEventListener>`. `hasListenerFor(domain)` and `hasAnyListener()` linear-scan live `getServices()` — no cached domain set, since `Tracker` exposes no add/remove notification and a cache would go stale on late listener registration. `getListeners()` applies a stable `getRank()` desc sort. |
 | `SnapshotAuditBufferHook.java` | Regular `CommitHook` — non-destructive peek into `CommitContext`. Idempotent under merge retry. |
 | `DispatchAuditEventsHook.java` | `PostValidationHook` — groups by domain, sorted-rank dispatch, per-listener try/catch. Sole drain authority (`finally` block). |
 | `NoOpAuditEventListener.java` | TRACE-only listener; not auto-registered. Reference example. |
@@ -64,6 +64,6 @@ Bulk membership operations emit `MembersAddedBulkEvent`/`MembersRemovedBulkEvent
 - OSGi DS annotations on `AuditConfigurationImpl` (`@Component`, `@Activate`, `@Deactivate`, `@Designate`).
 - SLF4J for all logging.
 - Lazy ArrayList alloc in `AuditBuffer` (null until first `record`).
-- Cached volatile `Set<String> activeDomains` in `WhiteboardAuditEventListenerRegistry`.
-- `AuditEvents.isEnabled()` is at most two volatile reads (toggle + cached listener-domain set).
+- `WhiteboardAuditEventListenerRegistry` uses live `Tracker.getServices()` lookups (no cached domain set; `Tracker` SPI has no add/remove callback, so any cache would be stale on late listener registration).
+- `AuditEvents.isEnabled()` is two volatile reads (toggle + registry). `AuditEvents.isEnabledFor(domain)` adds a live `Tracker.getServices()` lookup + linear scan; constant-time `emptyList()` short-circuit when no listener is registered.
 - No TODOs, no `UnsupportedOperationException`.

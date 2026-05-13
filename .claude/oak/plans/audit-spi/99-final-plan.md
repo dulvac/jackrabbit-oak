@@ -71,7 +71,7 @@ Listeners register via the Oak Whiteboard. v1 ships with the `"security"` domain
 | Listener ordering | `AuditEventListener.getRank()` (default 0); explicit stable sort in `WhiteboardAuditEventListenerRegistry.dispatch()` — **Whiteboard ranking is NOT portable**. `DefaultWhiteboard.java:35-64` is unsorted; `OsgiWhiteboard.java:181-194` is sorted; tests would diverge from production without explicit sort. | shannon §1, `01-architecture.md` §1 |
 | Prior art | None — OAK-2516 was an SLF4J logger, not an SPI. Greenfield namespace. Avoid the logger name `org.apache.jackrabbit.oak.audit` to prevent collision with existing AEM/Sling dashboards. | shannon §2 |
 | Payload contract | Non-null values via `Map.of(...)`; optional fields omitted (absent key), not sentinel; user IDs use `CommitInfo.OAK_UNKNOWN` (`"oak:unknown"`), never `""`. | `01-architecture.md` §1 ("AuditEvent.payload() contract") |
-| Hot-path API | `AuditEvents.isEnabledFor(domain)` is the canonical capture-site gate (2 volatile reads + 1 `Set.contains`); `isEnabled()` is coarse fallback for callers that don't know their domain | `01-architecture.md` §3 |
+| Hot-path API | `AuditEvents.isEnabledFor(domain)` is the canonical capture-site gate (2 volatile reads + live `Tracker.getServices()` + linear scan, constant-time via singleton `emptyList()` when no listener is registered); `isEnabled()` is the coarse fallback for callers that don't know their domain. **No registry-side cache** — would go stale because `Tracker` has no add/remove callback. | `01-architecture.md` §3 |
 | OSGi pattern | `@Component(service = {AuditConfiguration.class, SecurityConfiguration.class})` — dual registration matches `UserConfigurationImpl:78` | `01-architecture.md` §2 |
 | **Activation order** | toggle → registry → buffer → install — toggle must be initialized before publishing the buffer | `01-architecture.md` §2 |
 | **Deactivation order** | `feature.close()` FIRST (stop new captures) → `registry.stop()` → `install(null)` → `clearAll()`. **NOT reverse-of-activate** — alex's race catch: a reverse-order teardown would leave the toggle ON between `install(null)` and `feature.close()`, causing captures into a buffer about to be cleared (guaranteed-loss window). | `01-architecture.md` §2 ("Deactivation"), alex's correction |
@@ -118,7 +118,7 @@ public interface AuditEventAware { @NotNull AuditEventCollector getAuditEventCol
 
 public final class AuditEvents {
     public static boolean isEnabled() { /* 1 volatile read + AtomicBoolean.get */ }
-    public static boolean isEnabledFor(@NotNull String domain) { /* + Set.contains on cached Set<String> */ }
+    public static boolean isEnabledFor(@NotNull String domain) { /* + live Tracker.getServices() lookup + linear scan */ }
     public static void record(@NotNull Root root, @NotNull AuditEvent event) { /* … */ }
     public static void install(@Nullable Sink sink) { /* swap-on-install; null restores NOOP */ }
     public interface Sink { /* internal — implemented by AuditConfigurationImpl machinery */ }
@@ -230,7 +230,7 @@ When the audit module is not deployed (or `AuditConfigurationImpl` is unbound), 
 | Toggle off, audit deployed | 3× NOOP-via-installed-buffer (volatile + atomic-bool false → return) | Same as above (toggle reads false). |
 | Toggle on, no listener for domain | 2 no-op hooks in chain (Snapshot peek → null → return; Dispatch CommitContext-key-missing → return) | `isEnabledFor(domain)` checks cached `Set<String>` → false → return. No event allocation. |
 | Toggle on, listener subscribed, no events captured this commit | Same as above (buffer null for this sessionId). | n/a (no capture site fires unless `isEnabledFor` true). |
-| Toggle on, listener subscribed, N events captured | Snapshot: reference move (no copy). Dispatch: O(listeners × events for their domain). Listener cost is the listener's responsibility. | One `Map.of(...)` allocation per event + one `Set.contains` on cached domains. |
+| Toggle on, listener subscribed, N events captured | Snapshot: reference move (no copy). Dispatch: O(listeners × events for their domain). Listener cost is the listener's responsibility. | One `Map.of(...)` allocation per event + one live `Tracker.getServices()` lookup + linear scan over registered listeners (typical n ≤ 3). |
 
 **Pre-merge benchmark thresholds (regression vs `disabled` baseline, same fixture/run):**
 
@@ -266,7 +266,7 @@ The skeleton in `03-skeleton/` is the source of truth for file contents. The ord
 
 3. **Impl** — `oak-core/.../security/audit/`:
    1. `AuditBuffer` (ThreadLocal map, lazy alloc, `peek`/`drain`/`onCommitFailed`/`onRefresh`/`isAllocatedOnCurrentThread`).
-   2. `WhiteboardAuditEventListenerRegistry` (extends `AbstractServiceTracker`; cached `volatile Set<String> activeDomains`; `hasListenersFor(domain)`; `dispatch(events, root, info)` with explicit rank-descending sort).
+   2. `WhiteboardAuditEventListenerRegistry` (extends `AbstractServiceTracker`; `hasListenerFor(domain)` linear-scans live `Tracker.getServices()` — no cached domain set since `Tracker` exposes no add/remove notification; `dispatch(events, root, info)` with explicit rank-descending sort).
    3. `SnapshotAuditBufferHook` (regular `CommitHook`; peek-only).
    4. `DispatchAuditEventsHook` (`PostValidationHook`; drain authority in `finally`).
    5. `NoOpAuditEventListener` (registered as a default for diagnostics; TRACE only).
@@ -348,7 +348,7 @@ The skeleton in `03-skeleton/` is the source of truth for file contents. The ord
 
 ## 11. Why this design — the one-paragraph summary
 
-Capture at API call sites in oak-security via `AuditEvents.record(root, event)`; gate behind `AuditEvents.isEnabledFor(domain)` (volatile + cached Set.contains) for zero allocation in the no-listener fast path. Buffer per-session in a ThreadLocal map keyed by `sessionId`. Dispatch via two commit hooks contributed by a new `AuditConfiguration` (`SecurityConfiguration` sub-interface) — a peek-only `SnapshotAuditBufferHook` (regular `CommitHook`, runs before validators) and a `DispatchAuditEventsHook` (`PostValidationHook`, runs after validators, holds drain authority in a `finally` block). Listeners discovered via Oak's Whiteboard, sorted by explicit `getRank()` (since `DefaultWhiteboard` doesn't honor `service.ranking`). Same-thread dispatch end-to-end, so SLF4J MDC and HTTP request context are preserved without explicit propagation. Three `AuditBufferLifecycle` calls in `MutableRoot.java` (failure catch + refresh + rebase) close the buffer-cleanup loop and route to NOOP when audit isn't deployed — making the whole pipeline zero-cost when off. The `AuditConfiguration` marker interface + 7th `@Reference` slot in `SecurityProviderRegistration` (`InternalSecurityProvider`, `SecurityProviderBuilder` updated to match) makes the audit configuration first-class in Oak's security provider, deployable in OSGi without bypassing the existing security composition.
+Capture at API call sites in oak-security via `AuditEvents.record(root, event)`; gate behind `AuditEvents.isEnabledFor(domain)` (volatile + live `Tracker.getServices()` + linear scan; constant-time `Collections.emptyList()` short-circuit when no listener is registered) for zero allocation in the no-listener fast path. Buffer per-session in a ThreadLocal map keyed by `sessionId`. Dispatch via two commit hooks contributed by a new `AuditConfiguration` (`SecurityConfiguration` sub-interface) — a peek-only `SnapshotAuditBufferHook` (regular `CommitHook`, runs before validators) and a `DispatchAuditEventsHook` (`PostValidationHook`, runs after validators, holds drain authority in a `finally` block). Listeners discovered via Oak's Whiteboard, sorted by explicit `getRank()` (since `DefaultWhiteboard` doesn't honor `service.ranking`). Same-thread dispatch end-to-end, so SLF4J MDC and HTTP request context are preserved without explicit propagation. Three `AuditBufferLifecycle` calls in `MutableRoot.java` (failure catch + refresh + rebase) close the buffer-cleanup loop and route to NOOP when audit isn't deployed — making the whole pipeline zero-cost when off. The `AuditConfiguration` marker interface + 7th `@Reference` slot in `SecurityProviderRegistration` (`InternalSecurityProvider`, `SecurityProviderBuilder` updated to match) makes the audit configuration first-class in Oak's security provider, deployable in OSGi without bypassing the existing security composition.
 
 ---
 

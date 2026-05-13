@@ -385,14 +385,14 @@ public final class AuditEvents {
     public static boolean isEnabledFor(@NotNull String domain) {
         if (!isEnabled()) return false;
         WhiteboardAuditEventListenerRegistry r = registry;
-        return r != null && r.hasListenerFor(domain);            // volatile read + Set.contains() on cached Set<String>
+        return r != null && r.hasListenerFor(domain);            // volatile read + live linear scan of getServices()
     }
 
     public static void record(@NotNull Root root, @NotNull AuditEvent event) { ... }
 }
 ```
 
-`hasListenerFor(domain)` reads a cached `volatile Set<String>` rebuilt by the registry whenever the Whiteboard tracker fires an add/remove. Cost: 2 volatile reads + 1 `Set.contains(String)`. No allocation. No lock.
+`hasListenerFor(domain)` makes a live call to the underlying `Tracker.getServices()` and linear-scans for a matching `getDomain()`. **No cached domain set is held inside the registry** — the `Tracker` SPI exposes no listener add/remove notification (`oak-core-spi/.../whiteboard/Tracker.java:27-41`), so any cache would either be stale on listener arrival/departure or require polling. Cost: 2 volatile reads (for `feature` and `registry`) + one `Tracker.getServices()` lookup + a linear scan over the returned list. The `Tracker.getServices()` cost depends on the Whiteboard impl: `DefaultWhiteboard.lookup(...)` is `synchronized` and stream-collects a fresh `ArrayList` (`oak-core-spi/.../whiteboard/DefaultWhiteboard.java:54-64`); when no listener is registered for the type, it returns the singleton `Collections.emptyList()` and the linear scan is constant-time. For typical listener counts (0–3) the live scan is faster than a maintained `HashSet.contains` lookup.
 
 Capture-site discipline (mandatory pattern, enforced by Risk 3 mitigation 2):
 
@@ -407,7 +407,7 @@ if (AuditEvents.isEnabledFor(SecurityAuditDomain.NAME)) {
 
 The `if` gate runs first — when no listener is registered for `"security"`, the `MemberAddedEvent.of(...)` factory is never invoked, no event object is allocated, no `Map.of(...)` payload is built. This is the "no-listener fast path" performance contract documented in §"Performance constraints" of the design brief.
 
-Reasoning on the static volatile: this is the same fast-path discipline the `CLASSIC_MOVE` system-property pattern uses in `MutableRoot.java:142-143` (`static final boolean CLASSIC_MOVE`). The audit statics must be volatile because, unlike `CLASSIC_MOVE`, they are set after class load (in `@Activate`). The toggle's internal `AtomicBoolean.get()` does its own ordering, so the visible ordering is: volatile read on `feature` → atomic read on the `AtomicBoolean` → volatile read on `registry` → volatile read on cached `Set<String>` → `Set.contains`. All lock-free.
+Reasoning on the static volatile: this is the same fast-path discipline the `CLASSIC_MOVE` system-property pattern uses in `MutableRoot.java:142-143` (`static final boolean CLASSIC_MOVE`). The audit statics must be volatile because, unlike `CLASSIC_MOVE`, they are set after class load (in `@Activate`). The toggle's internal `AtomicBoolean.get()` does its own ordering, so the visible ordering is: volatile read on `feature` → atomic read on the `AtomicBoolean` → volatile read on `registry` → live `Tracker.getServices()` call (one synchronized lookup on `DefaultWhiteboard`; lock-free on `OsgiWhiteboard`) → linear scan over the returned list. The synchronized lookup is the only critical section in the chain, and it short-circuits to a singleton `emptyList()` when no listener is registered for the type.
 
 `isEnabled()` (without domain) remains in the SPI as a coarse-grained check usable when the caller is domain-agnostic (e.g., generic framework code routing into multiple domains). For domain-specific capture sites, **always prefer `isEnabledFor(domain)`** — it includes the toggle check, so callers never need to chain both.
 
@@ -486,7 +486,7 @@ The classical Oak rule (`AGENTS.md`): SPI must not depend on impl. We respect th
 1. **Pre-merge benchmark required**, per design brief §"Performance constraints". Turing owns the benchmark plan (`04-tests-and-benchmarks.md`). Specific asks for that doc:
    - JMH benchmark in `oak-benchmarks` that measures `Root.commit()` latency with empty changes, in all three regimes, against `SEGMENT_TAR` (default) and `DOCUMENT_NS`.
    - Acceptance criterion: < 5% regression for "toggle off" vs trunk baseline at p50 and p99.
-2. **No allocation on capture call site when listener absent**: `AuditEvents.record(...)` must check `WhiteboardAuditEventListenerRegistry.hasListenerFor(domain)` (cached `Set<String>`) before allocating any event object. The capture site in `MembershipProvider.addMember` (design brief lines 150-162) constructs the `MemberAddedEvent` only after `isEnabled()` returns true — this is intentional and grace must preserve it in the skeleton.
+2. **No allocation on capture call site when listener absent**: `AuditEvents.record(...)` must check `WhiteboardAuditEventListenerRegistry.hasListenerFor(domain)` (live `Tracker.getServices()` lookup + linear scan) before allocating any event object. The capture site in `MembershipProvider.addMember` (design brief lines 150-162) constructs the `MemberAddedEvent` only after `isEnabled()` returns true — this is intentional and grace must preserve it in the skeleton.
 3. **No copy on snapshot**: `SnapshotAuditBufferHook` moves the `List<AuditEvent>` reference from ThreadLocal into `CommitContext`, then nulls out the ThreadLocal entry. No `ArrayList(other)` copy.
 
 ### Risk 4 — Listener mis-registration race (TOCTOU)
@@ -499,7 +499,7 @@ The classical Oak rule (`AGENTS.md`): SPI must not depend on impl. We respect th
 **Mitigation**:
 1. **Documented as expected behavior** (design brief §"Failure modes addressed", "Listener registered after capture, before commit (TOCTOU)" row). This is the price of the no-listener fast path; the alternative is unconditional event buffering, which violates §Performance.
 2. Operationally: deploy listeners before enabling the toggle. Once the toggle has been ON for any non-zero duration, registering a new listener has standard "applies to subsequent transactions only" semantics — which is the JCR / observation convention anyway.
-3. Cache invalidation in `WhiteboardAuditEventListenerRegistry`: when a listener appears/disappears on the Whiteboard, refresh the cached `Set<String> activeDomains` and publish via `volatile` write. Already-staged transactions on other threads are unaffected; new transactions see the new value immediately (volatile semantics).
+3. No registry-side caching that could go stale: `hasListenerFor(domain)` always reads live state via `Tracker.getServices()` (`oak-core-spi/.../whiteboard/Tracker.java:34`). Listeners that appear or disappear on the Whiteboard are visible to the very next capture-site call. The `Tracker` SPI provides no add/remove callback, so a maintained cache would be the source of TOCTOU gaps, not the mitigation — the registry's first implementation cached `activeDomains` lazily but never refreshed it, silently dropping events when a listener registered after the cache initialized. Live lookup is the only correct option until the `Tracker` SPI grows callback support.
 
 ### Risk 5 — Dynamic bind/unbind race semantics (OPTIONAL+DYNAMIC cardinality)
 

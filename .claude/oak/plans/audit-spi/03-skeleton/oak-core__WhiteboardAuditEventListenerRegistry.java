@@ -17,25 +17,28 @@
 package org.apache.jackrabbit.oak.security.audit;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 import org.apache.jackrabbit.oak.spi.security.audit.AuditEventListener;
 import org.apache.jackrabbit.oak.spi.whiteboard.AbstractServiceTracker;
 import org.jetbrains.annotations.NotNull;
 
 /**
- * Whiteboard-backed registry of {@link AuditEventListener} services. The
- * registry caches the set of active listener domains to keep the capture
- * fast path allocation-free: a single volatile read decides whether the
- * capture site should build an event object.
+ * Whiteboard-backed registry of {@link AuditEventListener} services.
  * <p>
- * The cached snapshot is refreshed eagerly on {@link #refreshDomains()}
- * and lazily on {@link #hasAnyListener()} / {@link #hasListenerFor(String)}
- * when the cached snapshot is missing (initial state).
+ * Every predicate ({@link #hasAnyListener()}, {@link #hasListenerFor(String)})
+ * and every retrieval ({@link #getListeners()}) goes through a live
+ * {@code getServices()} call to the underlying {@link
+ * org.apache.jackrabbit.oak.spi.whiteboard.Tracker Tracker} — no cached
+ * domain set is held inside this registry. The {@code Tracker} SPI exposes
+ * no listener add/remove notification, so any cache here would either be
+ * stale on listener arrival/departure or require polling. The capture-site
+ * fast path is kept cheap by relying on the underlying Whiteboard's
+ * own dispatch: {@code DefaultWhiteboard.lookup(...)} returns the singleton
+ * {@link java.util.Collections#emptyList()} when no services of the type
+ * are registered, so {@link #hasAnyListener()} is constant-time and
+ * allocation-free in the no-listener regime.
  * <p>
  * Listener invocation order is determined by
  * {@link AuditEventListener#getRank()} (higher first). The registry
@@ -54,14 +57,6 @@ final class WhiteboardAuditEventListenerRegistry
      */
     private static final Comparator<AuditEventListener> BY_RANK_DESC =
             Comparator.comparingInt(AuditEventListener::getRank).reversed();
-
-    /**
-     * Cached set of domains for which a listener is currently
-     * registered. {@code null} until first lookup or
-     * {@link #refreshDomains()} call. Read-only once published; volatile
-     * publication ensures other threads see the latest snapshot.
-     */
-    private volatile Set<String> activeDomains;
 
     WhiteboardAuditEventListenerRegistry() {
         super(AuditEventListener.class);
@@ -92,50 +87,27 @@ final class WhiteboardAuditEventListenerRegistry
      *         registered.
      */
     boolean hasAnyListener() {
-        Set<String> snapshot = activeDomains;
-        if (snapshot == null) {
-            snapshot = refreshDomains();
-        }
-        return !snapshot.isEmpty();
+        return !getServices().isEmpty();
     }
 
     /**
      * Cheap predicate: is at least one listener registered for the
      * supplied {@code domain}? Read on the capture hot path.
+     * <p>
+     * Linear scan of the live listener list. Capture sites typically face
+     * a listener count in single digits, so iterating is competitive with
+     * (and simpler than) a maintained domain set.
      *
      * @param domain the domain to check, non-null.
      * @return {@code true} when at least one listener is registered for
      *         the domain.
      */
     boolean hasListenerFor(@NotNull String domain) {
-        Set<String> snapshot = activeDomains;
-        if (snapshot == null) {
-            snapshot = refreshDomains();
+        for (AuditEventListener listener : getServices()) {
+            if (domain.equals(listener.getDomain())) {
+                return true;
+            }
         }
-        return snapshot.contains(domain);
-    }
-
-    /**
-     * Rebuilds the cached domain set from the current listener
-     * snapshot. Called when listener arrival/departure invalidates the
-     * cache, and lazily on first lookup.
-     *
-     * @return the refreshed (and now-cached) domain set.
-     */
-    @NotNull
-    Set<String> refreshDomains() {
-        List<AuditEventListener> listeners = getServices();
-        if (listeners.isEmpty()) {
-            Set<String> empty = Collections.emptySet();
-            activeDomains = empty;
-            return empty;
-        }
-        Set<String> domains = new HashSet<>(4);
-        for (AuditEventListener listener : listeners) {
-            domains.add(listener.getDomain());
-        }
-        Set<String> snapshot = Collections.unmodifiableSet(domains);
-        activeDomains = snapshot;
-        return snapshot;
+        return false;
     }
 }
