@@ -1,0 +1,43 @@
+--- a/oak-core/src/main/java/org/apache/jackrabbit/oak/core/MutableRoot.java
++++ b/oak-core/src/main/java/org/apache/jackrabbit/oak/core/MutableRoot.java
+@@ -61,6 +61,7 @@ import org.apache.jackrabbit.oak.spi.commit.ValidatorProvider;
+ import org.apache.jackrabbit.oak.spi.query.QueryIndexProvider;
+ import org.apache.jackrabbit.oak.spi.security.SecurityConfiguration;
+ import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
++import org.apache.jackrabbit.oak.spi.security.audit.AuditBufferLifecycle;
+ import org.apache.jackrabbit.oak.spi.security.authorization.AuthorizationConfiguration;
+ import org.apache.jackrabbit.oak.spi.security.authorization.permission.PermissionAware;
+ import org.apache.jackrabbit.oak.spi.security.authorization.permission.PermissionProvider;
+@@ -234,6 +235,7 @@ class MutableRoot implements Root, PermissionAware {
+     @Override
+     public void rebase() {
+         checkLive();
++        AuditBufferLifecycle.onRefresh(getContentSession().toString());
+         store.rebase(builder);
+         secureBuilder.baseChanged();
+         if (permissionProvider.hasValue()) {
+@@ -244,6 +246,7 @@ class MutableRoot implements Root, PermissionAware {
+     @Override
+     public final void refresh() {
+         checkLive();
++        AuditBufferLifecycle.onRefresh(getContentSession().toString());
+         store.reset(builder);
+         secureBuilder.baseChanged();
+         modCount = 0;
+@@ -258,7 +261,15 @@ class MutableRoot implements Root, PermissionAware {
+         ContentSession session = getContentSession();
+         CommitInfo commitInfo = new CommitInfo(
+                 session.toString(), session.getAuthInfo().getUserID(), newInfoWithCommitContext(info));
+-        store.merge(builder, getCommitHook(), commitInfo);
++        boolean merged = false;
++        try {
++            store.merge(builder, getCommitHook(), commitInfo);
++            merged = true;
++        } finally {
++            if (!merged) {
++                AuditBufferLifecycle.onCommitFailed(commitInfo.getSessionId());
++            }
++        }
+         secureBuilder.baseChanged();
+         modCount = 0;
+         if (permissionProvider.hasValue()) {

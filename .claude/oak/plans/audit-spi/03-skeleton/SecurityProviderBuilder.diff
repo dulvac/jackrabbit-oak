@@ -1,0 +1,50 @@
+--- a/oak-core/src/main/java/org/apache/jackrabbit/oak/security/internal/SecurityProviderBuilder.java
++++ b/oak-core/src/main/java/org/apache/jackrabbit/oak/security/internal/SecurityProviderBuilder.java
+@@ -34,6 +34,7 @@
+ import org.apache.jackrabbit.oak.security.user.UserConfigurationImpl;
+ import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
+ import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
++import org.apache.jackrabbit.oak.spi.security.audit.AuditConfiguration;
+ import org.apache.jackrabbit.oak.spi.security.authentication.AuthenticationConfiguration;
+ import org.apache.jackrabbit.oak.spi.security.authentication.token.CompositeTokenConfiguration;
+ import org.apache.jackrabbit.oak.spi.security.authentication.token.TokenConfiguration;
+@@ -76,6 +77,9 @@
+     private ConfigurationParameters tokenParams = EMPTY;
+     private TokenConfiguration tokenConfiguration;
+ 
++    // Optional — null means the audit plug-in is not deployed.
++    private AuditConfiguration auditConfiguration;
++
+     private ConfigurationParameters configuration;
+ 
+     @NotNull
+@@ -223,6 +227,12 @@
+             initializeConfiguration(tokenConfiguration, securityProvider, tokenParams, rootProvider, treeProvider);
+         }
+         securityProvider.setTokenConfiguration(tokenConfiguration);
++
++        // audit (optional)
++        if (auditConfiguration != null) {
++            initializeConfiguration(auditConfiguration, securityProvider, EMPTY, rootProvider, treeProvider);
++            securityProvider.setAuditConfiguration(auditConfiguration);
++        }
+ 
+         // whiteboard
+         if (whiteboard != null) {
+@@ -232,6 +242,16 @@
+         return securityProvider;
+     }
+ 
++    /**
++     * Optional. Set the audit configuration. Pass {@code null} (the
++     * default) to build a provider without the audit pipeline; capture
++     * sites short-circuit at the NOOP {@code AuditEvents.Sink}.
++     */
++    public SecurityProviderBuilder withAuditConfiguration(AuditConfiguration auditConfiguration) {
++        this.auditConfiguration = auditConfiguration;
++        return this;
++    }
++
+     public SecurityProviderBuilder withWhiteboard(@NotNull Whiteboard whiteboard) {
+         this.whiteboard = whiteboard;
+         return this;
