@@ -64,9 +64,11 @@ import org.osgi.annotation.versioning.ConsumerType;
 public interface AuditEventListener {
 
     /**
-     * Returns the domain this listener is interested in. Must be stable
-     * across the listener's lifetime; the registry caches active domains
-     * to short-circuit dispatch when no listener is present.
+     * Returns the domain this listener is interested in. The registry
+     * queries {@code getDomain()} on every dispatch (no cache), so
+     * implementations must return a stable value across the listener's
+     * lifetime — if the value changes between dispatches the listener
+     * may silently start or stop receiving events.
      *
      * @return non-null domain name.
      */

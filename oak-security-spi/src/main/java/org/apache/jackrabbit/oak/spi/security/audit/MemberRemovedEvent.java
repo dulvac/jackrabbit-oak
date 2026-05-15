@@ -27,8 +27,9 @@ import org.jetbrains.annotations.NotNull;
  * <em>after</em> the in-memory write succeeded but <em>before</em>
  * {@code Root.commit()} returns.
  * <p>
- * The acting user id is not part of the event payload — listeners read
- * it from {@code commitInfo.getUserId()} which is always defined
+ * The acting user id is not part of the event's own payload — listeners
+ * read {@code commit.userId} from the decorated payload Map (added by
+ * Oak's commit-attached drain hook); the value is always defined
  * ({@code CommitInfo.OAK_UNKNOWN} for system commits).
  */
 public final class MemberRemovedEvent extends SecurityAuditEvent {

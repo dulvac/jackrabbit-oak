@@ -62,10 +62,21 @@ public interface AuditEvent {
     String getType();
 
     /**
-     * Returns the wall-clock timestamp (millis since epoch) at which the
-     * event was recorded.
+     * Returns the wall-clock timestamp (millis since epoch) captured at
+     * the API call site when the event was constructed — i.e. the
+     * <em>capture</em> timestamp.
+     * <p>
+     * For commit-attached events this can differ from the
+     * <em>commit</em> timestamp ({@code commit.timestamp} in
+     * {@link #getPayload()}): the capture timestamp is taken when the
+     * Oak API call ran; the commit timestamp is taken when the surrounding
+     * {@code Root.commit()} actually merged. The two can diverge when the
+     * surrounding operation takes a long time between capture and commit.
+     * Listeners that want "when did the change become visible?" should
+     * read {@code commit.timestamp}; listeners that want "when did the
+     * API call ran?" should read this value.
      *
-     * @return event timestamp in milliseconds since epoch.
+     * @return event capture timestamp in milliseconds since epoch.
      */
     long getTimestamp();
 
@@ -78,6 +89,15 @@ public interface AuditEvent {
      * entries with the keys {@code commit.sessionId}, {@code commit.userId},
      * and {@code commit.timestamp} at drain time. Fire-and-forget events
      * do not carry these entries.
+     * <p>
+     * <strong>Trust contract.</strong> Oak <em>unconditionally overrides</em>
+     * any caller-supplied values for the {@code commit.sessionId},
+     * {@code commit.userId}, and {@code commit.timestamp} keys with the
+     * values from {@code CommitInfo} on the commit-attached path. Listeners
+     * may therefore treat the <em>presence</em> of {@code commit.*} keys as
+     * an Oak-attested commit (the caller cannot forge these values). The
+     * absence of these keys signals a fire-and-forget emission whose
+     * payload reflects the emitting bundle's claim only.
      *
      * @return non-null, immutable payload map.
      */

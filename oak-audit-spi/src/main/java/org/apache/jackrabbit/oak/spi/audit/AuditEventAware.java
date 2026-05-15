@@ -23,9 +23,13 @@ import org.osgi.annotation.versioning.ConsumerType;
  * their API call sites. Implementing this interface is not required —
  * callers may instead use the static {@link AuditEvents#record} façade.
  * <p>
- * This marker exists so that tooling (and tests) can identify
- * audit-emitting components and enumerate the event types they produce
- * without instantiating them.
+ * The marker exists so that tooling and tests can discover
+ * audit-emitting bundles via OSGi service lookup or classpath scanning
+ * (e.g. {@code ServiceTracker<AuditEventAware>}). The marker carries no
+ * methods: it does not, on its own, expose which {@link AuditEvent}
+ * types a component emits. Tools that need to enumerate types either
+ * scan source for {@code AuditEvents.record(...)} call sites or rely on
+ * documentation in the component's own Javadoc.
  */
 @ConsumerType
 public interface AuditEventAware {

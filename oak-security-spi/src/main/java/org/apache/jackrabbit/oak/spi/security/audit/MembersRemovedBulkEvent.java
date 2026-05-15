@@ -57,7 +57,8 @@ import org.jetbrains.annotations.NotNull;
  * for serializer-friendliness; the typed {@link #getMemberIds()} and
  * {@link #getFailedIds()} accessors return immutable sets for callers
  * that prefer the set semantics. The acting user id is not part of the
- * event payload — listeners read it from {@code commitInfo.getUserId()}.
+ * event's own payload — listeners read {@code commit.userId} from the
+ * decorated payload Map (added by Oak's commit-attached drain hook).
  */
 public final class MembersRemovedBulkEvent extends SecurityAuditEvent {
 
