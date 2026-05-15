@@ -634,7 +634,29 @@ try {
 }
 ```
 
-### 6.1 Motivating example — `LinkageError` from a misconfigured consumer
+The argument for catching `Throwable` rather than the narrower
+`RuntimeException` is load-bearing on the **`Error` subclass taxonomy** —
+that is the section to challenge if the decision is challenged. The
+motivating example, the anti-pattern caveat, and the trade-off below all
+rely on the taxonomy as their first premise.
+
+### 6.1 `Error` subclass taxonomy
+
+"Error" is not a uniform JVM-stress signal. Three sub-hierarchies behave
+differently:
+
+| Subclass | Source | Handling rationale |
+|---|---|---|
+| `VirtualMachineError` (`OutOfMemoryError`, `StackOverflowError`) | genuine JVM stress | Caught; re-triggers on next allocation. No isolation loss — the JVM remains under stress and surfaces again at the next allocation site (see §6.4). |
+| `LinkageError` / `NoClassDefFoundError` / `ExceptionInInitializerError` | classloader / per-bundle misconfiguration | Caught and isolated. A per-bundle fault must not fail an unrelated commit; sibling listeners are healthy. |
+| `AssertionError` | listener-implementation bug | Caught and isolated. Per-listener fault; sibling listeners are healthy. |
+
+`LinkageError` and `AssertionError` are emphatically per-listener problems.
+Letting them abort the commit (or escape `emit`) gives the broken consumer
+veto power over the entire pipeline. `catch (Throwable)` correctly localizes
+the failure to the listener that caused it.
+
+### 6.2 Motivating example — `LinkageError` from a misconfigured consumer
 
 Consumer bundle X registers an `AuditEventListener` whose `onEvents` references
 class Y from bundle Z. At dispatch time bundle Z is not activated (wiring miss,
@@ -647,7 +669,8 @@ With `catch (RuntimeException)`, the `LinkageError` escapes the dispatch loop:
   `DispatchAuditEventsHook.processCommit`, which surfaces as a
   `CommitFailedException` and aborts `Root.commit()`. **The commit's mutation
   was valid.** The session caller did nothing wrong. Aborting the commit
-  because a consumer bundle is misconfigured is the wrong answer.
+  because a consumer bundle is misconfigured is the wrong answer — one
+  broken bundle takes audit (and the commit) down for everyone.
 - **Fire-and-forget path**: the `Throwable` propagates back to the caller of
   `AuditEventEmitter.emit`, breaking the documented contract
   ("exceptions are logged but never propagate back to the caller" —
@@ -657,31 +680,20 @@ Catching `Throwable` keeps the broken listener isolated to its own dispatch
 slot. Sibling listeners still run; the commit proceeds; the emit caller is
 not punished for a deployment error in someone else's bundle.
 
-### 6.2 The `Error` taxonomy is non-uniform
+### 6.3 Anti-pattern caveat — wrappers vs. barriers
 
-The "do not catch `Throwable`" guidance assumes the `Error` hierarchy
-signals JVM-wide stress. It doesn't, uniformly:
+The "do not catch `Throwable`" warning attaches to **top-level wrappers** —
+e.g. swallowing `OutOfMemoryError` in a `main()` or executor loop so a
+doomed JVM appears healthy. That pattern hides terminal conditions.
 
-| Sub-hierarchy | Signal | Scope |
-|---|---|---|
-| `VirtualMachineError` (`OutOfMemoryError`, `StackOverflowError`) | genuine JVM stress | wide — next allocation re-triggers |
-| `LinkageError` / `NoClassDefFoundError` / `ExceptionInInitializerError` | classloader / per-bundle misconfiguration | strictly per-listener — sibling listeners are healthy |
-| `AssertionError` | listener-implementation bug | per-listener |
+A **fan-out dispatcher** is structurally different. Its job *is* to be a
+barrier: ensure one consumer's failure does not punish other consumers.
+Errors are still logged at WARN — the JVM remains observable via
+OS-level metrics, heap-dump tooling, or repeat allocation failures if a
+`VirtualMachineError` recurs. The information is not lost; it is just
+not weaponized against the commit.
 
-`LinkageError` and `AssertionError` are emphatically per-listener problems.
-Letting them abort the commit (or escape `emit`) gives the broken consumer
-veto power over the entire pipeline. `catch (Throwable)` correctly localizes
-the failure to the listener that caused it.
-
-### 6.3 The "catch `Throwable`" anti-pattern applies to wrappers, not barriers
-
-The anti-pattern attached to `catch (Throwable)` is **the top-level wrapper**:
-swallowing `OutOfMemoryError` in a `main()` or executor loop so a doomed JVM
-appears healthy. That pattern hides terminal conditions.
-
-A **fan-out dispatcher** is a different category. Its responsibility is
-exactly to ensure one consumer's failure does not punish other consumers.
-The same pattern is used by:
+The same fan-out + log + continue pattern is used by:
 
 - `BackgroundObserver` in `oak-core` (executor-backed observer dispatch)
 - OSGi `EventAdmin` (per-handler isolation in async event delivery)
@@ -691,7 +703,10 @@ The audit dispatcher is one of these. Per-listener `catch (Throwable)` + log
 + continue is the correct shape for the role; the anti-pattern does not
 apply.
 
-### 6.4 Trade-off — `VirtualMachineError` is caught too
+### 6.4 Trade-off detail — `VirtualMachineError`
+
+The taxonomy row for `VirtualMachineError` in §6.1 summarizes the rationale;
+this subsection unpacks it.
 
 `VirtualMachineError` is caught alongside the others. This is **not** a loss
 of isolation, only a loss of immediate propagation:
