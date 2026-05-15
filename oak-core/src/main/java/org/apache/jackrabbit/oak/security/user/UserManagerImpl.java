@@ -34,8 +34,13 @@ import org.apache.jackrabbit.oak.plugins.tree.TreeUtil;
 import org.apache.jackrabbit.oak.plugins.value.jcr.PartialValueFactory;
 import org.apache.jackrabbit.oak.security.user.monitor.UserMonitor;
 import org.apache.jackrabbit.oak.security.user.query.UserQueryManager;
+import org.apache.jackrabbit.oak.spi.audit.AuditEvents;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
 import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
+import org.apache.jackrabbit.oak.spi.security.audit.MemberAddedEvent;
+import org.apache.jackrabbit.oak.spi.security.audit.MemberRemovedEvent;
+import org.apache.jackrabbit.oak.spi.security.audit.MembersAddedBulkEvent;
+import org.apache.jackrabbit.oak.spi.security.audit.MembersRemovedBulkEvent;
 import org.apache.jackrabbit.oak.spi.security.principal.EveryonePrincipal;
 import org.apache.jackrabbit.oak.spi.security.principal.PrincipalConfiguration;
 import org.apache.jackrabbit.oak.spi.security.principal.PrincipalImpl;
@@ -369,6 +374,7 @@ public class UserManagerImpl implements UserManager {
      * @throws RepositoryException If an error occurs.
      */
     void onGroupUpdate(@NotNull Group group, boolean isRemove, @NotNull Authorizable member) throws RepositoryException {
+        recordSingleMembershipAuditEvent(group, isRemove, member);
         for (GroupAction action : filterGroupActions()) {
             if (isRemove) {
                 action.onMemberRemoved(group, member, root, namePathMapper);
@@ -391,6 +397,7 @@ public class UserManagerImpl implements UserManager {
      * @throws RepositoryException If an error occurs.
      */
     void onGroupUpdate(@NotNull Group group, boolean isRemove, boolean isContentId, @NotNull Set<String> memberIds, @NotNull Set<String> failedIds) throws RepositoryException {
+        recordBulkMembershipAuditEvent(group, isRemove, isContentId, memberIds, failedIds);
         for (GroupAction action : filterGroupActions()) {
             if (isRemove) {
                 action.onMembersRemoved(group, memberIds, failedIds, root, namePathMapper);
@@ -401,6 +408,50 @@ public class UserManagerImpl implements UserManager {
                     action.onMembersAdded(group, memberIds, failedIds, root, namePathMapper);
                 }
             }
+        }
+    }
+
+    /**
+     * Records a single-member audit event for the given group update.
+     * Fires only on success — the upstream {@code MembershipWriter}
+     * does not invoke {@code onGroupUpdate} for the failure path.
+     */
+    private void recordSingleMembershipAuditEvent(@NotNull Group group, boolean isRemove, @NotNull Authorizable member) {
+        if (!AuditEvents.isEnabled()) {
+            return;
+        }
+        try {
+            String groupPath = group.getPath();
+            String memberPath = member.getPath();
+            AuditEvents.record(root, isRemove
+                    ? MemberRemovedEvent.of(groupPath, memberPath)
+                    : MemberAddedEvent.of(groupPath, memberPath));
+        } catch (RepositoryException e) {
+            // Path resolution failed — drop the event rather than fail
+            // the surrounding group update. Should be rare in practice.
+            log.debug("Skipping audit event: failed to resolve path for group update", e);
+        }
+    }
+
+    /**
+     * Records a bulk-membership audit event when {@code memberIds} is
+     * non-empty. {@code memberIds} is the successful subset (failed
+     * entries already filtered by {@code MembershipWriter}); when every
+     * entry failed, {@code memberIds} is empty and no event is emitted.
+     * {@code failedIds} is carried through to the listener for audit
+     * completeness — listeners can distinguish "happened" vs "rejected".
+     */
+    private void recordBulkMembershipAuditEvent(@NotNull Group group, boolean isRemove, boolean isContentId, @NotNull Set<String> memberIds, @NotNull Set<String> failedIds) {
+        if (memberIds.isEmpty() || !AuditEvents.isEnabled()) {
+            return;
+        }
+        try {
+            String groupPath = group.getPath();
+            AuditEvents.record(root, isRemove
+                    ? MembersRemovedBulkEvent.of(groupPath, memberIds, isContentId, failedIds)
+                    : MembersAddedBulkEvent.of(groupPath, memberIds, isContentId, failedIds));
+        } catch (RepositoryException e) {
+            log.debug("Skipping audit event: failed to resolve group path for bulk update", e);
         }
     }
 
