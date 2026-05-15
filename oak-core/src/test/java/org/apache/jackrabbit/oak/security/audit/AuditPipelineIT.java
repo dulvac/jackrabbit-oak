@@ -17,30 +17,35 @@
 package org.apache.jackrabbit.oak.security.audit;
 
 import java.io.Closeable;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 
+import javax.jcr.Credentials;
+import javax.jcr.SimpleCredentials;
+import javax.security.auth.login.Configuration;
+
+import org.apache.jackrabbit.oak.InitialContentHelper;
 import org.apache.jackrabbit.oak.Oak;
+import org.apache.jackrabbit.oak.api.CommitFailedException;
 import org.apache.jackrabbit.oak.api.ContentRepository;
 import org.apache.jackrabbit.oak.api.ContentSession;
+import org.apache.jackrabbit.oak.api.PropertyState;
 import org.apache.jackrabbit.oak.api.Root;
 import org.apache.jackrabbit.oak.plugins.memory.MemoryNodeStore;
-import org.apache.jackrabbit.oak.spi.audit.AuditBufferLifecycle;
+import org.apache.jackrabbit.oak.security.internal.SecurityProviderBuilder;
 import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
 import org.apache.jackrabbit.oak.spi.audit.AuditEventEmitter;
 import org.apache.jackrabbit.oak.spi.audit.AuditEventListener;
 import org.apache.jackrabbit.oak.spi.audit.AuditEvents;
-import org.apache.jackrabbit.oak.spi.commit.CommitHook;
-import org.apache.jackrabbit.oak.spi.security.ConfigurationBase;
+import org.apache.jackrabbit.oak.spi.commit.CommitInfo;
+import org.apache.jackrabbit.oak.spi.commit.DefaultValidator;
+import org.apache.jackrabbit.oak.spi.commit.Validator;
+import org.apache.jackrabbit.oak.spi.commit.ValidatorProvider;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
-import org.apache.jackrabbit.oak.spi.security.OpenSecurityProvider;
-import org.apache.jackrabbit.oak.spi.security.SecurityConfiguration;
 import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
-import org.apache.jackrabbit.oak.spi.toggle.Feature;
+import org.apache.jackrabbit.oak.spi.security.authentication.ConfigurationUtil;
+import org.apache.jackrabbit.oak.spi.state.NodeState;
 import org.apache.jackrabbit.oak.spi.toggle.FeatureToggle;
 import org.apache.jackrabbit.oak.spi.whiteboard.DefaultWhiteboard;
 import org.apache.jackrabbit.oak.spi.whiteboard.Registration;
@@ -53,94 +58,79 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
- * End-to-end integration test exercising both audit pipelines through a
- * single {@link AuditEventListener#onEvents} method. Uses {@link MemoryNodeStore}
- * for a real but in-process Oak instance.
+ * End-to-end integration test exercising both audit pipelines through a real
+ * {@link SecurityProviderBuilder}-wired {@link AuditConfigurationImpl}. Uses
+ * {@link MemoryNodeStore} for a real but in-process Oak instance.
  * <p>
- * The fixture mirrors what {@code AuditConfigurationImpl.activate()} does at
- * runtime, without an OSGi container:
+ * The fixture deliberately uses the production wiring path:
  * <ol>
- *   <li>Builds a {@link DefaultWhiteboard}, registers a {@link Feature} toggle
- *       and flips it on.</li>
- *   <li>Constructs an {@link AuditBuffer} and installs it on
- *       {@link AuditBufferLifecycle}.</li>
- *   <li>Starts a {@link WhiteboardAuditEventListenerRegistry} against the
- *       whiteboard and registers the test listener.</li>
- *   <li>Installs a {@link AuditEvents.Sink} that mirrors the inner
- *       {@code BufferSink} of {@code AuditConfigurationImpl} — both branches
- *       (commit-attached {@code record} and fire-and-forget {@code dispatch}).
- *       The real {@code BufferSink} is a private nested class; replicating its
- *       behavior locally lets the IT exercise both pipelines without
- *       reflection.</li>
- *   <li>Wires the {@link SnapshotAuditBufferHook} and
- *       {@link DispatchAuditEventsHook} via a custom {@link SecurityProvider}
- *       so {@code MutableRoot} correctly classifies the post-validation hook
- *       (see {@code MutableRoot.getCommitHook}).</li>
+ *   <li>{@link SecurityProviderBuilder#withAuditConfiguration(org.apache.jackrabbit.oak.spi.security.audit.AuditConfiguration)}
+ *       + {@link SecurityProviderBuilder#withWhiteboard(Whiteboard)} drive
+ *       {@link AuditConfigurationImpl#initialize(Whiteboard)} on
+ *       {@link SecurityProviderBuilder#build()}.</li>
+ *   <li>The {@code AuditConfigurationImpl} registers itself as a
+ *       {@link org.apache.jackrabbit.oak.spi.security.SecurityConfiguration}
+ *       that contributes the audit commit hooks — so Oak's commit chain
+ *       picks them up automatically with correct hook ordering.</li>
+ *   <li>Teardown calls {@link AuditConfigurationImpl#dispose()} — the same
+ *       code path that OSGi {@code @Deactivate} uses.</li>
  * </ol>
+ * No test mirror of {@code BufferSink} or hook wiring exists in this class;
+ * a bug in either pipeline will surface here.
  */
 public class AuditPipelineIT {
 
     private static final String DOMAIN = "test.domain";
-    private static final String FEATURE_TOGGLE_NAME = "FT_AUDIT_IT";
+    private static final String OTHER_DOMAIN = "other.domain";
+    private static final String FEATURE_TOGGLE_NAME = AuditConfigurationImpl.FEATURE_TOGGLE_NAME;
 
     private Whiteboard whiteboard;
-    private Feature featureToggle;
-    private AuditBuffer buffer;
-    private WhiteboardAuditEventListenerRegistry registry;
+    private AuditConfigurationImpl auditConfig;
     private Registration listenerRegistration;
     private List<AuditEvent> received;
-    private AuditEventListener listener;
     private ContentRepository repository;
     private AuditEventEmitter emitter;
+    private SecurityProvider securityProvider;
 
     @Before
     public void setUp() {
         whiteboard = new DefaultWhiteboard();
-
-        // Feature toggle — register on whiteboard, then flip ON via the
-        // FeatureToggle service registered by Feature.newFeature.
-        featureToggle = Feature.newFeature(FEATURE_TOGGLE_NAME, whiteboard);
-        Tracker<FeatureToggle> toggleTracker = whiteboard.track(FeatureToggle.class);
-        try {
-            for (FeatureToggle ft : toggleTracker.getServices()) {
-                if (FEATURE_TOGGLE_NAME.equals(ft.getName())) {
-                    ft.setEnabled(true);
-                }
-            }
-        } finally {
-            toggleTracker.stop();
-        }
-
-        buffer = new AuditBuffer();
-        AuditBufferLifecycle.install(buffer);
-
-        registry = new WhiteboardAuditEventListenerRegistry();
-        registry.start(whiteboard);
-
-        // Listener captures events for verification.
         received = new CopyOnWriteArrayList<>();
-        listener = new AuditEventListener() {
+
+        auditConfig = new AuditConfigurationImpl();
+        securityProvider = SecurityProviderBuilder.newBuilder()
+                .withWhiteboard(whiteboard)
+                .withAuditConfiguration(auditConfig)
+                .build();
+
+        // JAAS — wire the default authentication configuration from the
+        // SecurityProvider's params so repository.login(adminCreds) succeeds.
+        Configuration.setConfiguration(
+                ConfigurationUtil.getDefaultConfiguration(ConfigurationParameters.EMPTY));
+
+        // Flip the feature toggle ON via the FeatureToggle service the
+        // AuditConfigurationImpl.initialize() call registered on the
+        // whiteboard.
+        setToggle(true);
+
+        // Register a domain-scoped listener that captures events for
+        // verification. Single listener tests use DOMAIN; multi-listener
+        // tests register additional listeners inline.
+        AuditEventListener listener = new AuditEventListener() {
             @Override public @NotNull String getDomain() { return DOMAIN; }
-            @Override public void onEvents(@NotNull List<AuditEvent> events) { received.addAll(events); }
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                received.addAll(events);
+            }
         };
         listenerRegistration = whiteboard.register(AuditEventListener.class, listener, Map.of());
 
-        // Install a Sink mirroring the BufferSink behavior. See class Javadoc.
-        AuditEvents.install(new TestBufferSink(featureToggle, registry, buffer));
-
-        // Oak instance with the custom security provider that contributes
-        // the two audit commit hooks via a SecurityConfiguration so they're
-        // ordered correctly relative to validation.
-        SecurityProvider sp = new AuditTestSecurityProvider(
-                new AuditTestConfiguration(
-                        new SnapshotAuditBufferHook(featureToggle, buffer),
-                        new DispatchAuditEventsHook(featureToggle, buffer, registry)));
-
-        repository = new Oak(new MemoryNodeStore())
-                .with(sp)
+        repository = new Oak(new MemoryNodeStore(InitialContentHelper.INITIAL_CONTENT))
+                .with(securityProvider)
                 .with(whiteboard)
                 .createContentRepository();
 
@@ -149,23 +139,35 @@ public class AuditPipelineIT {
 
     @After
     public void tearDown() throws Exception {
-        // Order mirrors AuditConfigurationImpl.deactivate().
-        if (featureToggle != null) {
-            featureToggle.close();
+        try {
+            if (listenerRegistration != null) {
+                listenerRegistration.unregister();
+            }
+            if (auditConfig != null) {
+                auditConfig.dispose();
+            }
+            if (repository instanceof Closeable) {
+                ((Closeable) repository).close();
+            }
+        } finally {
+            Configuration.setConfiguration(null);
         }
-        if (registry != null) {
-            registry.stop();
-        }
-        if (listenerRegistration != null) {
-            listenerRegistration.unregister();
-        }
-        AuditEvents.install(null);
-        AuditBufferLifecycle.install(null);
-        if (buffer != null) {
-            buffer.clearAll();
-        }
-        if (repository instanceof Closeable) {
-            ((Closeable) repository).close();
+    }
+
+    private static Credentials adminCredentials() {
+        return new SimpleCredentials("admin", "admin".toCharArray());
+    }
+
+    private void setToggle(boolean enabled) {
+        Tracker<FeatureToggle> toggleTracker = whiteboard.track(FeatureToggle.class);
+        try {
+            for (FeatureToggle ft : toggleTracker.getServices()) {
+                if (FEATURE_TOGGLE_NAME.equals(ft.getName())) {
+                    ft.setEnabled(enabled);
+                }
+            }
+        } finally {
+            toggleTracker.stop();
         }
     }
 
@@ -179,6 +181,12 @@ public class AuditPipelineIT {
             @Override public @NotNull Map<String, Object> getPayload() { return payload; }
         };
     }
+
+    private ContentSession login() throws Exception {
+        return repository.login(adminCredentials(), null);
+    }
+
+    //--------------------------------------------------------< original 3 >---
 
     @Test
     public void fireAndForgetEventCarriesNoCommitMetadata() {
@@ -194,19 +202,16 @@ public class AuditPipelineIT {
 
     @Test
     public void emitNoListenerForDomainIsNoOp() {
-        // Listener registered for DOMAIN; emit on a different domain.
-        emitter.emit(eventFor("other.domain", "x", Map.of()));
+        emitter.emit(eventFor(OTHER_DOMAIN, "x", Map.of()));
         assertTrue(received.isEmpty());
     }
 
     @Test
     public void commitAttachedEventCarriesCommitMetadata() throws Exception {
-        ContentSession session = repository.login(null, null);
-        try {
+        try (ContentSession session = login()) {
             Root root = session.getLatestRoot();
-            AuditEvents.record(root, eventFor(DOMAIN, "commit.type", Map.of("note", "v")));
-            // Mutate so commit isn't a no-op — without a real change, the
-            // commit hook chain may short-circuit before reaching dispatch.
+            AuditEvents.record(
+                    root, eventFor(DOMAIN, "commit.type", Map.of("note", "v")));
             root.getTree("/").setProperty("scratch", "value");
             root.commit();
 
@@ -218,121 +223,411 @@ public class AuditPipelineIT {
                     p.containsKey("commit.sessionId"));
             assertTrue(p.containsKey("commit.userId"));
             assertTrue(p.containsKey("commit.timestamp"));
-            // Original payload entry preserved.
             assertEquals("v", p.get("note"));
+        }
+    }
+
+    //------------------------------------------------< new — discard tests >---
+
+    /**
+     * After a failed commit, the events staged in the per-session buffer
+     * must be discarded. The strongest assertion is end-to-end: do a
+     * SUBSEQUENT successful commit on the same session and verify only the
+     * fresh event arrives. A naive "buffer empty after failure" assertion
+     * would pass under a regression that drained the wrong session's slot.
+     */
+    @Test
+    public void commitFailureDiscardsStagedEvents() throws Exception {
+        // Build a separate Oak instance with an injected throwing validator
+        // — the main fixture's repository can't carry the validator without
+        // breaking the success-path tests. The audit pipeline state on the
+        // whiteboard is shared, which is what we want to exercise.
+        ContentRepository repo2 = new Oak(new MemoryNodeStore(InitialContentHelper.INITIAL_CONTENT))
+                .with(securityProvider)
+                .with(whiteboard)
+                .with(new ThrowingValidatorProvider("trigger-failure"))
+                .createContentRepository();
+        try (ContentSession session = repo2.login(adminCredentials(), null)) {
+            // Stage E1, then force commit failure via the trigger property.
+            Root r1 = session.getLatestRoot();
+            AuditEvents.record(
+                    r1, eventFor(DOMAIN, "discarded",
+                            Map.of("trace.id", "E1-from-failed-commit")));
+            r1.getTree("/").setProperty("trigger-failure", "boom");
+            try {
+                r1.commit();
+                fail("Expected CommitFailedException from injected validator");
+            } catch (CommitFailedException expected) {
+                // expected
+            }
+
+            // Subsequent successful commit on the SAME session.
+            Root r2 = session.getLatestRoot();
+            AuditEvents.record(
+                    r2, eventFor(DOMAIN, "delivered",
+                            Map.of("trace.id", "E2-from-successful-commit")));
+            r2.getTree("/").setProperty("scratch", "value");
+            r2.commit();
+
+            assertEquals("only E2 must be delivered", 1, received.size());
+            AuditEvent d = received.get(0);
+            assertEquals("event type is E2's", "delivered", d.getType());
+            assertEquals("payload is E2's, not E1's or merged",
+                    "E2-from-successful-commit", d.getPayload().get("trace.id"));
+            assertEquals("commit.sessionId decorates with current session",
+                    session.toString(), d.getPayload().get("commit.sessionId"));
         } finally {
-            session.close();
-        }
-    }
-
-    /**
-     * Mirrors {@code AuditConfigurationImpl.BufferSink} (private nested type)
-     * so the IT exercises both audit paths without an OSGi container or
-     * reflective access. If {@code BufferSink} is later promoted to
-     * package-private, this can be replaced with a direct instantiation.
-     */
-    private static final class TestBufferSink implements AuditEvents.Sink {
-
-        private final Feature toggle;
-        private final WhiteboardAuditEventListenerRegistry registry;
-        private final AuditBuffer buffer;
-
-        TestBufferSink(@NotNull Feature toggle,
-                       @NotNull WhiteboardAuditEventListenerRegistry registry,
-                       @NotNull AuditBuffer buffer) {
-            this.toggle = toggle;
-            this.registry = registry;
-            this.buffer = buffer;
-        }
-
-        @Override
-        public boolean isEnabled() {
-            return toggle.isEnabled() && registry.hasAnyListener();
-        }
-
-        @Override
-        public boolean isEnabledFor(@NotNull String domain) {
-            return toggle.isEnabled() && registry.hasListenerFor(domain);
-        }
-
-        @Override
-        public void record(@NotNull Root root, @NotNull AuditEvent event) {
-            if (!isEnabledFor(event.getDomain())) {
-                return;
-            }
-            buffer.record(root.getContentSession().toString(), event);
-        }
-
-        @Override
-        public void dispatch(@NotNull AuditEvent event) {
-            if (!toggle.isEnabled()) {
-                return;
-            }
-            List<AuditEventListener> listeners = registry.getListeners();
-            if (listeners.isEmpty()) {
-                return;
-            }
-            String domain = event.getDomain();
-            List<AuditEvent> single = Collections.singletonList(event);
-            for (AuditEventListener l : listeners) {
-                if (!domain.equals(l.getDomain())) {
-                    continue;
-                }
-                try {
-                    l.onEvents(single);
-                } catch (RuntimeException re) {
-                    // Mirror BufferSink — swallow.
-                }
+            if (repo2 instanceof Closeable) {
+                ((Closeable) repo2).close();
             }
         }
     }
 
     /**
-     * Wraps {@link OpenSecurityProvider} and adds an extra
-     * {@link SecurityConfiguration} (the audit test config) so its commit
-     * hooks are picked up by {@code MutableRoot.getCommitHook()} and
-     * correctly classified (post-validation hook placed after validators).
+     * After {@code root.refresh()} the staged events for the session must
+     * be discarded — mirrors {@link #commitFailureDiscardsStagedEvents()}.
      */
-    private static final class AuditTestSecurityProvider extends OpenSecurityProvider {
+    @Test
+    public void refreshDiscardsStagedEvents() throws Exception {
+        try (ContentSession session = login()) {
+            Root r1 = session.getLatestRoot();
+            AuditEvents.record(
+                    r1, eventFor(DOMAIN, "discarded",
+                            Map.of("trace.id", "E1-discarded-by-refresh")));
+            r1.refresh();
 
-        private final SecurityConfiguration auditConfig;
+            // After refresh, dispatch a fresh event and commit.
+            Root r2 = session.getLatestRoot();
+            AuditEvents.record(
+                    r2, eventFor(DOMAIN, "delivered",
+                            Map.of("trace.id", "E2-after-refresh")));
+            r2.getTree("/").setProperty("scratch", "v");
+            r2.commit();
 
-        AuditTestSecurityProvider(@NotNull SecurityConfiguration auditConfig) {
-            this.auditConfig = auditConfig;
-        }
-
-        @Override
-        public @NotNull Iterable<? extends SecurityConfiguration> getConfigurations() {
-            List<SecurityConfiguration> all = new ArrayList<>();
-            for (SecurityConfiguration sc : super.getConfigurations()) {
-                all.add(sc);
-            }
-            all.add(auditConfig);
-            return all;
+            assertEquals("only E2 must be delivered", 1, received.size());
+            AuditEvent d = received.get(0);
+            assertEquals("delivered", d.getType());
+            assertEquals("E2-after-refresh", d.getPayload().get("trace.id"));
         }
     }
 
     /**
-     * Minimal {@link SecurityConfiguration} exposing pre-built commit hooks.
+     * After {@code root.rebase()} the staged events for the session must
+     * be discarded. Same SPI listener ({@code onRefresh}) drives both
+     * refresh and rebase per the audit-spi v1 contract.
      */
-    private static final class AuditTestConfiguration extends ConfigurationBase {
+    @Test
+    public void rebaseDiscardsStagedEvents() throws Exception {
+        try (ContentSession session = login()) {
+            Root r1 = session.getLatestRoot();
+            AuditEvents.record(
+                    r1, eventFor(DOMAIN, "discarded",
+                            Map.of("trace.id", "E1-discarded-by-rebase")));
+            r1.rebase();
 
-        private final List<CommitHook> hooks;
+            Root r2 = session.getLatestRoot();
+            AuditEvents.record(
+                    r2, eventFor(DOMAIN, "delivered",
+                            Map.of("trace.id", "E2-after-rebase")));
+            r2.getTree("/").setProperty("scratch", "v");
+            r2.commit();
 
-        AuditTestConfiguration(@NotNull CommitHook... hooks) {
-            super();
-            setParameters(ConfigurationParameters.EMPTY);
-            this.hooks = Arrays.asList(hooks);
+            assertEquals("only E2 must be delivered", 1, received.size());
+            assertEquals("E2-after-rebase",
+                    received.get(0).getPayload().get("trace.id"));
+        }
+    }
+
+    //----------------------------------------< toggle, grouping, isolation >---
+
+    /**
+     * With the feature toggle disabled, neither pipeline emits to listeners.
+     * Pins the {@code if (!featureToggle.isEnabled()) return} early-returns
+     * in both {@code SnapshotAuditBufferHook} and {@code DispatchAuditEventsHook},
+     * as well as the toggle gate in {@code BufferSink}.
+     */
+    @Test
+    public void toggleDisabledShortCircuitsEntirePipeline() throws Exception {
+        setToggle(false);
+
+        // Fire-and-forget path:
+        emitter.emit(eventFor(DOMAIN, "forget", Map.of()));
+        assertTrue("fire-and-forget must short-circuit with toggle disabled",
+                received.isEmpty());
+
+        // Commit-attached path:
+        try (ContentSession session = login()) {
+            Root root = session.getLatestRoot();
+            AuditEvents.record(
+                    root, eventFor(DOMAIN, "commit.type", Map.of()));
+            root.getTree("/").setProperty("scratch", "v");
+            root.commit();
+            assertTrue("commit-attached must short-circuit with toggle disabled",
+                    received.isEmpty());
+        }
+    }
+
+    /**
+     * Three events recorded on two domains: listener-A (DOMAIN) receives the
+     * two for its domain in capture order; listener-B (OTHER_DOMAIN) receives
+     * only its one. Pins {@code groupByDomain} fan-out.
+     */
+    @Test
+    public void multipleEventsAcrossDomainsGroupedCorrectly() throws Exception {
+        List<AuditEvent> otherReceived = new CopyOnWriteArrayList<>();
+        AuditEventListener otherListener = new AuditEventListener() {
+            @Override public @NotNull String getDomain() { return OTHER_DOMAIN; }
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                otherReceived.addAll(events);
+            }
+        };
+        Registration otherReg = whiteboard.register(AuditEventListener.class,
+                otherListener, Map.of());
+        try (ContentSession session = login()) {
+            Root root = session.getLatestRoot();
+            AuditEvents.record(
+                    root, eventFor(DOMAIN, "a-1", Map.of()));
+            AuditEvents.record(
+                    root, eventFor(OTHER_DOMAIN, "b-1", Map.of()));
+            AuditEvents.record(
+                    root, eventFor(DOMAIN, "a-2", Map.of()));
+            root.getTree("/").setProperty("scratch", "v");
+            root.commit();
+
+            assertEquals("DOMAIN listener receives 2 events in capture order",
+                    2, received.size());
+            assertEquals("a-1", received.get(0).getType());
+            assertEquals("a-2", received.get(1).getType());
+
+            assertEquals("OTHER_DOMAIN listener receives 1 event",
+                    1, otherReceived.size());
+            assertEquals("b-1", otherReceived.get(0).getType());
+        } finally {
+            otherReg.unregister();
+        }
+    }
+
+    /**
+     * After a successful commit, the per-thread {@link AuditBuffer}'s slot
+     * for the session must be drained. Asserted behaviorally via a
+     * second commit on the SAME session — if drain didn't run after the
+     * first commit, the second snapshot would re-include E1 and we'd see
+     * three deliveries total (E1 dispatched by commit#1, then E1+E2
+     * re-dispatched by commit#2) instead of two.
+     */
+    @Test
+    public void bufferDrainedAfterSuccessfulCommit() throws Exception {
+        try (ContentSession session = login()) {
+            // Commit #1: record E1, commit.
+            Root r1 = session.getLatestRoot();
+            AuditEvents.record(
+                    r1, eventFor(DOMAIN, "e1", Map.of("trace.id", "E1")));
+            r1.getTree("/").setProperty("scratch1", "v");
+            r1.commit();
+
+            // Commit #2 on the same session: record E2, commit.
+            Root r2 = session.getLatestRoot();
+            AuditEvents.record(
+                    r2, eventFor(DOMAIN, "e2", Map.of("trace.id", "E2")));
+            r2.getTree("/").setProperty("scratch2", "v");
+            r2.commit();
+
+            // Exactly two deliveries — E1 first, then E2. If drain were
+            // broken after commit#1, we'd see [E1, E1, E2] = 3 events.
+            assertEquals("buffer must be drained between commits", 2, received.size());
+            assertEquals("first received is E1", "e1", received.get(0).getType());
+            assertEquals("second received is E2", "e2", received.get(1).getType());
+            // The marker is the regression-guard: a re-dispatch would
+            // duplicate "E1" at position 1, not produce a fresh "E2".
+            assertNotEquals("position 1 must not be a stale E1",
+                    "E1", received.get(1).getPayload().get("trace.id"));
+        }
+    }
+
+    /**
+     * Listener that throws {@code RuntimeException} from {@code onEvents}
+     * must not prevent other listeners on the same domain from receiving
+     * the event. Pins per-listener isolation in
+     * {@code DispatchAuditEventsHook.dispatchOne} (commit-attached).
+     */
+    @Test
+    public void listenerRuntimeExceptionDoesNotPreventOtherListeners() throws Exception {
+        List<AuditEvent> bReceived = new CopyOnWriteArrayList<>();
+        AuditEventListener throwingA = new AuditEventListener() {
+            @Override public @NotNull String getDomain() { return DOMAIN; }
+            @Override public int getRank() { return 10; } // dispatched first
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                throw new RuntimeException("synthetic-A");
+            }
+        };
+        AuditEventListener okB = new AuditEventListener() {
+            @Override public @NotNull String getDomain() { return DOMAIN; }
+            @Override public int getRank() { return 5; }
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                bReceived.addAll(events);
+            }
+        };
+        Registration regA = whiteboard.register(AuditEventListener.class, throwingA, Map.of());
+        Registration regB = whiteboard.register(AuditEventListener.class, okB, Map.of());
+        try (ContentSession session = login()) {
+            Root root = session.getLatestRoot();
+            AuditEvents.record(
+                    root, eventFor(DOMAIN, "x", Map.of()));
+            root.getTree("/").setProperty("scratch", "v");
+            root.commit();
+
+            assertEquals("listener-B must receive despite listener-A throwing",
+                    1, bReceived.size());
+        } finally {
+            regA.unregister();
+            regB.unregister();
+        }
+    }
+
+    /**
+     * Listener that throws {@code NoClassDefFoundError} (an
+     * {@link Error}, not an {@link Exception}) from {@code onEvents}
+     * must not prevent other listeners from receiving the event. Pins
+     * the catch-{@code Throwable} contract documented in
+     * {@code audit-spi/01-architecture.md §6}.
+     */
+    @Test
+    public void listenerNoClassDefFoundErrorIsIsolated() throws Exception {
+        List<AuditEvent> bReceived = new CopyOnWriteArrayList<>();
+        AuditEventListener throwingA = new AuditEventListener() {
+            @Override public @NotNull String getDomain() { return DOMAIN; }
+            @Override public int getRank() { return 10; }
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                throw new NoClassDefFoundError("synthetic-A");
+            }
+        };
+        AuditEventListener okB = new AuditEventListener() {
+            @Override public @NotNull String getDomain() { return DOMAIN; }
+            @Override public int getRank() { return 5; }
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                bReceived.addAll(events);
+            }
+        };
+        Registration regA = whiteboard.register(AuditEventListener.class, throwingA, Map.of());
+        Registration regB = whiteboard.register(AuditEventListener.class, okB, Map.of());
+        try (ContentSession session = login()) {
+            Root root = session.getLatestRoot();
+            AuditEvents.record(
+                    root, eventFor(DOMAIN, "x", Map.of()));
+            root.getTree("/").setProperty("scratch", "v");
+            root.commit();
+
+            assertEquals("listener-B must receive despite listener-A throwing NoClassDefFoundError",
+                    1, bReceived.size());
+        } finally {
+            regA.unregister();
+            regB.unregister();
+        }
+    }
+
+    /**
+     * Fire-and-forget variant of the runtime-exception isolation test.
+     * Pins the same property in {@code BufferSink.dispatch}.
+     */
+    @Test
+    public void fireAndForgetListenerRuntimeExceptionDoesNotPreventOthers() {
+        List<AuditEvent> bReceived = new CopyOnWriteArrayList<>();
+        AuditEventListener throwingA = new AuditEventListener() {
+            @Override public @NotNull String getDomain() { return DOMAIN; }
+            @Override public int getRank() { return 10; }
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                throw new RuntimeException("synthetic-A");
+            }
+        };
+        AuditEventListener okB = new AuditEventListener() {
+            @Override public @NotNull String getDomain() { return DOMAIN; }
+            @Override public int getRank() { return 5; }
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                bReceived.addAll(events);
+            }
+        };
+        Registration regA = whiteboard.register(AuditEventListener.class, throwingA, Map.of());
+        Registration regB = whiteboard.register(AuditEventListener.class, okB, Map.of());
+        try {
+            emitter.emit(eventFor(DOMAIN, "x", Map.of()));
+            assertEquals("fire-and-forget: listener-B must receive despite A's RuntimeException",
+                    1, bReceived.size());
+        } finally {
+            regA.unregister();
+            regB.unregister();
+        }
+    }
+
+    /**
+     * Fire-and-forget variant of the Error isolation test.
+     */
+    @Test
+    public void fireAndForgetListenerNoClassDefFoundErrorIsIsolated() {
+        List<AuditEvent> bReceived = new CopyOnWriteArrayList<>();
+        AuditEventListener throwingA = new AuditEventListener() {
+            @Override public @NotNull String getDomain() { return DOMAIN; }
+            @Override public int getRank() { return 10; }
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                throw new NoClassDefFoundError("synthetic-A");
+            }
+        };
+        AuditEventListener okB = new AuditEventListener() {
+            @Override public @NotNull String getDomain() { return DOMAIN; }
+            @Override public int getRank() { return 5; }
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                bReceived.addAll(events);
+            }
+        };
+        Registration regA = whiteboard.register(AuditEventListener.class, throwingA, Map.of());
+        Registration regB = whiteboard.register(AuditEventListener.class, okB, Map.of());
+        try {
+            emitter.emit(eventFor(DOMAIN, "x", Map.of()));
+            assertEquals("fire-and-forget: listener-B must receive despite A's NoClassDefFoundError",
+                    1, bReceived.size());
+        } finally {
+            regA.unregister();
+            regB.unregister();
+        }
+    }
+
+    //--------------------------------------------------< validator support >---
+
+    /**
+     * {@link ValidatorProvider} that injects a {@link Validator} which
+     * fails the commit when it observes a specific marker property added
+     * to the root. Used by {@link #commitFailureDiscardsStagedEvents()}
+     * to force a deterministic commit failure.
+     */
+    private static final class ThrowingValidatorProvider extends ValidatorProvider {
+
+        private final String triggerPropertyName;
+
+        ThrowingValidatorProvider(@NotNull String triggerPropertyName) {
+            this.triggerPropertyName = triggerPropertyName;
+        }
+
+        @NotNull
+        @Override
+        public Validator getRootValidator(NodeState before, NodeState after,
+                                          CommitInfo info) {
+            return new ThrowingValidator(triggerPropertyName);
+        }
+    }
+
+    private static final class ThrowingValidator extends DefaultValidator {
+
+        private final String triggerPropertyName;
+
+        ThrowingValidator(@NotNull String triggerPropertyName) {
+            this.triggerPropertyName = triggerPropertyName;
         }
 
         @Override
-        public @NotNull String getName() {
-            return "audit-test";
-        }
-
-        @Override
-        public @NotNull List<? extends CommitHook> getCommitHooks(@NotNull String workspaceName) {
-            return hooks;
+        public void propertyAdded(PropertyState after) throws CommitFailedException {
+            if (triggerPropertyName.equals(after.getName())) {
+                throw new CommitFailedException(CommitFailedException.CONSTRAINT, 1,
+                        "Injected validator failure: " + triggerPropertyName);
+            }
         }
     }
 }
