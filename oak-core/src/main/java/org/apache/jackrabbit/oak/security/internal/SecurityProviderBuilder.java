@@ -24,6 +24,7 @@ import org.apache.jackrabbit.oak.plugins.tree.RootProvider;
 import org.apache.jackrabbit.oak.plugins.tree.TreeProvider;
 import org.apache.jackrabbit.oak.plugins.tree.impl.RootProviderService;
 import org.apache.jackrabbit.oak.plugins.tree.impl.TreeProviderService;
+import org.apache.jackrabbit.oak.security.audit.AuditConfigurationImpl;
 import org.apache.jackrabbit.oak.security.authentication.AuthenticationConfigurationImpl;
 import org.apache.jackrabbit.oak.security.authentication.token.TokenConfigurationImpl;
 import org.apache.jackrabbit.oak.security.authorization.AuthorizationConfigurationImpl;
@@ -34,6 +35,7 @@ import org.apache.jackrabbit.oak.security.privilege.PrivilegeConfigurationImpl;
 import org.apache.jackrabbit.oak.security.user.UserConfigurationImpl;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
 import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
+import org.apache.jackrabbit.oak.spi.security.audit.AuditConfiguration;
 import org.apache.jackrabbit.oak.spi.security.authentication.AuthenticationConfiguration;
 import org.apache.jackrabbit.oak.spi.security.authentication.token.CompositeTokenConfiguration;
 import org.apache.jackrabbit.oak.spi.security.authentication.token.TokenConfiguration;
@@ -75,6 +77,9 @@ public final class SecurityProviderBuilder {
 
     private ConfigurationParameters tokenParams = EMPTY;
     private TokenConfiguration tokenConfiguration;
+
+    // Optional — null means the audit plug-in is not deployed.
+    private AuditConfiguration auditConfiguration;
 
     private ConfigurationParameters configuration;
 
@@ -224,12 +229,38 @@ public final class SecurityProviderBuilder {
         }
         securityProvider.setTokenConfiguration(tokenConfiguration);
 
+        // audit (optional)
+        if (auditConfiguration != null) {
+            initializeConfiguration(auditConfiguration, securityProvider, EMPTY, rootProvider, treeProvider);
+            // Run the non-OSGi pipeline-init path on AuditConfigurationImpl
+            // so the SAME entry point that OSGi activation uses is exercised
+            // in embedded / test deployments. The downcast is safe because
+            // SecurityProviderBuilder is the only caller that wires the
+            // audit impl outside OSGi, and the impl is intentionally not
+            // pluggable at this level (see SecurityProviderRegistration's
+            // unary-optional cardinality rationale).
+            if (whiteboard != null && auditConfiguration instanceof AuditConfigurationImpl) {
+                ((AuditConfigurationImpl) auditConfiguration).initialize(whiteboard);
+            }
+            securityProvider.setAuditConfiguration(auditConfiguration);
+        }
+
         // whiteboard
         if (whiteboard != null) {
             securityProvider.setWhiteboard(whiteboard);
         }
 
         return securityProvider;
+    }
+
+    /**
+     * Optional. Set the audit configuration. Pass {@code null} (the
+     * default) to build a provider without the audit pipeline; capture
+     * sites short-circuit at the NOOP {@code AuditEvents.Sink}.
+     */
+    public SecurityProviderBuilder withAuditConfiguration(AuditConfiguration auditConfiguration) {
+        this.auditConfiguration = auditConfiguration;
+        return this;
     }
 
     public SecurityProviderBuilder withWhiteboard(@NotNull Whiteboard whiteboard) {

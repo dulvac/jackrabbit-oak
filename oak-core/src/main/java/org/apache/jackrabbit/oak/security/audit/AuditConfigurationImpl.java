@@ -103,8 +103,28 @@ public class AuditConfigurationImpl extends ConfigurationBase implements AuditCo
                           @NotNull BundleContext bundleContext,
                           @NotNull Map<String, Object> properties) {
         setParameters(ConfigurationParameters.of(properties));
+        initialize(new OsgiWhiteboard(bundleContext));
+    }
 
-        Whiteboard whiteboard = new OsgiWhiteboard(bundleContext);
+    /**
+     * Non-OSGi entry point for wiring up the audit pipeline. Called by
+     * {@link #activate} in OSGi deployments after the {@code BundleContext}
+     * has been unwrapped into an {@code OsgiWhiteboard}, and by
+     * {@code SecurityProviderBuilder} in embedded / test deployments
+     * directly. The same code path runs in both worlds.
+     * <p>
+     * <strong>Must be called exactly once per instance.</strong> Calling
+     * it more than once orphans the previous {@code Feature} toggle and
+     * registry tracker, and silently overwrites the static
+     * {@link AuditEvents} / {@link AuditBufferLifecycle} sinks — v1 does
+     * not enforce single-call semantics, it's a contract. To rewire,
+     * call {@link #dispose()} first.
+     *
+     * @param whiteboard the whiteboard to register the {@code Feature}
+     *                   toggle and {@code AuditEventListener} tracker on;
+     *                   non-null.
+     */
+    public void initialize(@NotNull Whiteboard whiteboard) {
         featureToggle = Feature.newFeature(FEATURE_TOGGLE_NAME, whiteboard);
 
         registry = new WhiteboardAuditEventListenerRegistry();
@@ -121,32 +141,72 @@ public class AuditConfigurationImpl extends ConfigurationBase implements AuditCo
 
     @Deactivate
     private void deactivate() {
+        dispose();
+    }
+
+    /**
+     * Non-OSGi tear-down entry point, paired with
+     * {@link #initialize(Whiteboard)}. Called by {@link #deactivate} in
+     * OSGi deployments and directly by tests / embedded callers. Safe to
+     * call when no pipeline was previously initialized — each step
+     * guards against unset state.
+     * <p>
+     * Each cleanup step is wrapped in its own try/catch so an exception
+     * at one step does not skip the rest: an OSGi deactivate that leaves
+     * static façades pointing at half-torn-down state is worse than a
+     * noisy log.
+     */
+    public void dispose() {
         // Order matters — see Risk 5 in 01-architecture.md.
+
         // 1. Close the feature toggle FIRST. AuditEvents.isEnabled()
         //    immediately returns false, so any new capture-site call
         //    that races with deactivation short-circuits before reaching
         //    the buffer (which we're about to dismantle).
         if (featureToggle != null) {
-            featureToggle.close();
-            featureToggle = null;
+            try {
+                featureToggle.close();
+            } catch (RuntimeException e) {
+                log.warn("Audit deactivate: featureToggle.close() failed; continuing.", e);
+            } finally {
+                featureToggle = null;
+            }
         }
         // 2. Stop discovery — listeners disappear from getServices().
         if (registry != null) {
-            registry.stop();
-            registry = null;
+            try {
+                registry.stop();
+            } catch (RuntimeException e) {
+                log.warn("Audit deactivate: registry.stop() failed; continuing.", e);
+            } finally {
+                registry = null;
+            }
         }
         // 3. Route AuditEvents/AuditBufferLifecycle to NOOP. Now even
         //    callers that already passed the isEnabled() gate land on
         //    no-ops.
-        AuditEvents.install(null);
-        AuditBufferLifecycle.install(null);
+        try {
+            AuditEvents.install(null);
+        } catch (RuntimeException e) {
+            log.warn("Audit deactivate: AuditEvents.install(null) failed; continuing.", e);
+        }
+        try {
+            AuditBufferLifecycle.install(null);
+        } catch (RuntimeException e) {
+            log.warn("Audit deactivate: AuditBufferLifecycle.install(null) failed; continuing.", e);
+        }
         // 4. Drain the deactivator thread's ThreadLocal. Residual entries
         //    on other threads are bounded by worker-pool × in-flight
         //    sessions; acknowledged trade-off for v1 (no weak-reference
         //    machinery).
         if (buffer != null) {
-            buffer.clearAll();
-            buffer = null;
+            try {
+                buffer.clearAll();
+            } catch (RuntimeException e) {
+                log.warn("Audit deactivate: buffer.clearAll() failed; continuing.", e);
+            } finally {
+                buffer = null;
+            }
         }
         log.info("Audit pipeline deactivated.");
     }
