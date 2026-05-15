@@ -102,8 +102,7 @@ final class DispatchAuditEventsHook implements PostValidationHook {
 
     private static @NotNull List<AuditEvent> decorate(@NotNull List<AuditEvent> events,
                                                       @NotNull CommitInfo info) {
-        // Passthrough until Task 11 lands CommitMetadataDecorator.
-        return events;
+        return CommitMetadataDecorator.decorate(events, info);
     }
 
     private static @NotNull Map<String, List<AuditEvent>> groupByDomain(@NotNull List<AuditEvent> events) {
