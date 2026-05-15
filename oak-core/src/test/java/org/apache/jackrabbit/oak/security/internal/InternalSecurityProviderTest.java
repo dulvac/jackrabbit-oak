@@ -19,6 +19,7 @@ package org.apache.jackrabbit.oak.security.internal;
 import org.apache.jackrabbit.oak.commons.collections.IterableUtils;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
 import org.apache.jackrabbit.oak.spi.security.SecurityConfiguration;
+import org.apache.jackrabbit.oak.spi.security.audit.AuditConfiguration;
 import org.apache.jackrabbit.oak.spi.security.authentication.AuthenticationConfiguration;
 import org.apache.jackrabbit.oak.spi.security.authentication.token.TokenConfiguration;
 import org.apache.jackrabbit.oak.spi.security.authorization.AuthorizationConfiguration;
@@ -198,5 +199,34 @@ public class InternalSecurityProviderTest {
     @Test
     public void testGetParametersForUnknown() {
         assertSame(ConfigurationParameters.EMPTY, securityProvider.getParameters("unknownName"));
+    }
+
+    @Test
+    public void testDefaultAuditConfiguration() {
+        // Default never null — returns the NOOP instance.
+        assertSame(AuditConfiguration.NOOP, securityProvider.getConfiguration(AuditConfiguration.class));
+        assertTrue(IterableUtils.contains(securityProvider.getConfigurations(), AuditConfiguration.NOOP));
+    }
+
+    @Test
+    public void testSetAuditConfiguration() {
+        AuditConfiguration ac = Mockito.mock(AuditConfiguration.class);
+        when(ac.getParameters()).thenReturn(PARAMS);
+
+        securityProvider.setAuditConfiguration(ac);
+
+        assertSame(ac, securityProvider.getConfiguration(AuditConfiguration.class));
+        assertTrue(IterableUtils.contains(securityProvider.getConfigurations(), ac));
+        // Exercises the AuditConfiguration.NAME branch in the private name-based lookup.
+        assertEquals(PARAMS, securityProvider.getParameters(AuditConfiguration.NAME));
+    }
+
+    @Test
+    public void testSetAuditConfigurationNullRestoresNoop() {
+        // Set then clear — null parameter must restore the NOOP, not leave the previous instance.
+        securityProvider.setAuditConfiguration(Mockito.mock(AuditConfiguration.class));
+        securityProvider.setAuditConfiguration(null);
+
+        assertSame(AuditConfiguration.NOOP, securityProvider.getConfiguration(AuditConfiguration.class));
     }
 }
