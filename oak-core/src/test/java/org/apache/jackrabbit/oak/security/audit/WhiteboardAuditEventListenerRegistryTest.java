@@ -18,6 +18,7 @@ package org.apache.jackrabbit.oak.security.audit;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
 import org.apache.jackrabbit.oak.spi.audit.AuditEventListener;
@@ -119,12 +120,21 @@ public class WhiteboardAuditEventListenerRegistryTest {
     }
 
     /**
-     * Listener-order stability when ranks tie. The Javadoc on
-     * {@link WhiteboardAuditEventListenerRegistry} promises
-     * "ties preserve Whiteboard insertion order because List.sort is stable."
-     * Without this test, a refactor that swaps the stable sort for an
-     * unstable one (e.g. quicksort-variants tend to be) would silently
-     * break observable listener order without failing existing tests.
+     * Listener ordering with a mix of distinct and equal ranks:
+     * <ul>
+     *   <li>Strict descending order where ranks differ — the highest-rank
+     *       listener comes first, the lowest-rank last.</li>
+     *   <li>Equal-rank entries appear as a contiguous block; their internal
+     *       order is determined by the underlying {@link Whiteboard} (and
+     *       must be stable across repeat {@code getListeners()} calls per
+     *       the registry Javadoc).</li>
+     * </ul>
+     * Note: {@link DefaultWhiteboard} stores services in an identity-hash
+     * set, so it does NOT preserve registration order for equal-rank
+     * entries — only OSGi's {@code OsgiWhiteboard} honors registration
+     * order via {@code service.ranking}. This test therefore asserts set
+     * equality (not list equality) on the equal-rank block, plus
+     * determinism on repeat calls.
      */
     @Test
     public void stableOrderAmongEqualRanks() {
@@ -132,18 +142,36 @@ public class WhiteboardAuditEventListenerRegistryTest {
         WhiteboardAuditEventListenerRegistry reg = new WhiteboardAuditEventListenerRegistry();
         reg.start(wb);
         try {
-            StubListener first = new StubListener("d", 5);
-            StubListener second = new StubListener("d", 5);
-            StubListener third = new StubListener("d", 5);
-            wb.register(AuditEventListener.class, first, Map.of());
-            wb.register(AuditEventListener.class, second, Map.of());
-            wb.register(AuditEventListener.class, third, Map.of());
+            StubListener high = new StubListener("d", 10);
+            StubListener midA = new StubListener("d", 5);
+            StubListener midB = new StubListener("d", 5);
+            StubListener midC = new StubListener("d", 5);
+            StubListener low = new StubListener("d", 1);
+            wb.register(AuditEventListener.class, high, Map.of());
+            wb.register(AuditEventListener.class, midA, Map.of());
+            wb.register(AuditEventListener.class, midB, Map.of());
+            wb.register(AuditEventListener.class, midC, Map.of());
+            wb.register(AuditEventListener.class, low, Map.of());
+
             List<AuditEventListener> sorted = reg.getListeners();
-            assertEquals(3, sorted.size());
-            // Insertion order preserved among equal ranks.
-            assertSame(first, sorted.get(0));
-            assertSame(second, sorted.get(1));
-            assertSame(third, sorted.get(2));
+            assertEquals(5, sorted.size());
+
+            // Strict ordering where ranks differ.
+            assertSame("highest rank must be first", high, sorted.get(0));
+            assertSame("lowest rank must be last", low, sorted.get(4));
+
+            // Equal-rank entries (rank 5) form a contiguous block in
+            // positions 1..3 — set equality, not list equality, because
+            // DefaultWhiteboard does not preserve registration order.
+            Set<AuditEventListener> middle = Set.copyOf(sorted.subList(1, 4));
+            assertEquals("middle three positions must hold all rank-5 entries",
+                    Set.of(midA, midB, midC), middle);
+
+            // Stable sort: repeat call must return identical order. An
+            // unstable sort would reorder the equal-rank entries on the
+            // second call even with the same input.
+            assertEquals("stable sort — repeat call returns identical order",
+                    sorted, reg.getListeners());
         } finally {
             reg.stop();
         }
