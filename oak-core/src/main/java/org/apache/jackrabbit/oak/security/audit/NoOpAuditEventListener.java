@@ -31,7 +31,7 @@ import static org.apache.jackrabbit.oak.spi.security.audit.SecurityAuditDomain.N
  * listener is registered. Logs at TRACE level only; payloads are not
  * logged at higher levels by default.
  */
-public final class NoOpAuditEventListener implements AuditEventListener {
+final class NoOpAuditEventListener implements AuditEventListener {
 
     private static final Logger log = LoggerFactory.getLogger(NoOpAuditEventListener.class);
 

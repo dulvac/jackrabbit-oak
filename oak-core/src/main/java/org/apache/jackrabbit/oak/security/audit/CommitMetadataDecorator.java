@@ -21,6 +21,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
 import org.apache.jackrabbit.oak.spi.commit.CommitInfo;
@@ -34,6 +35,25 @@ import org.jetbrains.annotations.NotNull;
  * The decorator returns NEW {@link AuditEvent} instances that wrap the
  * originals; the input events are not mutated. The wrapper's payload map
  * is unmodifiable.
+ *
+ * <h3>Security invariant</h3>
+ * Caller-supplied {@link #KEY_SESSION_ID}, {@link #KEY_USER_ID}, and
+ * {@link #KEY_TIMESTAMP} entries in the input payload are
+ * <strong>unconditionally overwritten</strong> with the values from the
+ * {@link CommitInfo} captured for the surrounding commit. This invariant
+ * is what allows listeners to treat the presence of {@code commit.*} keys
+ * as Oak-attested — see the trust contract on
+ * {@link org.apache.jackrabbit.oak.spi.audit.AuditEvent#getPayload()}.
+ * Any change to {@code putIfAbsent} / {@code computeIfAbsent} / conditional
+ * {@code put} for these keys is a regression in the trust model.
+ *
+ * <h3>Payload null-value contract</h3>
+ * The decorator trusts the no-null-keys/no-null-values contract documented
+ * on {@link org.apache.jackrabbit.oak.spi.audit.AuditEventListener#onEvents}.
+ * Buggy event implementations that violate it may leak null values to
+ * listeners — runtime validation is the event author's responsibility,
+ * not the decorator's. Adding per-entry null checks here would impose
+ * hot-path cost for what is an SPI-contract violation.
  */
 final class CommitMetadataDecorator {
 
@@ -69,7 +89,7 @@ final class CommitMetadataDecorator {
                             @NotNull String sessionId,
                             @NotNull String userId,
                             long commitTimestamp) {
-            this.delegate = delegate;
+            this.delegate = Objects.requireNonNull(delegate, "delegate");
             Map<String, Object> merged = new HashMap<>(delegate.getPayload());
             merged.put(KEY_SESSION_ID, sessionId);
             merged.put(KEY_USER_ID, userId);

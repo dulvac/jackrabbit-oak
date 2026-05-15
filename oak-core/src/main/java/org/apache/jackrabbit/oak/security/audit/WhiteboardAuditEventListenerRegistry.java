@@ -71,8 +71,15 @@ final class WhiteboardAuditEventListenerRegistry
     @NotNull
     List<AuditEventListener> getListeners() {
         List<AuditEventListener> services = getServices();
-        if (services.size() <= 1) {
-            return services;
+        if (services.isEmpty()) {
+            return List.of();
+        }
+        // Always return an immutable copy — the underlying tracker may
+        // expose a live mutable view; we don't want callers to be able
+        // to mutate it. Sorting is a no-op for size 1 but we still copy
+        // to defend the contract.
+        if (services.size() == 1) {
+            return List.copyOf(services);
         }
         List<AuditEventListener> sorted = new ArrayList<>(services);
         sorted.sort(BY_RANK_DESC);

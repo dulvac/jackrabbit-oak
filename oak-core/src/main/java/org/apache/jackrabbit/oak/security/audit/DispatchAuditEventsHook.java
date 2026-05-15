@@ -67,12 +67,22 @@ final class DispatchAuditEventsHook implements PostValidationHook {
         }
         CommitContext ctx = (CommitContext) info.getInfo().get(CommitContext.NAME);
         if (ctx == null) {
+            // No CommitContext on this commit (non-MutableRoot path, e.g. an internal
+            // NodeStore.merge skipping ResetCommitAttributeHook). Snapshot couldn't
+            // stash, so there's nothing to dispatch — but the buffer may still hold
+            // events captured for this session. Drain to prevent ThreadLocal
+            // accumulation across commits on the same session.
+            buffer.drain(info.getSessionId());
             return after;
         }
         Object stashed = ctx.get(SnapshotAuditBufferHook.COMMIT_CONTEXT_KEY);
         if (!(stashed instanceof List)) {
             return after;
         }
+        // Safe because COMMIT_CONTEXT_KEY ("oak.audit.events") is
+        // package-private to this module and only SnapshotAuditBufferHook
+        // writes there — it always writes a List<AuditEvent>. Do not widen
+        // the key's visibility without redesigning this cast.
         @SuppressWarnings("unchecked")
         List<AuditEvent> events = (List<AuditEvent>) stashed;
         try {
@@ -83,7 +93,6 @@ final class DispatchAuditEventsHook implements PostValidationHook {
             if (listeners.isEmpty()) {
                 return after;
             }
-            // Task 11 replaces this passthrough with real metadata decoration.
             List<AuditEvent> decorated = decorate(events, info);
             Map<String, List<AuditEvent>> byDomain = groupByDomain(decorated);
             for (AuditEventListener listener : listeners) {
