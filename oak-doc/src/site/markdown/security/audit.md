@@ -97,14 +97,14 @@ with three additional payload entries:
 | Key | Value | Source |
 |---|---|---|
 | `commit.sessionId` | session identifier of the writing session | `CommitInfo.getSessionId()` |
-| `commit.userId`    | acting user id (`OAK_UNKNOWN` for system commits) | `CommitInfo.getUserId()` |
+| `commit.userId`    | acting user id (`CommitInfo.OAK_UNKNOWN` (`"oak:unknown"`) for system commits) | `CommitInfo.getUserId()` |
 | `commit.timestamp` | commit timestamp in milliseconds since epoch     | `CommitInfo.getDate()` |
 
 Events arriving through the fire-and-forget pipeline do NOT carry these keys.
 Consumers that need to tell the two sources apart inspect for the presence of
-`commit.sessionId`. The `commit.userId` value `OAK_UNKNOWN` is a deliberate
-anonymity marker for system commits; listeners MUST NOT attempt to resolve it
-to a real user.
+`commit.sessionId`. The `commit.userId` value `CommitInfo.OAK_UNKNOWN`
+(`"oak:unknown"`) is a deliberate anonymity marker for system commits;
+listeners MUST NOT attempt to resolve it to a real user.
 
 <a name="pipelines"></a>
 ### Pipelines
@@ -123,8 +123,8 @@ The dispatch sequence is:
 3. On success, `DispatchAuditEventsHook` drains the buffer, decorates each
    event with `commit.sessionId`, `commit.userId`, `commit.timestamp`, and
    hands the list to the listener registry.
-4. The registry filters by domain, sorts by rank, and invokes each matching
-   listener's `onEvents(List<AuditEvent>)`.
+4. The registry sorts listeners by rank, then the dispatch path filters by
+   domain and invokes each matching listener's `onEvents(List<AuditEvent>)`.
 
 Capture sites inside Oak record events through the internal `AuditEvents`
 façade; this path is not part of the public consumer surface. Bundles wishing
@@ -140,8 +140,9 @@ rollback. The pipeline is:
 2. Caller gates allocation with `isEnabledFor(domain)`.
 3. Caller invokes `emit(event)`.
 4. The emitter forwards to the static façade, which routes to the listener
-   registry. The registry filters by domain, sorts by rank, and invokes each
-   matching listener's `onEvents(List<AuditEvent>)`.
+   registry. The registry sorts listeners by rank, then the dispatch path
+   filters by domain and invokes each matching listener's
+   `onEvents(List<AuditEvent>)`.
 
 Properties:
 
@@ -257,9 +258,10 @@ public class SiemForwarder implements AuditEventListener {
 
 Contract notes:
 
-- **`getDomain()`** is invoked once on registration and MUST return a stable,
-  non-null value. A listener subscribes to exactly one domain. To consume
-  multiple domains, register multiple listener components.
+- **`getDomain()`** is queried on every dispatch and MUST return a stable,
+  non-null value across the listener's lifetime. A listener subscribes to
+  exactly one domain. To consume multiple domains, register multiple
+  listener components.
 - **`getRank()`** orders listeners within a domain. Higher rank first.
   Default 0. Useful when one listener must observe state set by another (for
   example, a redaction listener running before a SIEM forwarder).
