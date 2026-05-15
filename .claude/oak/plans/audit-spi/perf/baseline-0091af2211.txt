@@ -1,0 +1,12 @@
+=== BasicWriteTest (baseline 0091af2211) ===
+# BasicWriteTest                   C     min     10%     50%     90%     max     N       mean 
+Oak-MemoryNS                       1      13      19      48      79     91     609      49
+
+=== AddMemberTest (baseline 0091af2211) ===
+# AddMemberTest                    C     min     10%     50%     90%     max     N       mean 
+Oak-MemoryNS                       1   14217   14217   15723   16279  16279       3   15406
+
+=== RemoveMemberTest (baseline 0091af2211) ===
+# RemoveMemberTest                 C     min     10%     50%     90%     max     N       mean 
+Oak-MemoryNS                       1   25913   25913   26103   26292  26292       2   26103
+
