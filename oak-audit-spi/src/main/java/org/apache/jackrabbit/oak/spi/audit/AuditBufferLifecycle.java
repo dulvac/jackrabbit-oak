@@ -17,6 +17,7 @@
 package org.apache.jackrabbit.oak.spi.audit;
 
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Static façade used by {@code MutableRoot} (in {@code oak-core}) to notify
@@ -85,10 +86,19 @@ public final class AuditBufferLifecycle {
     /**
      * Installs the active listener. Called by the audit module on
      * activation. Passing {@code null} resets to the NOOP listener.
+     * <p>
+     * <strong>Bundle deployment is the security boundary.</strong> An attacker
+     * with bundle-deploy capability can intercept (by installing a custom
+     * Listener) or silently disable (by installing the NOOP via
+     * {@code install(null)}) the buffer-lifecycle wiring. Protecting against
+     * this requires OSGi-level controls (bundle signing, deployment policy);
+     * SPI-level access controls cannot help once a hostile bundle is already
+     * deployed. Embedded (non-OSGi) deployments inherit the JVM classpath as
+     * the boundary instead.
      *
      * @param newListener the listener to install, or {@code null}.
      */
-    public static void install(Listener newListener) {
+    public static void install(@Nullable Listener newListener) {
         listener = (newListener != null) ? newListener : NOOP;
     }
 

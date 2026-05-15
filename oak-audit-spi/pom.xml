@@ -46,7 +46,7 @@
                 <configuration>
                     <instructions>
                         <Export-Package>
-                            org.apache.jackrabbit.oak.spi.audit;version=${project.version}
+                            org.apache.jackrabbit.oak.spi.audit
                         </Export-Package>
                     </instructions>
                 </configuration>

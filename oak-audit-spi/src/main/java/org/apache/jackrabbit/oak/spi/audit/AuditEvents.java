@@ -18,6 +18,7 @@ package org.apache.jackrabbit.oak.spi.audit;
 
 import org.apache.jackrabbit.oak.api.Root;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Static façade used by Oak-internal code (commit-attached capture sites,
@@ -79,8 +80,17 @@ public final class AuditEvents {
     /**
      * Installs the active sink. Called by the audit module on activation.
      * Passing {@code null} resets the façade to the NOOP sink.
+     * <p>
+     * <strong>Bundle deployment is the security boundary.</strong> An attacker
+     * with bundle-deploy capability can intercept (by installing a custom
+     * Sink that exfiltrates events) or silently disable (by installing the
+     * NOOP via {@code install(null)}) the audit pipeline. Protecting against
+     * this requires OSGi-level controls (bundle signing, deployment policy);
+     * SPI-level access controls cannot help once a hostile bundle is already
+     * deployed. Embedded (non-OSGi) deployments inherit the JVM classpath as
+     * the boundary instead.
      */
-    public static void install(Sink newSink) {
+    public static void install(@Nullable Sink newSink) {
         sink = (newSink != null) ? newSink : NOOP;
     }
 
