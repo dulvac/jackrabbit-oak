@@ -22,12 +22,14 @@ import java.util.Map;
 import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
 import org.apache.jackrabbit.oak.spi.audit.AuditEventListener;
 import org.apache.jackrabbit.oak.spi.whiteboard.DefaultWhiteboard;
+import org.apache.jackrabbit.oak.spi.whiteboard.Registration;
 import org.apache.jackrabbit.oak.spi.whiteboard.Whiteboard;
 import org.jetbrains.annotations.NotNull;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 public class WhiteboardAuditEventListenerRegistryTest {
@@ -111,6 +113,63 @@ public class WhiteboardAuditEventListenerRegistryTest {
             assertTrue(reg.hasListenerFor("security"));
             // Different domain must still return false.
             assertFalse(reg.hasListenerFor("aem.content"));
+        } finally {
+            reg.stop();
+        }
+    }
+
+    /**
+     * Listener-order stability when ranks tie. The Javadoc on
+     * {@link WhiteboardAuditEventListenerRegistry} promises
+     * "ties preserve Whiteboard insertion order because List.sort is stable."
+     * Without this test, a refactor that swaps the stable sort for an
+     * unstable one (e.g. quicksort-variants tend to be) would silently
+     * break observable listener order without failing existing tests.
+     */
+    @Test
+    public void stableOrderAmongEqualRanks() {
+        Whiteboard wb = new DefaultWhiteboard();
+        WhiteboardAuditEventListenerRegistry reg = new WhiteboardAuditEventListenerRegistry();
+        reg.start(wb);
+        try {
+            StubListener first = new StubListener("d", 5);
+            StubListener second = new StubListener("d", 5);
+            StubListener third = new StubListener("d", 5);
+            wb.register(AuditEventListener.class, first, Map.of());
+            wb.register(AuditEventListener.class, second, Map.of());
+            wb.register(AuditEventListener.class, third, Map.of());
+            List<AuditEventListener> sorted = reg.getListeners();
+            assertEquals(3, sorted.size());
+            // Insertion order preserved among equal ranks.
+            assertSame(first, sorted.get(0));
+            assertSame(second, sorted.get(1));
+            assertSame(third, sorted.get(2));
+        } finally {
+            reg.stop();
+        }
+    }
+
+    /**
+     * Unregistering a listener via the {@link Registration#unregister()}
+     * handle must remove it from {@link WhiteboardAuditEventListenerRegistry#getListeners()}
+     * and from {@link WhiteboardAuditEventListenerRegistry#hasListenerFor(String)}.
+     */
+    @Test
+    public void unregisterRemovesListener() {
+        Whiteboard wb = new DefaultWhiteboard();
+        WhiteboardAuditEventListenerRegistry reg = new WhiteboardAuditEventListenerRegistry();
+        reg.start(wb);
+        try {
+            Registration r = wb.register(AuditEventListener.class,
+                    new StubListener("security", 0), Map.of());
+            assertEquals(1, reg.getListeners().size());
+            assertTrue(reg.hasListenerFor("security"));
+
+            r.unregister();
+
+            assertEquals(0, reg.getListeners().size());
+            assertFalse(reg.hasListenerFor("security"));
+            assertFalse(reg.hasAnyListener());
         } finally {
             reg.stop();
         }
