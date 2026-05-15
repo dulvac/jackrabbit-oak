@@ -286,9 +286,15 @@ public class AuditConfigurationImpl extends ConfigurationBase implements AuditCo
                 }
                 try {
                     listener.onEvents(single);
-                } catch (RuntimeException re) {
-                    log.warn("AuditEventListener {} failed on fire-and-forget dispatch in domain '{}'; swallowing.",
-                            listener.getClass().getName(), domain, re);
+                } catch (Throwable t) {
+                    // Per-listener isolation: a misconfigured consumer bundle whose listener
+                    // throws e.g. LinkageError must not fail the commit for unrelated work.
+                    // JVM-level pathology (OutOfMemoryError) is caught here too but
+                    // re-triggers on the next allocation and surfaces through normal channels.
+                    // Do not narrow this catch to RuntimeException without re-reading the
+                    // design discussion. See: audit-spi/01-architecture.md §6.
+                    log.warn("AuditEventListener {} threw {} on fire-and-forget dispatch in domain '{}'; isolating from other listeners.",
+                            listener.getClass().getName(), t.getClass().getSimpleName(), domain, t);
                 }
             }
         }
