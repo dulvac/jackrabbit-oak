@@ -210,7 +210,12 @@ public class SecurityProviderRegistrationTest extends AbstractSecurityTest {
 
         SecurityProvider service = context.getService(SecurityProvider.class);
         assertNotNull(service);
-        assertEquals(6, IterableUtils.size(IterableUtils.filter(service.getConfigurations(), x -> x != null)));
+        // 7 configurations: authentication, authorization, user, privilege,
+        // principal, token, audit. AuditConfiguration is defaulted to
+        // AuditConfiguration.NOOP after BLOCKER-2 registration wiring; NOOP
+        // is non-null per the SPI contract, so it counts in the filtered
+        // size.
+        assertEquals(7, IterableUtils.size(IterableUtils.filter(service.getConfigurations(), x -> x != null)));
     }
 
 
