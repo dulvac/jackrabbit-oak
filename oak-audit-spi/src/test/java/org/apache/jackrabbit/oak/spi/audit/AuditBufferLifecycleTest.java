@@ -34,9 +34,25 @@ public class AuditBufferLifecycleTest {
 
     @Test
     public void noOpWhenNoListenerInstalled() {
-        // Exercises the NOOP listener bodies — no exception, no observable effect.
-        AuditBufferLifecycle.onCommitFailed("s-1");
-        AuditBufferLifecycle.onRefresh("s-1");
+        // Calls on the NOOP listener must complete without exception AND
+        // without observable side effect on any subsequently installed
+        // listener. Sentinel pattern: first call NOOP, then install a
+        // sentinel and verify it is fresh (no spurious replay).
+        AuditBufferLifecycle.onCommitFailed("s-noop-1");
+        AuditBufferLifecycle.onRefresh("s-noop-1");
+
+        AtomicReference<String> sentinel = new AtomicReference<>();
+        AuditBufferLifecycle.install(new AuditBufferLifecycle.Listener() {
+            @Override public void onCommitFailed(@NotNull String sessionId) {
+                sentinel.set("failed:" + sessionId);
+            }
+            @Override public void onRefresh(@NotNull String sessionId) {
+                sentinel.set("refresh:" + sessionId);
+            }
+        });
+        // No prior invocation should have been queued / replayed onto
+        // the newly-installed sentinel.
+        assertNull("sentinel must not observe pre-install NOOP calls", sentinel.get());
     }
 
     @Test

@@ -44,6 +44,17 @@ public class AuditEventListenerTest {
 
     @Test
     public void listenerReceivesCallToOnEvents() {
+        // Per AuditEventListener.onEvents Javadoc: "the non-empty list of
+        // events for this listener's domain." Test exercises the contract
+        // with a non-empty list — passing emptyList would contradict the
+        // documented contract.
+        AuditEvent event = new AuditEvent() {
+            @Override public @NotNull String getDomain() { return "test"; }
+            @Override public @NotNull String getType() { return "t"; }
+            @Override public long getTimestamp() { return 0L; }
+        };
+        List<AuditEvent> input = Collections.singletonList(event);
+
         final List<AuditEvent>[] received = new List[]{null};
         AuditEventListener listener = new AuditEventListener() {
             @Override
@@ -56,7 +67,8 @@ public class AuditEventListenerTest {
                 received[0] = events;
             }
         };
-        listener.onEvents(Collections.emptyList());
-        assertEquals(Collections.emptyList(), received[0]);
+        listener.onEvents(input);
+        assertEquals(1, received[0].size());
+        assertEquals(event, received[0].get(0));
     }
 }
