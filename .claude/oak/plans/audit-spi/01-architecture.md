@@ -282,14 +282,22 @@ Minimal config surface for v1; following `UserConfigurationImpl.java:82-203`:
     @AttributeDefinition(
         name = "Listener invocation timeout (ms)",
         description = "Soft budget logged when a listener exceeds this duration. 0 disables timing.")
-    long listenerTimeoutMs() default 0L;
+    long listenerTimeoutMs() default 0L;             // [v1 status: not landed]
 
     @AttributeDefinition(
         name = "Drop events on listener exception",
         description = "If true (default), a listener throwing only logs; other listeners still run.")
-    boolean isolateListenerExceptions() default true;
+    boolean isolateListenerExceptions() default true; // [v1 status: not landed — see §6.5]
 }
 ```
+
+**v1 status**: neither attribute sketched above landed in the committed
+`AuditConfigurationImpl.Configuration` — `@interface Configuration` is
+empty by design (`AuditConfigurationImpl.java:80-88`: "Configuration is
+currently empty by design: capture/dispatch behavior is controlled
+exclusively by the feature toggle"). See §6.5 for why
+`isolateListenerExceptions` is unconditional rather than configurable;
+`listenerTimeoutMs` is deferred without a concrete revisit trigger.
 
 We intentionally do **not** expose the toggle state as a metatype property: the toggle is flipped via Whiteboard at runtime (`FeatureToggle.setEnabled(boolean)` — `oak-core-spi/.../spi/toggle/FeatureToggle.java:66`), not via OSGi config. Mixing the two configuration channels is a footgun.
 
