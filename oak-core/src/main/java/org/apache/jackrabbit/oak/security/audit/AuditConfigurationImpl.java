@@ -16,6 +16,7 @@
  */
 package org.apache.jackrabbit.oak.security.audit;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -23,6 +24,7 @@ import org.apache.jackrabbit.oak.api.Root;
 import org.apache.jackrabbit.oak.osgi.OsgiWhiteboard;
 import org.apache.jackrabbit.oak.spi.audit.AuditBufferLifecycle;
 import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
+import org.apache.jackrabbit.oak.spi.audit.AuditEventListener;
 import org.apache.jackrabbit.oak.spi.audit.AuditEvents;
 import org.apache.jackrabbit.oak.spi.commit.CommitHook;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationBase;
@@ -209,10 +211,26 @@ public class AuditConfigurationImpl extends ConfigurationBase implements AuditCo
 
         @Override
         public void dispatch(@NotNull AuditEvent event) {
-            // Chunk 7 wires fire-and-forget dispatch here.
-            // For now, throw to make the gap obvious if exercised.
-            throw new UnsupportedOperationException(
-                    "AuditEvents.dispatch not yet wired; will land in Chunk 7");
+            if (!toggle.isEnabled()) {
+                return;
+            }
+            List<AuditEventListener> listeners = registry.getListeners();
+            if (listeners.isEmpty()) {
+                return;
+            }
+            String domain = event.getDomain();
+            List<AuditEvent> single = Collections.singletonList(event);
+            for (AuditEventListener listener : listeners) {
+                if (!domain.equals(listener.getDomain())) {
+                    continue;
+                }
+                try {
+                    listener.onEvents(single);
+                } catch (RuntimeException re) {
+                    log.warn("AuditEventListener {} failed on fire-and-forget dispatch in domain '{}'; swallowing.",
+                            listener.getClass().getName(), domain, re);
+                }
+            }
         }
     }
 }
