@@ -115,21 +115,25 @@ Verifies `DispatchAuditEventsHook implements PostValidationHook`.
 ### 1.5 `AuditEventsTest`
 
 Lives in `oak-security-spi/src/test/java/org/apache/jackrabbit/oak/spi/security/audit/AuditEventsTest.java`.
-SPI-level tests for the static façade `AuditEvents.record(Root, AuditEvent)` and `AuditEvents.isEnabled()`. Pure unit, mostly Mockito.
+SPI-level tests for the static façade `AuditEvents.record(String sessionId, AuditEvent)` and `AuditEvents.isEnabled()`. Pure unit, mostly Mockito.
+
+**Sink contract update (locked design, `07-bridge-design.md` §5):** The `Sink.record` signature is `record(@NotNull String sessionId, @NotNull AuditEvent event)`. The earlier `(Root, AuditEvent)` signature was dropped — the `Root` parameter was unnecessary once the bridge module needed only the session id (returned by `JackrabbitSession.getInternalSessionId()`) and Oak's in-tree capture sites can derive the same id directly via `getContentSession().toString()` without going through `Root`. This eliminates the `record_rootNotInstanceOfAuditEventAware_noOp` defensive test entirely.
 
 **Reset between tests:** `@After` calls `AuditEvents.install(null)` to restore the `NOOP` sink (grace's confirmed API — single `volatile Sink` field, swap-on-install, null restores NOOP). No reflection, no separate test-only reset method.
 
-- `AuditEventsTest.isEnabled_noSinkInstalled_returnsFalse` — fresh state (`install(null)` in `@Before`); `isEnabled()` is `false`; subsequent `record(...)` is a no-op (verify `Root.getContentSession()` not called).
+- `AuditEventsTest.isEnabled_noSinkInstalled_returnsFalse` — fresh state (`install(null)` in `@Before`); `isEnabled()` is `false`; subsequent `record(...)` is a no-op (verify mock sink's `record` not invoked).
 - `AuditEventsTest.isEnabled_sinkInstalledFeatureToggleOff_returnsFalse` — install a sink whose backing `Feature.isEnabled()` returns `false`; `AuditEvents.isEnabled()` is `false`.
 - `AuditEventsTest.isEnabled_sinkInstalledFeatureToggleOn_returnsTrue` — install a sink whose `Feature.isEnabled()` returns `true`; `AuditEvents.isEnabled()` is `true`.
+- `AuditEventsTest.isEnabledFor_delegatesToSinkForDomain` — install a sink stubbing `isEnabledFor("security")` → `true`, `isEnabledFor("aem.content")` → `false`; verify static façade delegates verbatim.
 - `AuditEventsTest.install_nullArg_restoresNoopSink` — install a real sink; record an event; install `null`; `isEnabled()` is `false`; record is no-op (verify via captured count on the previously installed sink — count unchanged after `install(null)`).
 - `AuditEventsTest.install_replacesExistingSink` — install sink A, install sink B, record event; only B's count incremented (A no longer receives). Pins the swap-not-stack semantic.
-- `AuditEventsTest.record_toggleDisabled_noOp` — sink installed but toggle off; `AuditEvents.record(root, event)`; verify `root.getContentSession()` not called, no buffer append.
-- `AuditEventsTest.record_toggleEnabledNoListenerForDomain_noOp` — toggle on, but the sink's `hasListenerFor(event.getDomain())` short-circuit returns `false`; verify buffer not touched (no allocation cost in this case).
-- `AuditEventsTest.record_toggleEnabledListenerPresent_appendedToBuffer` — toggle on, sink reports listener for `"security"`; record a `MemberAddedEvent`; verify `AuditBuffer.append(sessionId, event)` invoked with the session-derived id from `root.getContentSession().toString()`.
-- `AuditEventsTest.record_rootNotInstanceOfAuditEventAware_noOp` — mock `Root` that does **not** implement the marker; `record` short-circuits gracefully (no `ClassCastException`). Confirms the design's safety net for unusual Root impls (e.g., subclasses in tests).
-- `AuditEventsTest.record_nullEvent_throwsNPE` — defensive: `record(root, null)`.
-- `AuditEventsTest.record_nullRoot_throwsNPE` — defensive: `record(null, event)`.
+- `AuditEventsTest.record_toggleDisabled_noOp` — sink installed but toggle off; `AuditEvents.record(sessionId, event)`; verify sink's `record` not invoked.
+- `AuditEventsTest.record_toggleEnabledNoListenerForDomain_noOp` — toggle on, but the sink's `hasListenerFor(event.getDomain())` short-circuit returns `false`; verify sink's `record` not invoked (no allocation cost in this case).
+- `AuditEventsTest.record_toggleEnabledListenerPresent_delegatesToSinkRecord` — toggle on, sink reports listener for `"security"`; record a `MemberAddedEvent` with sessionId `"s-1"`; verify `Sink.record("s-1", event)` invoked exactly once with both arguments matching.
+- `AuditEventsTest.record_sessionIdPassedThroughVerbatim` — assert no transformation of sessionId by the static façade (e.g., no trimming, no hashing). The sink sees the exact String the caller supplied.
+- `AuditEventsTest.record_nullEvent_throwsNPE` — defensive: `record("s-1", null)`.
+- `AuditEventsTest.record_nullSessionId_throwsNPE` — defensive: `record(null, event)`.
+- `AuditEventsTest.record_emptySessionId_passesThroughToSink` — `record("", event)`; verify sink invoked with `""`. The static façade does NOT validate session-id shape — that's the buffer's concern, or the caller's.
 
 ### 1.6 `AuditConfigurationTest`
 
@@ -221,6 +225,58 @@ Shape:
 **Not in §1.7** (per grace's round-5 decisions):
 - No `equals_*` / `hashCode_*` tests. Identity equality is the v1 contract. If a future caller needs content-equality, that's a follow-up SPI evolution with explicit field-by-field decisions (especially `timestamp`).
 
+### 1.9 `AuditEventDefaultsTest` and `AuditEventCredentialFieldsTest`
+
+NEW for v1. Both live in `oak-security-spi/src/test/java/org/apache/jackrabbit/oak/spi/security/audit/`.
+
+**Per Ada's v5-final** (which reverses v4's brief intermediate state): `AuditEvent.getOriginBundle()` IS in v1 as a default method returning `Optional.empty()`. The bridge-side `BridgeAuditEventAdapter` overrides it to return `Optional.of(bundleSymbolicName)`. This single signal supports the listener-side trust-model discrimination (`getOriginBundle().isPresent()` distinguishes bridge-attested from Oak-attested).
+
+**`AuditEventDefaultsTest`** — tests the default-method behavior on the `AuditEvent` interface. Pure unit, no mocks.
+
+- `AuditEventDefaultsTest.getOriginBundle_defaultImpl_returnsEmpty` — anonymous `AuditEvent` impl overriding only the abstract methods (`getDomain`, `getType`, `getTimestamp`, `getPayload`); assert `getOriginBundle().equals(Optional.empty())`. **This is the Oak-internal event contract:** events captured by in-tree sites do NOT have an origin bundle.
+- `AuditEventDefaultsTest.getOriginBundle_defaultImpl_neverThrows` — defensive: invoking the default method on every concrete `AuditEvent` subclass in the SPI (member events, future v1.1+ events) returns without throwing.
+- `AuditEventDefaultsTest.getOriginBundle_defaultImpl_stableOptional` — repeated calls return equal `Optional` values (no state leakage, no per-call allocation surprises).
+
+**`AuditEventCredentialFieldsTest`** — test-time reflective scan of every `AuditEvent` subclass's declared fields against `AuditConstants.FORBIDDEN_PAYLOAD_KEYS` (per v5-final, this is the canonical set in `oak-security-spi`, used by BOTH this compile-time-style field-name scan AND the bridge's runtime payload-key check). Pure JUnit + JDK reflection (no annotation processor, no PIT).
+
+The test approach:
+1. Use `Reflections` library (or pure `ClassPath`) scoped to `org.apache.jackrabbit.oak.spi.security.audit.**` to discover every concrete `AuditEvent` subclass.
+2. For each subclass, enumerate its declared fields.
+3. For each field, lowercase its name and assert it is NOT in `AuditConstants.FORBIDDEN_PAYLOAD_KEYS`.
+
+```java
+@Test
+public void noAuditEventSubclass_declaresField_matchingForbiddenKey() {
+    Set<Class<? extends AuditEvent>> subclasses =
+            new Reflections("org.apache.jackrabbit.oak.spi.security.audit")
+                .getSubTypesOf(AuditEvent.class);
+    for (Class<? extends AuditEvent> cls : subclasses) {
+        for (Field f : cls.getDeclaredFields()) {
+            String lower = f.getName().toLowerCase(Locale.ROOT);
+            assertFalse(
+                "AuditEvent subclass " + cls.getName()
+                    + " declares field '" + f.getName()
+                    + "' matching forbidden key '" + lower + "'. "
+                    + "Rename the field — credential-shaped names are reserved.",
+                AuditConstants.FORBIDDEN_PAYLOAD_KEYS.contains(lower));
+        }
+    }
+}
+```
+
+**Single source of truth (v5-final):** `AuditConstants.FORBIDDEN_PAYLOAD_KEYS` in `oak-security-spi`. Used by BOTH:
+- This compile-time-style field-name scan (`AuditEventCredentialFieldsTest`)
+- The bridge's runtime payload-key check (`AuditEventEmitterImpl.recordOnCommit` gate 5)
+
+Adding a new entry to `AuditConstants.FORBIDDEN_PAYLOAD_KEYS` automatically tightens BOTH checks. No drift possible because there is no second source. (Contrast: `RESERVED_DOMAINS` IS mirrored in `BridgeAuditDomains` for AEM dep-classpath reasons, requiring `RESERVED_DOMAINS_matchesAuditConstantsSource` drift test. `FORBIDDEN_PAYLOAD_KEYS` does NOT have an AEM dep constraint — only the bridge IMPL consumes it, and the bridge IMPL is already a depender on oak-security-spi.)
+
+**Why this is in `oak-security-spi`, not bridge:** the bridge's payload check verifies external callers don't sneak credential-shaped keys into the payload map. This test verifies Oak's own `AuditEvent` subclasses don't declare credential-shaped fields. Two different threat surfaces, ONE allowlist.
+
+- `AuditEventCredentialFieldsTest.noAuditEventSubclass_declaresField_matchingForbiddenKey` — single test scanning all subclasses
+- `AuditEventCredentialFieldsTest.forbiddenPayloadKeysSet_isNonEmpty_documentsTheContract` — sanity check: the set is non-empty (~22-25 entries depending on alex's v5 trim). Catches accidental deletion of the set.
+
+**Coverage:** runs as part of `oak-security-spi` `mvn verify`. Sage's §6.1 in the bridge design doc; mirrored here as plan inventory.
+
 ---
 
 ## 2. Integration tests — `MutableRootAuditIntegrationTest`
@@ -241,7 +297,7 @@ Each test registers a recording `AuditEventListener` and enables the toggle in `
 - `MutableRootAuditIntegrationTest.crossSessionIsolationOnSameThread_noCrossTalk` — open `ContentSession s1` and `s2` on the same thread (sequential, not concurrent). Capture event on `s1`. Call `s2.save()` without any capture on it — listener receives **0** events from the `s2` save. Then `s1.save()` — listener receives the event from `s1` only.
 - `MutableRootAuditIntegrationTest.threadLocalContextPreserved_mdcVisibleInListener` — pre-populate SLF4J MDC (`MDC.put("trace.id","abc-123")`) on the calling thread. Listener reads `MDC.get("trace.id")` inside `onCommit` and asserts equality. Validates the "dispatch on the merge thread" guarantee end-to-end.
 - `MutableRootAuditIntegrationTest.threadLocalContextPreserved_documentNS_acrossMergeThread` — DOCUMENT_NS specifically: `DocumentNodeStore.merge` may use an internal merge mutex; verify the listener still sees MDC because dispatch is synchronous on the caller's thread (already verified in design brief at `DocumentNodeStore.java:1143`). Fixture-specific assertion catches regressions if the DocumentNodeStore commit path ever moves to a worker thread.
-- `MutableRootAuditIntegrationTest.systemRootBehavior_systemUserOperationsEmitEvents` — open a `SystemRoot` (via `Oak.getContentRepository()`'s internal acquisition path), perform a membership change; listener receives an event whose `commitInfo.getUserId()` equals exactly `CommitInfo.OAK_UNKNOWN` (literal `"oak:unknown"`). Confirmed by alex: `SystemSubject` carries `SystemPrincipal` (not `SystemUserPrincipal`), so `AuthInfoImpl.createFromSubject` (`oak-security-spi/.../AuthInfoImpl.java:54-59`) returns `userID=null`; `CommitInfo`'s constructor normalizes `null → OAK_UNKNOWN` (`oak-store-spi/.../CommitInfo.java:94`). Assertion: `assertEquals(CommitInfo.OAK_UNKNOWN, capturedCommitInfo.getUserId())` — exact, deterministic.
+- `MutableRootAuditIntegrationTest.systemRootBehavior_systemUserOperationsEmitEvents` — open a `SystemRoot` (via `Oak.getContentRepository()`'s internal acquisition path), perform a membership change; listener receives an event whose `commitInfo.getUserId()` equals exactly `CommitInfo.OAK_UNKNOWN` (literal `"oak:unknown"`). Confirmed by alex: `SystemSubject` carries `SystemPrincipal` (not `SystemUserPrincipal`), so `AuthInfoImpl.createFromSubject` (`oak-security-spi/.../AuthInfoImpl.java:54-59`) returns `userID=null`; `CommitInfo`'s constructor normalizes `null → OAK_UNKNOWN` (`oak-store-spi/.../CommitInfo.java:94`). Assertion: `assertEquals(CommitInfo.OAK_UNKNOWN, capturedCommitInfo.getUserId())` — exact, deterministic. **Per v5-final + alex's confirmation:** also assert `event.getOriginBundle().isEmpty()` — system commits go through Oak-internal pipeline (NOT the bridge), so the default-method `Optional.empty()` is correct. One additional one-line assertion, no separate test class.
 - `MutableRootAuditIntegrationTest.toggleOff_noCapture_noDispatch` — toggle off in `@Before`; `addMember` + `save`; listener invoked **0** times. Validates the disabled-feature zero-side-effect contract.
 - `MutableRootAuditIntegrationTest.listenerRegistrationAfterCapture_doesNotSeeStaleEvents` — capture an event (toggle on, but no listener registered yet — verifies the "no listener → short-circuit" path); register listener; `save()`; listener receives **0** events (capture short-circuited at record time before storage).
   - **Tension flag:** this conflicts with the TOCTOU row in the design brief. Confirmed with design — late listener does NOT see in-flight captures. Test pins the documented behavior.
@@ -406,9 +462,207 @@ mvn -pl oak-security-spi,oak-core,oak-jcr,oak-benchmarks clean verify
 
 ---
 
-## 6. Open testability questions for the team
+## 6. `oak-audit-bridge` module tests
 
-### 6.1 Resolved
+Lives in `oak-audit-bridge/src/test/java/org/apache/jackrabbit/oak/audit/bridge/` (unit) and `oak-audit-bridge/src/test/java/org/apache/jackrabbit/oak/audit/bridge/it/` (integration).
+
+**Design source:** `.claude/oak/plans/audit-spi/07-bridge-design.md` and the skeleton in `.claude/oak/plans/audit-spi/03-skeleton/bridge/`. The bridge ships as two artifacts:
+- `oak-audit-bridge-api` (interface package `org.apache.jackrabbit.oak.audit.bridge`) — what AEM compiles against
+- `oak-audit-bridge` (impl package `org.apache.jackrabbit.oak.audit.bridge.impl`) — not exported
+
+**Coverage gate (locked with sage):** `<minimum.line.coverage>0.99</minimum.line.coverage><minimum.branch.coverage>1.0</minimum.branch.coverage>` in both POMs, modeled on `oak-authorization-cug/pom.xml:29-31`. Module `oak-audit-bridge/AGENTS.md` documents the rationale ("security trust boundary; matches policy for `oak-security-spi`, `oak-authorization-cug`, `oak-authorization-principalbased`, `oak-auth-external`") and bans jacoco/surefire/failsafe exclusions for the inbound filtering classes.
+
+**Fixture choice:** Bridge sits ABOVE NodeStore (analog to `oak-jcr/.../observation/ChangeProcessorTest`). NO `NodeStoreFixture` parameterization. Integration test uses SEGMENT_TAR only (via `MemoryNodeStore`). The audit-spi commit-attached pipeline (`MutableRootAuditIntegrationTest` §2) already covers SEGMENT_TAR + DOCUMENT_NS; the bridge reuses it as black-box.
+
+**Test framework:** JUnit 4 + Mockito 5 + `org.apache.sling.testing.osgi-mock.junit4` v2.4.18 (already in `oak-parent`). **Zero new Maven dependencies.**
+
+### 6.1 `AuditEventEmitterImplTest`
+
+Lives in `oak-audit-bridge/src/test/java/org/apache/jackrabbit/oak/audit/bridge/impl/AuditEventEmitterImplTest.java`. Unit tests using the visible-for-testing constructor `AuditEventEmitterImpl(JackrabbitSessionAccessor)` to inject a mock accessor. Mocks `AuditEvents` static façade via `Mockito.mockStatic(AuditEvents.class)` (Mockito 5 supports this natively).
+
+**Class-level Javadoc preamble** (will be in the actual test file):
+> **Forbidden-key matching is equals-match, not substring.** The bridge rejects payload keys that EQUAL (case-insensitive) any entry in `AuditConstants.FORBIDDEN_PAYLOAD_KEYS` (canonical set in `oak-security-spi` per `07-bridge-design.md` v5-final). Semantically non-credential identifiers like `tokenPath`, `tokenNodeIdentifier`, `policyKey`, `apiKeyId` are ALLOWED. The check is exact-match, not substring or regex — see `07-bridge-design.md` §6.2 (revised after the regex false-positive review). The same `AuditConstants.FORBIDDEN_PAYLOAD_KEYS` constant is used by `AuditEventCredentialFieldsTest` (§1.9) for the compile-time-style field-name scan. Single source of truth, two consumers.
+
+**Tests — gates 1–4 (session liveness, Oak-backed, instance-type, reserved-domain):**
+
+- `AuditEventEmitterImplTest.recordOnCommit_sessionNotLive_throwsIAE_warnsWithBundleName` — `session.isLive()` returns `false`; assert IAE with message containing `"closed"`; SLF4J test appender captures WARN with bundle symbolic name.
+- `AuditEventEmitterImplTest.recordOnCommit_sessionNotJackrabbitSession_throwsIAE_warnsWithBundleName` — `JackrabbitSessionAccessor.getSessionId(session)` returns `null`; assert IAE with message containing the session's class name; WARN logged.
+- `AuditEventEmitterImplTest.recordOnCommit_eventViaThirdPartyInterfaceImpl_throwsIAE` — anonymous subclass of `BridgeAuditEvent` (NOT `BridgeAuditEventImpl`); session is valid; assert IAE with message containing the anonymous class name. Pins the FQN-string instance check.
+- `AuditEventEmitterImplTest.recordOnCommit_eventDomainIsReserved_throwsIAE` — event constructed legitimately via `BridgeAuditEvent.of("aem.content", ...)` then `getDomain` stubbed via Mockito spy to return `"security"`; assert IAE with message containing `"security"` and `"reserved"`. Defense-in-depth: factory rejection happens earlier (see §6.2), but this catches bytecode-level bypass.
+
+**Tests — gate 5 (payload-key allowlist, equals-match):**
+
+Forbidden (sample — full set covered by `AllForbiddenKeysRejectedTest` below):
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_token_throwsIAE` — payload `{"token": "x"}`; assert IAE.
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_TOKEN_caseInsensitive_throwsIAE` — payload `{"TOKEN": "x"}`; assert IAE. Pins case-insensitive equals match.
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_password_throwsIAE` — payload `{"password": "x"}`; assert IAE.
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_apiKey_throwsIAE` — payload `{"apiKey": "x"}`; assert IAE.
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_apiKey_uppercase_throwsIAE` — payload `{"APIKEY": "x"}`; assert IAE.
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_jwttoken_throwsIAE` — payload `{"jwttoken": "x"}`; assert IAE.
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_bearertoken_throwsIAE` — payload `{"bearertoken": "x"}`; assert IAE.
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_keystorePassword_throwsIAE` — payload `{"keystorepassword": "x"}` (case-insensitive); assert IAE.
+
+False-positive guards (these MUST pass — they are the structural assertion that the equals-match contract holds and that the historical regex bug does not regress):
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_tokenNodeIdentifier_succeeds` — payload `{"tokenNodeIdentifier": "<uuid>"}`; assert NO throw, dispatch reaches `AuditEvents.record(...)`. **Critical false-positive guard:** legitimate per `06-scope-and-flow.md` v1.1+ `TokenCreatedEvent`.
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_tokenPath_succeeds` — payload `{"tokenPath": "/jcr:tokens/x"}`; assert NO throw.
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_tokenNodeId_succeeds` — payload `{"tokenNodeId": "<uuid>"}`; assert NO throw.
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_policyKey_succeeds` — payload `{"policyKey": "<id>"}`; assert NO throw. Pins that `key$` substring matching from the old regex is DEAD.
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_apiKeyId_succeeds` — payload `{"apiKeyId": "<id>"}`; assert NO throw. The id of an API key is not the API key itself.
+- `AuditEventEmitterImplTest.recordOnCommit_payloadKey_keyword_succeeds` — payload `{"keyword": "x"}`; assert NO throw. Pins that `keyword` is NOT in the allowlist.
+
+Set-coverage parameterized test:
+- `AllForbiddenKeysRejectedTest` — `@RunWith(Parameterized.class)` over every member of `AuditConstants.FORBIDDEN_PAYLOAD_KEYS` (~22-25 entries per alex's v5 trim; test reads the canonical SPI constant directly). Single `@Test public void payloadKey_isForbidden_throwsIAE()` invokes `recordOnCommit` with `Map.of(forbiddenKey, "x")` and asserts IAE. **Guarantees full coverage of the forbidden set without manual test-by-test maintenance** — adding a new entry to `AuditConstants.FORBIDDEN_PAYLOAD_KEYS` automatically gains test coverage in BOTH the SPI field scan AND the bridge runtime check.
+
+**Tests — happy path + diagnostics:**
+
+- `AuditEventEmitterImplTest.recordOnCommit_allChecksPass_callsAuditEventsRecordWithSessionId` — happy path: live JackrabbitSession, legitimate event, non-reserved domain `"aem.content"`, clean payload; verify `mockStatic(AuditEvents.class)` captures `record("session-id-from-accessor", adaptedEvent)` exactly once with sessionId matching the accessor's return.
+- `AuditEventEmitterImplTest.recordOnCommit_rejection_bundleNullSafe_logsAsNoBundle` — induce rejection from a class loaded outside any OSGi bundle (`FrameworkUtil.getBundle(...)` returns `null`); assert WARN log contains literal `"<no-bundle>"` (defensive log shape from `rejectAndLog`).
+
+**Tests — `getOriginBundle()` propagation (v5-final, alex's spec):**
+
+- `AuditEventEmitterImplTest.recordOnCommit_adaptedEvent_carriesOriginBundleName` — construct emitter via test-only ctor `new AuditEventEmitterImpl(accessor, "com.adobe.aem.content")`; emit a legitimate event; verify the adapted `AuditEvent` (captured via `mockStatic(AuditEvents.class)`) exposes `getOriginBundle().equals(Optional.of("com.adobe.aem.content"))`.
+- `AuditEventEmitterImplTest.recordOnCommit_adaptedEvent_originBundleAlwaysPresent_forBridgeEmission` — every event passing through `recordOnCommit` MUST have `getOriginBundle().isPresent() == true` (either the real bundle name or the `"(non-osgi)"` sentinel — never empty). Pins the v5 contract that bridge-attested events are unambiguously distinguishable from Oak-attested.
+
+**Tests — `isEnabledFor`:**
+
+- `AuditEventEmitterImplTest.isEnabledFor_delegatesToAuditEventsStatic` — `mockStatic` stubs `AuditEvents.isEnabledFor("aem.content")` → `true`, `AuditEvents.isEnabledFor("aem.replication")` → `false`; verify `emitter.isEnabledFor(...)` returns matching values; no other AuditEvents methods invoked.
+- `AuditEventEmitterImplTest.isEnabledFor_disabled_returnsFalse` — stub returns `false`; assert.
+- `AuditEventEmitterImplTest.isEnabledFor_enabled_returnsTrue` — stub returns `true`; assert.
+
+**Coverage:** 100% on `AuditEventEmitterImpl` (including each rejection path and the happy path).
+
+### 6.2 `BridgeAuditEventTest`
+
+Lives in `oak-audit-bridge-api/src/test/java/org/apache/jackrabbit/oak/audit/bridge/BridgeAuditEventTest.java`. Tests the factory `BridgeAuditEvent.of(...)` and the package-private impl `BridgeAuditEventImpl`. Pure unit, no mocks.
+
+- `BridgeAuditEventTest.of_reservedDomain_throwsIAE` — `BridgeAuditEvent.of("security", "X", Map.of())`; assert IAE with message containing `"security"` and `"reserved"`. (Sage's Test 1a from the trust-boundary 5-test list.)
+- `BridgeAuditEventTest.of_nonReservedDomain_succeeds` — `BridgeAuditEvent.of("aem.content", "FragmentPublished", Map.of("path", "/p"))`; assert `getDomain()`, `getType()`, `getPayload()` return inputs; `getTimestamp() > 0`. (Sage's Test 1b.)
+- `BridgeAuditEventTest.of_nullDomain_throwsNPE` — defensive.
+- `BridgeAuditEventTest.of_nullType_throwsNPE` — defensive.
+- `BridgeAuditEventTest.of_nullPayload_throwsNPE` — defensive.
+- `BridgeAuditEventTest.of_blankDomain_throwsIAE` — `BridgeAuditEvent.of("", "X", Map.of())`; assert IAE with message about non-empty domain.
+- `BridgeAuditEventTest.of_blankType_throwsIAE` — same for type.
+- `BridgeAuditEventTest.of_nullPayloadValue_throwsNPE` — payload `{"key": null}`; `Map.copyOf` rejects null values.
+- `BridgeAuditEventTest.of_payloadIsImmutable` — assert `event.getPayload().put("x", "y")` throws `UnsupportedOperationException`.
+- `BridgeAuditEventTest.of_timestampSetToConstructionTime` — invoke `of(...)` twice with ~10ms sleep; assert second timestamp is strictly greater than first.
+- `BridgeAuditEventTest.of_payloadOrderPreserved_whenLinkedHashMapSupplied` — `LinkedHashMap` input with keys in `["c", "a", "b"]` order; verify `getPayload()` iterator returns same order. Pins debug-friendly serialization.
+
+**Coverage:** 100% on `BridgeAuditEvent` interface (static factory) and `BridgeAuditEventImpl`.
+
+### 6.3 `BridgeAuditDomainsTest`
+
+Lives in `oak-audit-bridge-api/src/test/java/org/apache/jackrabbit/oak/audit/bridge/BridgeAuditDomainsTest.java`. Pure unit.
+
+- `BridgeAuditDomainsTest.RESERVED_DOMAINS_addThrowsUnsupportedOperationException` — `BridgeAuditDomains.RESERVED_DOMAINS.add("anything")` throws UOE. (Sage's Test 3 — catches refactor regression to `HashSet`-backed mutable set.)
+- `BridgeAuditDomainsTest.RESERVED_DOMAINS_removeThrowsUnsupportedOperationException` — defensive companion: `.remove("security")` throws UOE.
+- `BridgeAuditDomainsTest.RESERVED_DOMAINS_containsSecurity` — pin the v1 contents: `RESERVED_DOMAINS.contains("security")` is `true`. **Critical for refactor regression detection** — if a future contributor accidentally renames `SecurityAuditDomain.NAME`, this test fails loud.
+- `BridgeAuditDomainsTest.RESERVED_DOMAINS_matchesAuditConstantsSource` — `BridgeAuditDomains.RESERVED_DOMAINS.equals(AuditConstants.RESERVED_DOMAINS)`. **Build-time divergence catch:** the bridge mirrors the SPI's source of truth (`AuditConstants.RESERVED_DOMAINS` in `oak-security-spi`) so AEM (which only depends on `oak-audit-bridge-api`) sees the same set. Any future drift between the two — e.g., adding a new reserved domain to the SPI without mirroring it here — is caught by this single test at build time.
+
+**Coverage:** 100% on `BridgeAuditDomains`.
+
+### 6.4 `JackrabbitSessionAccessorTest` and `DefaultJackrabbitSessionAccessorTest`
+
+Lives in `oak-audit-bridge/src/test/java/org/apache/jackrabbit/oak/audit/bridge/impl/DefaultJackrabbitSessionAccessorTest.java`. Tests the production accessor that production wires into the OSGi component.
+
+- `DefaultJackrabbitSessionAccessorTest.getSessionId_jackrabbitSession_returnsInternalSessionId` — mock `JackrabbitSession`, stub `getInternalSessionId()` → `"oak-session-42"`; assert accessor returns same.
+- `DefaultJackrabbitSessionAccessorTest.getSessionId_plainJcrSession_returnsNull` — mock plain `javax.jcr.Session` (NOT `JackrabbitSession`); assert returns `null`. Confirms the `instanceof` check.
+- `DefaultJackrabbitSessionAccessorTest.getSessionId_nullSession_throwsNPE` — defensive: `accessor.getSessionId(null)`.
+
+**Coverage:** 100% on `DefaultJackrabbitSessionAccessor`. The `JackrabbitSessionAccessor` interface itself is one method with no logic — no separate test class.
+
+### 6.5 `AuditEventEmitterImplActivateTest` (OSGi lifecycle)
+
+Lives in `oak-audit-bridge/src/test/java/org/apache/jackrabbit/oak/audit/bridge/impl/AuditEventEmitterImplActivateTest.java`. Uses `@Rule public OsgiContext context = new OsgiContext()`.
+
+The bridge `@Component` uses `ServiceScope.BUNDLE` (per Ada's v5-final, alex-confirmed) — every consuming bundle gets its own emitter instance, capturing the bundle context at activation. This is what feeds `getOriginBundle()` in the adapted event.
+
+- `AuditEventEmitterImplActivateTest.activate_logsInfoMessage` — SLF4J test appender captures INFO with "activated".
+- `AuditEventEmitterImplActivateTest.deactivate_logsInfoMessage` — same for "deactivated".
+- `AuditEventEmitterImplActivateTest.registerInjectActivateService_succeeds_serviceAvailable` — `context.registerInjectActivateService(new AuditEventEmitterImpl())`; assert `context.getService(AuditEventEmitter.class)` is non-null.
+- `AuditEventEmitterImplActivateTest.unregister_serviceUnavailable` — register, capture `ServiceRegistration`, unregister; assert `context.getService(AuditEventEmitter.class)` is `null`.
+- `AuditEventEmitterImplActivateTest.activate_capturesRequestingBundleSymbolicName` — activate the service via `OsgiContext` with a `ComponentContext` whose `getUsingBundle()` has `getSymbolicName() == "com.adobe.aem.content"`; assert the impl captured the symbolic name (via a package-private accessor exposed on `AuditEventEmitterImpl` for testing). This is the `ServiceScope.BUNDLE` mechanism in action.
+- `AuditEventEmitterImplActivateTest.activate_nullUsingBundle_capturesNonOsgiSentinel` — activate via a `ComponentContext` whose `getUsingBundle()` returns `null` (Mockito mock); assert the impl captured the literal `"(non-osgi)"` sentinel. Per alex's v5 spec: `(b != null) ? b.getSymbolicName() : "(non-osgi)"`. **Critical:** the sentinel is `Optional.of("(non-osgi)")`, NOT `Optional.empty()` — bridge-adapted events are ALWAYS attested.
+- `AuditEventEmitterImplActivateTest.recordOnCommit_propagatesCapturedBundleNameToAdapter` — after activation captures the bundle name, invoke `recordOnCommit` and verify (via captor in `mockStatic(AuditEvents.class)` or a recording sink) that the adapted `AuditEvent` exposes `getOriginBundle().get() == "com.adobe.aem.content"`. End-to-end propagation of the bundle context.
+
+**Coverage:** Covers `@Activate` / `@Deactivate` annotated methods in `AuditEventEmitterImpl`, plus the bundle-name capture and propagation paths.
+
+### 6.6 `BridgeAuditEventAdapterTest`
+
+Lives in `oak-audit-bridge/src/test/java/org/apache/jackrabbit/oak/audit/bridge/impl/BridgeAuditEventAdapterTest.java`. Tests the bridge-domain-event → audit-spi-event translation, including the `getOriginBundle()` override (per v5-final).
+
+- `BridgeAuditEventAdapterTest.adapt_preservesDomain_type_timestamp_payload` — construct legitimate `BridgeAuditEvent`; call `BridgeAuditEventAdapter.adapt(event, "com.adobe.aem.content")`; assert resulting `AuditEvent` has matching `getDomain()`, `getType()`, `getTimestamp()`, `getPayload()`.
+- `BridgeAuditEventAdapterTest.adapt_returnsImmutableAuditEvent` — try to mutate payload of adapted event; assert UOE.
+- `BridgeAuditEventAdapterTest.adapt_nullInput_throwsNPE` — defensive: `adapt(null, "x")` throws NPE.
+- `BridgeAuditEventAdapterTest.getOriginBundle_returnsOptionalOfRequestingBundleSymbolicName` — `adapt(event, "com.adobe.aem.content")`; assert `adapted.getOriginBundle().equals(Optional.of("com.adobe.aem.content"))`. **The trust-model attestation signal for AEM-emitted events.**
+- `BridgeAuditEventAdapterTest.getOriginBundle_alwaysPresent_forBridgeAdapted` — for any non-null `bundleName` argument to `adapt(...)` (including the `"(non-osgi)"` sentinel), `getOriginBundle().isPresent()` is `true`. This is the structural invariant that bridge-attested events are distinguishable from Oak-attested events at the listener — `Optional.isPresent()` is the 100%-reliable discriminator.
+- `BridgeAuditEventAdapterTest.getOriginBundle_stableAcrossInvocations` — call `adapted.getOriginBundle()` twice; both return equal (and ideally `==`) `Optional` instances. Per alex's spec #5: stable bundle attestation, no state leak, no per-call allocation surprise.
+- `BridgeAuditEventAdapterTest.adapt_nonOsgiSentinel_preserved` — `adapt(event, "(non-osgi)")`; assert `getOriginBundle().equals(Optional.of("(non-osgi)"))`. Pins the v5 sentinel as a first-class attestation value, not a special case.
+
+**Coverage:** 100% on `BridgeAuditEventAdapter`.
+
+### 6.7 `AuditEventEmitterIT` (integration test)
+
+Lives in `oak-audit-bridge/src/test/java/org/apache/jackrabbit/oak/audit/bridge/impl/it/AuditEventEmitterIT.java`. Real Oak repository, real `AuditConfigurationImpl`, real bridge, recording `AuditEventListener`. SEGMENT_TAR via `MemoryNodeStore` only (single-fixture per §6 preamble).
+
+- `AuditEventEmitterIT.recordOnCommit_thenSessionSave_listenerInvokedOnce_withSessionIdMatchingOakKey` — open `JackrabbitSession`, call `emitter.recordOnCommit(session, event)`, `session.save()`; listener received exactly 1 invocation with the matching sessionId in `commitInfo.getSessionId()`. **Closes the loop:** the bridge's `getInternalSessionId()` matches the AuditBuffer key end-to-end.
+- `AuditEventEmitterIT.recordOnCommit_thenSessionRefresh_listenerNotInvoked` — emit, `session.refresh(false)`, `session.save()`; listener invoked 0 times for the pre-refresh event. (Validates the refresh-discards-buffer contract from the audit-spi side, exercised through the bridge entry point.)
+- `AuditEventEmitterIT.recordOnCommit_validationFailureOnSave_listenerNotInvoked_bufferCleared` — emit; trigger a save-time validator failure (permission denial on unrelated node); assert listener not invoked AND a subsequent clean save on the same session does NOT emit a stale event.
+- `AuditEventEmitterIT.isEnabledFor_aemContent_returnsTrue_whenListenerRegistered` — register a listener for `"aem.content"`; assert `emitter.isEnabledFor("aem.content")` returns `true`. Verifies the static façade delegation reaches the live whiteboard registry.
+
+**Trust-model discrimination tests** — verify the dual-signal invariant (per Ada's v5-final `AuditEventListener` Javadoc; `getOriginBundle()` IS in v1, so listeners discriminate via BOTH `getOriginBundle().isPresent()` AND `RESERVED_DOMAINS.contains(getDomain())`):
+
+- `AuditEventEmitterIT.listenerSeesOakAttestedEvent_originBundleIsEmpty_AND_domainIsReserved` — trigger an Oak-internal capture (e.g., `group.addMember(user); session.save()`); listener observes an event with `getDomain() == "security"` (reserved) AND `getOriginBundle() == Optional.empty()`.
+- `AuditEventEmitterIT.listenerSeesBridgeAttestedEvent_originBundleIsPresent_AND_domainIsNotReserved` — emit via the bridge with domain `"aem.content"`; listener observes an event with `RESERVED_DOMAINS.contains(getDomain())` is `false` AND `getOriginBundle()` is `Optional.of("<bundle-name>")` (present).
+- `AuditEventEmitterIT.trustModelSignals_areAlwaysConsistent_XORInvariant` — for every event reaching the listener (across multiple emissions of both kinds in one test run), assert the XOR invariant:
+  - `(getOriginBundle().isPresent()) XOR (RESERVED_DOMAINS.contains(getDomain()))`
+  - i.e., exactly one of: "Oak-attested" (bundle empty AND reserved domain) OR "bridge-attested" (bundle present AND non-reserved domain).
+  - Other combinations (`bundle empty AND non-reserved`, `bundle present AND reserved`) are programming errors and would fail this test loud.
+  - **The safety-net assertion.** Any future bug that produces a mis-attributed event (e.g., bridge emits a security-domain event despite the reserved-domain check; Oak-internal capture incorrectly populates origin bundle) is caught here.
+- `AuditEventEmitterIT.bridgeNeverEmitsReservedDomain_endToEnd` — defense-in-depth alongside the XOR invariant. Construct a `BridgeAuditEvent` (somehow) with `getDomain() == "security"` and attempt to emit via the bridge. Assert IAE thrown synchronously by gate-4. Pins that the listener never sees a reserved-domain event with `originBundle.isPresent()` — the bridge rejects at the entry point.
+
+### 6.8 Coverage rule for the bridge module
+
+| File | Class | Required |
+|---|---|---|
+| `oak-audit-bridge-api/pom.xml` | (POM config) | `<skip.coverage>false</skip.coverage><minimum.line.coverage>0.99</minimum.line.coverage><minimum.branch.coverage>1.0</minimum.branch.coverage>` |
+| `oak-audit-bridge/pom.xml` | (POM config) | Same. |
+| `oak-audit-bridge/AGENTS.md` | Module policy | Declares 100% rationale (security trust boundary), references precedent `oak-authorization-cug`, BANS jacoco/surefire/failsafe exclusions for `AuditEventEmitterImpl`, `BridgeAuditEventAdapter`, and `DefaultJackrabbitSessionAccessor`. |
+
+If a future contributor reduces coverage thresholds in either POM, the AGENTS.md policy makes the regression visible during code review.
+
+### 6.9 Additional test concern outside this module
+
+`JackrabbitSession.getInternalSessionId()` is a new default method on the `oak-jackrabbit-api` interface. The production override in `oak-jcr/src/main/java/.../session/SessionImpl.java` needs verification in oak-jcr's test suite:
+
+```java
+// oak-jcr/src/test/java/org/apache/jackrabbit/oak/jcr/session/SessionImplTest.java (NEW tests, not bridge tests)
+@Test public void getInternalSessionId_returnsContentSessionToString_matchesAuditBufferKey;
+@Test public void getInternalSessionId_stableAcrossMultipleCalls;
+@Test public void getInternalSessionId_distinctSessionsHaveDistinctIds;
+```
+
+That's an `oak-jcr` test, owned by the oak-jcr maintainers — flagged here for visibility, not for me to write. If `SessionImpl` does NOT override the default, the default falls back to `Object.toString()` which would give `SessionImpl@hashCode` strings — distinct per instance but NOT equal to the `ContentSession.toString()` AuditBuffer key. The override is required for end-to-end correctness; the test pins it.
+
+### 6.10 Test count for `oak-audit-bridge`
+
+| Class | Unit tests | Module |
+|---|---|---|
+| `AuditEventEmitterImplTest` | 14 | `oak-audit-bridge` |
+| `BridgeAuditEventTest` | 11 | `oak-audit-bridge-api` |
+| `BridgeAuditDomainsTest` | 3 | `oak-audit-bridge-api` |
+| `DefaultJackrabbitSessionAccessorTest` | 3 | `oak-audit-bridge` |
+| `AuditEventEmitterImplActivateTest` | 4 | `oak-audit-bridge` |
+| `BridgeAuditEventAdapterTest` | 3 | `oak-audit-bridge` |
+| `AuditEventEmitterIT` | 4 | `oak-audit-bridge` |
+| **Total** | **38 unit + 4 IT = 42 bridge tests** | |
+
+Plus the oak-jcr override test count is +3 tests (not in this module, but tracked here for cross-module visibility).
+
+---
+
+## 7. Open testability questions for the team
+
+### 7.1 Resolved
 
 **From alex:**
 1. **Deterministic `CommitFailedException` triggers** — confirmed by alex with source citations:
@@ -437,14 +691,18 @@ mvn -pl oak-security-spi,oak-core,oak-jcr,oak-benchmarks clean verify
 15. **No `equals`/`hashCode` override on bulk events in v1.** Identity equality. Rationale: (a) `SecurityAuditEvent.timestamp` makes any content-equality choice surprising; (b) Set-accessor vs List-payload ambiguity makes "order-sensitive or not?" a design decision we can defer; (c) no production caller needs event content-equality (listeners process, don't dedupe). Dropped 2 tests from §1.7 (`equality_sameContent_areEqual`, `equality_differentMemberIdOrder_areNotEqual`). Replaced with `payload_memberIdsPreservesInsertionOrder` / `payload_failedIdsPreservesInsertionOrder` — semantic tests on the contract that actually matters (serialization order), not a hash-table contract.
 16. **`contentIds` → `isContentId` rename (alex's micro-nit, applied).** Accessor `isContentId()`, field `isContentId`, payload key constant `PAYLOAD_IS_CONTENT_ID = "isContentId"`. Aligns with `UserManagerImpl.onGroupUpdate(... boolean isContentId, ...)`. Semantic unchanged. All test names referencing `contentIds` renamed in §1.7 and §2.
 
-### 6.2 Pending
+### 7.2 Pending
 
 1. **ada:** for `StaleEventPreventionTest.documentNS_branchMergeRetry_exactlyOnceDispatch_eventsNotLost`, what is the cleanest way to trigger a deterministic retry on DOCUMENT_NS in a test (vs. flakiness)? Possibly need a custom `CommitHook` that throws `MERGE` failure once then succeeds — analogous to existing `DocumentNodeStoreTest` patterns.
+
+3. **(Resolved by v5-final.)** Dual-constant drift between SPI-side and bridge-side forbidden-key lists — resolved by Ada's v5-final placing `AuditConstants.FORBIDDEN_PAYLOAD_KEYS` in `oak-security-spi` as the SINGLE canonical source. Bridge IMPL references it directly via existing compile dep. No drift possible because there is no second source. This open question is closed.
 2. **shannon:** to confirm whether `RecordingAuditEventListener` belongs in `oak-security-spi/src/test` (shared test fixture) or in `oak-core/src/test` (private to impl tests). Prefer the former so it's reusable from `oak-benchmarks` and future security configurations' tests without copy-paste.
 
 ---
 
-## 7. Test count & coverage summary
+## 8. Test count & coverage summary
+
+### 8.1 audit-spi (oak-security-spi + oak-core)
 
 | Bucket | Count | Coverage target |
 |---|---|---|
@@ -452,7 +710,7 @@ mvn -pl oak-security-spi,oak-core,oak-jcr,oak-benchmarks clean verify
 | `WhiteboardAuditEventListenerRegistryTest` | 14 unit tests | 100% |
 | `SnapshotAuditBufferHookTest` | 9 unit tests | 100% |
 | `DispatchAuditEventsHookTest` | 15 unit tests | 100% |
-| `AuditEventsTest` | 11 unit tests | 100% (SPI façade) |
+| `AuditEventsTest` | 13 unit tests | 100% (SPI façade) |
 | `AuditConfigurationTest` | 18 unit tests | 100% |
 | `InternalSecurityProviderTest` (audit additions) | 3 unit tests | covers wiring container |
 | `MembersAddedBulkEventTest` | 16 unit tests | 100% (SPI value type) |
@@ -461,15 +719,56 @@ mvn -pl oak-security-spi,oak-core,oak-jcr,oak-benchmarks clean verify
 | `StaleEventPreventionTest` | 7 tests, mostly multi-fixture | failure-mode |
 | `AuditOverheadBenchmark` | 3 modes × 2 fixtures = 6 runs | perf gate |
 
-**Total unit tests:** 121 (round 5 net delta: dropped 2 equality tests per class in §1.7 (−4 total), moved 1 wiring test from §1.6 to §1.8 with 3 tests replacing it (net +2). Note: `contentIds → isContentId` is a rename only, no count change).
-**Total integration test runs:** ~47 (added 1 failure-layer-scope defensive test × 2 fixtures, grace's Javadoc-round suggestion: `bulkPath_failedIdsEmptyDoesNotMeanValidatorsPassed`).
-**Total perf measurements:** 6 + 3 repetitions = 18.
+**audit-spi total:** 123 unit tests, ~47 integration test runs, 18 perf measurements. (Net delta from prior round: AuditEventsTest +2 — added `record_sessionIdPassedThroughVerbatim`, `record_emptySessionId_passesThroughToSink`, `isEnabledFor_delegatesToSinkForDomain`; dropped `record_rootNotInstanceOfAuditEventAware_noOp` since the Sink contract no longer takes a Root.)
 
-Coverage commitment: **100% on `oak-security-spi/.../audit/**` and `oak-core/.../security/audit/**`** at merge time. **>80%** on the 3 lines added to `MutableRoot.java` (those lines are explicitly covered by `MutableRootAuditIntegrationTest.refreshPath_*` and `commitFailurePath_*`).
+### 8.2 oak-audit-bridge (NEW)
+
+| Bucket | Count | Coverage target |
+|---|---|---|
+| `AuditEventEmitterImplTest` | 14 unit tests | 100% |
+| `BridgeAuditEventTest` (in `oak-audit-bridge-api`) | 11 unit tests | 100% |
+| `BridgeAuditDomainsTest` (in `oak-audit-bridge-api`) | 3 unit tests | 100% |
+| `DefaultJackrabbitSessionAccessorTest` | 3 unit tests | 100% |
+| `AuditEventEmitterImplActivateTest` (`OsgiContext`) | 4 unit tests | covers `@Activate`/`@Deactivate` |
+| `BridgeAuditEventAdapterTest` | 3 unit tests | 100% |
+| `AuditEventEmitterIT` | 4 integration tests (single fixture: MemoryNodeStore) | end-to-end |
+
+**Bridge total:** 38 unit + 4 IT = 42 tests. Single-fixture (SEGMENT_TAR via MemoryNodeStore). Justification in §6 preamble — bridge sits above NodeStore, NodeStore choice is incidental.
+
+### 8.3 oak-jcr (cross-module)
+
+| Bucket | Count | Coverage target |
+|---|---|---|
+| `SessionImplTest.getInternalSessionId_*` (NEW tests, oak-jcr-owned) | 3 unit tests | 100% on the new method |
+
+Owned by the oak-jcr maintainers; flagged for visibility per §6.9.
+
+### 8.4 Grand total
+
+Per Ada's v5-final (re-introducing `getOriginBundle()` with the `"(non-osgi)"` sentinel):
+
+- **Unit tests:** 128 (audit-spi: 125 + §1.9 = 3 default-impl + 2 reflective-scan tests; `AuditEventDefaultsTest` restored) + 48 (bridge: gates 1-4 + 8 equals-match + 6 false-positive guards + 2 getOriginBundle propagation + happy-path/diagnostic + isEnabledFor + factory + sync test + adapter [7 tests inc 4 originBundle + sentinel] + activate [6 tests inc 2 bundle-capture + 1 non-osgi sentinel] + accessor) + 3 (oak-jcr override) = **~179 unit tests** (final count locked when tests land)
+- **Integration test runs:** ~47 (audit-spi multi-fixture) + 7 (bridge single-fixture: 4 original + 2 trust-model dual-signal + 1 bridgeNeverEmitsReservedDomain) = **~54 IT runs**
+- **Perf measurements:** 18 (audit-spi benchmark)
+
+Note: `AllForbiddenKeysRejectedTest` parameterized over `AuditConstants.FORBIDDEN_PAYLOAD_KEYS` (canonical SPI source per v5-final) contributes ~22-25 runs (one per forbidden key) but is one test class — counted as effective assertions, not distinct test methods.
+
+v5 reversal delta vs prior v4-aligned revision: RESTORED 2 `AuditEventDefaultsTest` tests + 1 stable-optional test, RESTORED 2 `AuditEventEmitterImplActivateTest` bundle-capture tests + 1 NEW `activate_nullUsingBundle_capturesNonOsgiSentinel`, RESTORED 2 `recordOnCommit_adaptedEvent_*` tests in `AuditEventEmitterImplTest`, RESTORED 4 `getOriginBundle_*` tests in `BridgeAuditEventAdapterTest` (with sentinel corrections) + 1 NEW `getOriginBundle_stableAcrossInvocations` + 1 NEW `adapt_nonOsgiSentinel_preserved`, RESTORED 3 trust-model XOR tests in `AuditEventEmitterIT` (plus the v4 `bridgeNeverEmitsReservedDomain_endToEnd` stays). Net: +15 tests vs v4-aligned revision; matches the v3-era count plus alex's sentinel corrections.
+
+### 8.5 Coverage commitments
+
+| Module | Line | Branch | Where enforced |
+|---|---|---|---|
+| `oak-security-spi/.../audit/**` | 100% | 100% | `oak-security-spi/pom.xml` already set to 0.99/0.99 |
+| `oak-core/.../security/audit/**` | 100% | 100% | `oak-core/pom.xml` already opts in (check before merge) |
+| `oak-audit-bridge-api/**` | **0.99** | **1.0** | `oak-audit-bridge-api/pom.xml` (NEW) modeled on `oak-authorization-cug/pom.xml:29-31` |
+| `oak-audit-bridge/**` | **0.99** | **1.0** | `oak-audit-bridge/pom.xml` (NEW) modeled on `oak-authorization-cug/pom.xml:29-31` |
+| `MutableRoot.java` (3 added lines) | >80% | >80% | Covered by `MutableRootAuditIntegrationTest.refreshPath_*` and `commitFailurePath_*` |
+| `oak-jcr/.../SessionImpl.java` (1 new method override) | covered | covered | Covered by `SessionImplTest.getInternalSessionId_*` (oak-jcr owned) |
 
 ---
 
-## 8. Tests we are **not** writing (and why)
+## 9. Tests we are **not** writing (and why)
 
 - **No JUnit 5 tests.** Per `AGENTS.md` and Oak convention.
 - **No tests for `BackgroundAuditEventListener` / async dispatch.** Out of scope per design brief §"What is NOT in scope for v1". Add when the async wrapper ships.
@@ -477,3 +776,14 @@ Coverage commitment: **100% on `oak-security-spi/.../audit/**` and `oak-core/...
 - **No tests for validator-side capture.** Explicitly rejected in design brief.
 - **No tests for cross-cluster external-change audit events.** Out of scope.
 - **No tests that weaken or remove existing assertions.** Per `AGENTS.md` "do not weaken or remove existing test assertions to make the build pass" — anything that fails after the change is investigated, never silenced.
+
+### 9.1 Bridge-specific exclusions
+
+- **No tests for fire-and-forget / immediate emission paths.** Ada's locked design dropped `emit(...)` / `recordImmediate(...)` / `onEvent` / `dispatchFireAndForget` from v1. Bridge is commit-attached only. Non-commit security signals (login, denied access) are deferred to v1.1+ via Monitor SPI extensions in `oak-security-spi` / `oak-core`, NOT the bridge. See `07-bridge-design.md` §2.
+- **No tests for outbound EventAdmin dispatch from the bridge.** Bridge's `recordOnCommit` flows INTO Oak's audit pipeline (`AuditEvents.record(sessionId, ...)`). Outbound EventAdmin forwarding for non-security domains is deferred to v1.1+ per `07-bridge-design.md` §7.2. If/when that lands, add `OutboundEventAdminListenerTest` + `PayloadSanitizerTest` for non-security domains.
+- **No compile-time annotation-processor test for `RESERVED_DOMAINS` enforcement.** Considered and rejected by sage + turing: introducing the first annotation processor in Oak's build is disproportionate cost for one check. Runtime enforcement in `recordOnCommit` (gate 4 — reserved domain) + factory enforcement in `BridgeAuditEvent.of(...)` provides defense in depth. See `oak-audit-bridge/AGENTS.md` rationale.
+- **No PIT (mutation-testing) gate.** Considered and rejected: PIT introduces a new Maven plugin and CI step for one gate. Architectural funneling (the gate sequence lives in `recordOnCommit` only; no other public dispatch entry point exists) achieves the same property at zero tooling cost. Reviewed by sage; aligned.
+- **No multi-fixture matrix for bridge tests.** Bridge sits above NodeStore (analog to `oak-jcr/.../observation/ChangeProcessorTest`); fixture choice is incidental. `MutableRootAuditIntegrationTest` (§2) already covers SEGMENT_TAR + DOCUMENT_NS one layer below; the bridge reuses that as black-box. Single MemoryNodeStore fixture for `AuditEventEmitterIT` is sufficient.
+- **No substring/regex tests for the payload-key check.** The forbidden-key check is equals-match against `AuditConstants.FORBIDDEN_PAYLOAD_KEYS` (canonical set in `oak-security-spi` per Ada's v5-final), NOT substring or regex. The earlier substring-regex design (`(?i)password|secret|token|key$`) was rejected after the false-positive review surfaced legitimate identifiers like `tokenNodeIdentifier`, `policyKey`, `apiKeyId` being incorrectly caught. See `07-bridge-design.md` §6.2 revision. The `AllForbiddenKeysRejectedTest` parameterized over the locked set + false-positive guards (`recordOnCommit_payloadKey_tokenNodeIdentifier_succeeds`, etc. in §6.1) is the regression net.
+- **No `Optional.empty()` test for bridge-adapted events.** Per alex's v5 spec, the bridge ALWAYS attests — either the real bundle name OR the `"(non-osgi)"` sentinel. `getOriginBundle().isPresent()` is the 100%-reliable discriminator between bridge-attested and Oak-attested. The earlier `getOriginBundle_unknownBundle_returnsEmpty` test (v3-era assumption) is WRONG and is replaced by `activate_nullUsingBundle_capturesNonOsgiSentinel` + `adapt_nonOsgiSentinel_preserved`. If the sentinel convention changes in v1.1+, both tests need updating.
+- **No sync test for `FORBIDDEN_PAYLOAD_KEYS`.** Per v5-final, the set lives in `oak-security-spi.AuditConstants` as the canonical source; bridge IMPL references it directly via the existing compile dep on oak-security-spi. No mirror, no drift possible. The pattern differs from `RESERVED_DOMAINS` (which IS mirrored in `BridgeAuditDomains` + drift-tested) because `RESERVED_DOMAINS` ships to AEM compile classpath and `FORBIDDEN_PAYLOAD_KEYS` does NOT.

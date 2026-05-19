@@ -1,0 +1,580 @@
+# Cross-Stack Audit — Loose Design
+
+Companion to `history/06-scope-and-flow.md` (Path α commit-attached pipeline) and `history/07-bridge-design.md` (the team's prior narrow design, now superseded). This spec opens the producer surface to any OSGi bundle in the stack — Oak, AEM, Sling, third-party — and unifies the listener interface to a single method.
+
+This document supersedes `history/07-bridge-design.md` per user direction: drop the bridge narrowing, restore an open producer surface, and accept the trust-model trade-off documented in §9.
+
+---
+
+## 1. Goals & non-goals
+
+### Goals
+
+- One dispatch place for ALL audit events regardless of origin.
+- Higher-stack code (AEM, Sling, third-party bundles) can issue events for their own domains, on their own schedule, without committing through Oak.
+- Trivial AEM call site: `@Reference AuditEventEmitter` + `emit(event)`.
+- Coexists with the existing Path α commit-attached security audit pipeline.
+- No compile-time coupling between consumer bundles and `oak-security-spi`.
+
+### Non-goals
+
+- Spoofing prevention at the SPI level. Any bundle can emit any domain. The trust model is documented (§9), not enforced by the type system or runtime gates.
+- Reserved domains.
+- Commit-boundary semantics on the producer side.
+- Outbound forwarding to OSGi EventAdmin or AEM AuditLog. Deferred; listeners can fan out themselves if needed.
+- `getOriginBundle()` on AuditEvent. Explicitly excluded; per-source attribution is the consumer's responsibility (via payload conventions).
+
+---
+
+## 2. Architecture overview
+
+Two producer paths feed a single listener registry. Both paths converge on one listener method.
+
+```mermaid
+flowchart LR
+    subgraph PROD["Producers"]
+        OAK_CAP["Oak internal capture<br>(UserManagerImpl etc.)"]
+        AEM_CAP["AEM / Sling / 3rd-party<br>any bundle, any time"]
+    end
+
+    subgraph FACADE["oak-audit-spi · AuditEvents (static)"]
+        REC["record(root, event)"]
+        DISP["dispatch(event)"]
+    end
+
+    subgraph PATH_CA["Commit-attached path (oak-core, existing)"]
+        BUF["ThreadLocal AuditBuffer"]
+        VAL["Validators"]
+        DRAIN["DispatchAuditEventsHook<br>(decorate payload + drain)"]
+    end
+
+    EMIT["AuditEventEmitterImpl<br>(oak-core, OSGi @Component)"]
+
+    REG["WhiteboardAuditEventListenerRegistry"]
+
+    subgraph LISTENERS["Listeners (consumer bundles)"]
+        L1["SiemForwarder<br>onEvents(events)"]
+        L2["ComplianceArchive<br>onEvents(events)"]
+    end
+
+    OAK_CAP --> REC
+    REC --> BUF
+    BUF --> VAL
+    VAL -->|merge ok| DRAIN
+    DRAIN --> REG
+
+    AEM_CAP -->|"@Reference emit"| EMIT
+    EMIT --> DISP
+    DISP --> REG
+
+    REG -->|filter by domain<br>sort by rank| L1
+    REG --> L2
+
+    style PROD fill:#fff4e0
+    style EMIT fill:#e0ffe0
+    style LISTENERS fill:#f0e0ff
+```
+
+**Invariant:** there is ONE registry, ONE listener method. The two paths differ only in:
+- whether events are buffered (commit-attached) or dispatched immediately (fire-and-forget)
+- whether the event payload carries commit metadata keys (set by the drain hook on commit success)
+
+---
+
+## 3. Module layout
+
+`oak-audit-spi` is a NEW module extracted from the current Path α additions to `oak-security-spi`. It holds the domain-neutral audit primitives. `oak-security-spi` keeps its security-specific event subclasses and now depends on `oak-audit-spi`.
+
+```mermaid
+flowchart TB
+    subgraph SPI["oak-audit-spi (NEW)"]
+        AE_INT[AuditEvent]
+        AEL_INT[AuditEventListener]
+        EMIT_INT[AuditEventEmitter]
+        AES[AuditEvents façade]
+    end
+
+    subgraph SEC["oak-security-spi (existing)"]
+        SEC_EV[SecurityAuditEvent]
+        MA[MemberAddedEvent, etc.]
+        SAD[SecurityAuditDomain]
+    end
+
+    subgraph CORE["oak-core (existing impl + small additions)"]
+        ACI[AuditConfigurationImpl]
+        BUF[AuditBuffer]
+        REG[WhiteboardAuditEventListenerRegistry]
+        SNAP[SnapshotAuditBufferHook]
+        DISP[DispatchAuditEventsHook]
+        EMIT_IMPL[AuditEventEmitterImpl]
+    end
+
+    subgraph AEM["AEM / Sling bundle (consumer)"]
+        CALLER[Caller @Reference]
+        EV_CLS[Custom AuditEvent subclass]
+        LISTENER[Custom AuditEventListener]
+    end
+
+    SEC --> SPI
+    CORE --> SEC
+    CORE --> SPI
+    AEM --> SPI
+
+    style SPI fill:#e0f0ff
+    style AEM fill:#fff4e0
+```
+
+| Module | Status | Role |
+|---|---|---|
+| `oak-audit-spi` | NEW | Domain-neutral SPI: `AuditEvent`, `AuditEventListener`, `AuditEventEmitter`, `AuditEvents` static façade |
+| `oak-security-spi` | existing — depends on `oak-audit-spi` | Security-specific event subclasses (`SecurityAuditEvent`, `MemberAddedEvent`, `SecurityAuditDomain`, etc.) |
+| `oak-core` | existing — adds `AuditEventEmitterImpl` | Pipeline implementation (registry, buffer, hooks, emitter) |
+| AEM / Sling / 3rd-party | consumer | Maven dep on `oak-audit-spi` only |
+
+**Consumer compile classpath:** `oak-audit-spi`. Nothing else from Oak. No `oak-core`, no `oak-jcr`, no `oak-security-spi`.
+
+---
+
+## 4. SPI surface
+
+### 4.1 `AuditEvent` — unchanged from Path α
+
+```java
+@ProviderType
+public interface AuditEvent {
+    @NotNull String getDomain();
+    @NotNull String getType();
+    long getTimestamp();
+    @NotNull Map<String, Object> getPayload();
+}
+```
+
+No `getOriginBundle()`. No `getCommitContext()`. Source-specific metadata lives in the payload Map.
+
+### 4.2 `AuditEventListener` — single method (Option C)
+
+```java
+@ConsumerType
+public interface AuditEventListener {
+
+    /**
+     * Returns the domain this listener subscribes to. Listeners are
+     * domain-scoped: only events whose {@link AuditEvent#getDomain()} matches
+     * are delivered.
+     */
+    @NotNull
+    String getDomain();
+
+    /**
+     * Returns the dispatch rank. Higher rank invoked first. Default 0.
+     */
+    default int getRank() {
+        return 0;
+    }
+
+    /**
+     * Invoked when one or more events for this listener's domain are
+     * dispatched. Events arrive in capture order. Implementations must be
+     * non-blocking; expensive work belongs in an async wrapper.
+     *
+     * <p><strong>Trust model.</strong> Events delivered through this method
+     * may originate from either:
+     * <ul>
+     *   <li>Oak-internal capture sites tied to a successful {@code Root.commit()}.
+     *       Such events carry {@code commit.sessionId}, {@code commit.userId},
+     *       and {@code commit.timestamp} entries in their payload.</li>
+     *   <li>Any bundle calling {@link AuditEventEmitter#emit(AuditEvent)}.
+     *       The accuracy of such events is the emitting bundle's responsibility;
+     *       Oak does not verify them. They do not carry the {@code commit.*}
+     *       payload entries.</li>
+     * </ul>
+     * Consumers that need to distinguish should inspect payload keys.
+     *
+     * @param events non-empty list of events for this listener's domain
+     */
+    void onEvents(@NotNull List<AuditEvent> events);
+}
+```
+
+**Single method.** No `NodeState`, no `CommitInfo` parameters. Commit-attached events carry `commit.*` payload keys; fire-and-forget events don't.
+
+### 4.3 `AuditEventEmitter` — NEW OSGi service
+
+```java
+@ProviderType
+public interface AuditEventEmitter {
+
+    /**
+     * Dispatches the event synchronously on the calling thread to all
+     * listeners registered for the event's domain. Not tied to any commit;
+     * not buffered; not rolled back on failure.
+     *
+     * <p>Listeners are invoked under per-listener try/catch isolation: one
+     * listener throwing does not prevent others from running, and exceptions
+     * are logged but never propagate back to the caller.
+     *
+     * @param event the event to dispatch, non-null
+     */
+    void emit(@NotNull AuditEvent event);
+
+    /**
+     * Returns true when at least one listener is registered for the given
+     * domain. Callers should gate event allocation with this method on hot
+     * paths to avoid unnecessary work when audit is off.
+     *
+     * @param domain the domain to check, non-null
+     */
+    boolean isEnabledFor(@NotNull String domain);
+}
+```
+
+Consumed via `@Reference`. One singleton per OSGi container, owned by `oak-core`.
+
+### 4.4 `AuditEvents` façade — extended
+
+```java
+public final class AuditEvents {
+
+    public interface Sink {
+        boolean isEnabled();
+        boolean isEnabledFor(@NotNull String domain);
+
+        /** Existing — commit-attached buffering path. */
+        void record(@NotNull Root root, @NotNull AuditEvent event);
+
+        /** NEW — fire-and-forget dispatch path. */
+        void dispatch(@NotNull AuditEvent event);
+    }
+
+    private static volatile Sink sink = NOOP;
+
+    public static void install(Sink newSink) { sink = (newSink != null) ? newSink : NOOP; }
+
+    public static boolean isEnabled()                       { return sink.isEnabled(); }
+    public static boolean isEnabledFor(String domain)        { return sink.isEnabledFor(domain); }
+    public static void record(Root root, AuditEvent event)   { sink.record(root, event); }
+
+    /** NEW. */
+    public static void dispatch(AuditEvent event)            { sink.dispatch(event); }
+}
+```
+
+---
+
+## 5. Commit-attached pipeline — preserved, payload decorated at drain time
+
+Path α's commit-attached pipeline is unchanged structurally. The only adaptation: at drain time, before `registry.dispatch(events)`, the `DispatchAuditEventsHook` DECORATES each event's payload with commit metadata.
+
+```java
+// in DispatchAuditEventsHook.processCommit, after validators pass:
+List<AuditEvent> events = drainBuffer(sessionId);
+List<AuditEvent> decorated = events.stream()
+        .map(e -> withCommitMetadata(e, commitInfo))
+        .collect(Collectors.toList());
+registry.dispatch(decorated);
+```
+
+The `withCommitMetadata` helper wraps the original event, returning a new `AuditEvent` whose `getPayload()` includes:
+
+| Key | Value | Source |
+|---|---|---|
+| `commit.sessionId` | `commitInfo.getSessionId()` | `CommitInfo` |
+| `commit.userId` | `commitInfo.getUserId()` | `CommitInfo` (`OAK_UNKNOWN` for system commits) |
+| `commit.timestamp` | `commitInfo.getDate()` | `CommitInfo` |
+
+Everything else in the original payload passes through unchanged. The decorator is internal to `oak-core`; consumers see only the public `AuditEvent` interface.
+
+**`NodeState after` is not surfaced in the payload.** Listeners that need to query post-commit state `@Reference NodeStore` directly.
+
+**`OAK_UNKNOWN` resolution:** listeners MUST NOT attempt to resolve `OAK_UNKNOWN` to a real user. It is a deliberate anonymity marker for system commits. This is captured in the `AuditEventListener.onEvents` Javadoc.
+
+---
+
+## 6. Fire-and-forget pipeline — new
+
+```
+AEM bundle: audit.emit(event)
+  → AuditEventEmitterImpl.emit(event)                       (oak-core, OSGi singleton)
+  → AuditEvents.dispatch(event)                              (oak-audit-spi static façade)
+  → sink.dispatch(event)                                     (installed by AuditConfigurationImpl)
+  → registry.dispatch(List.of(event))                        (WhiteboardAuditEventListenerRegistry)
+  → for each listener with matching domain, ordered by rank:
+       listener.onEvents(List.of(event))                     (synchronous on calling thread)
+```
+
+**Properties:**
+- **No buffer.** The ThreadLocal `AuditBuffer` is bypassed entirely.
+- **No commit.** The event fires immediately. Subsequent JCR operations have no bearing on it.
+- **Synchronous on calling thread.** Listeners doing I/O must wrap themselves in an async dispatcher (their responsibility). The `AuditEventListener.onEvents` Javadoc states this.
+- **Per-listener try/catch isolation.** One listener throwing does not stop the others. Exceptions are logged and swallowed.
+- **No payload decoration.** Fire-and-forget events keep the payload the caller provided. They do NOT carry `commit.*` keys.
+
+### 6.1 `AuditEventEmitterImpl` skeleton
+
+```java
+package org.apache.jackrabbit.oak.core.audit;
+
+import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
+import org.apache.jackrabbit.oak.spi.audit.AuditEventEmitter;
+import org.apache.jackrabbit.oak.spi.audit.AuditEvents;
+import org.jetbrains.annotations.NotNull;
+import org.osgi.service.component.annotations.Component;
+
+@Component(service = AuditEventEmitter.class)
+public class AuditEventEmitterImpl implements AuditEventEmitter {
+
+    @Override
+    public void emit(@NotNull AuditEvent event) {
+        AuditEvents.dispatch(event);
+    }
+
+    @Override
+    public boolean isEnabledFor(@NotNull String domain) {
+        return AuditEvents.isEnabledFor(domain);
+    }
+}
+```
+
+Roughly 15 lines. All work is in the static façade and the listener registry, which are part of `oak-core`'s existing wiring.
+
+---
+
+## 7. End-to-end sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant OakCap as Oak internal caller<br>(UserManagerImpl)
+    participant AemCap as AEM/Sling caller<br>(ContentFragmentAuditor)
+    participant AE as AuditEvents façade<br>(oak-audit-spi)
+    participant EMIT as AuditEventEmitterImpl<br>(oak-core, OSGi @Component)
+    participant AB as AuditBuffer<br>(ThreadLocal per session)
+    participant NS as NodeStore.merge
+    participant Val as Validators
+    participant Disp as DispatchAuditEventsHook
+    participant Reg as WhiteboardAuditEventListenerRegistry
+    participant L as Listener<br>(SiemForwarder)
+
+    Note over OakCap,L: Commit-attached path (Path α, payload-decorating drain)
+    OakCap->>AE: record(root, securityEvent)
+    AE->>AB: append(sessionId, event)
+    Note over AB: Buffered until commit drain
+    OakCap->>NS: Root.commit()
+    NS->>Val: validators run
+    alt validators pass
+        NS->>Disp: processCommit
+        Disp->>AB: drain(sessionId)
+        Disp->>Disp: decorate payload with<br>commit.sessionId, commit.userId, commit.timestamp
+        Disp->>Reg: dispatch(decoratedEvents)
+        Reg->>L: onEvents(decoratedEvents)
+    else validators fail
+        NS--xOakCap: CommitFailedException
+        Note over AB: Buffer cleared in finally; events discarded
+    end
+
+    Note over OakCap,L: Fire-and-forget path (NEW)
+    AemCap->>EMIT: emit(aemEvent)
+    EMIT->>AE: dispatch(aemEvent)
+    AE->>Reg: registry.dispatch(List.of(aemEvent))
+    Reg->>L: onEvents(List.of(aemEvent))
+
+    Note over OakCap,L: Same listener, single onEvents method. Source distinguishable via presence/absence of commit.* payload keys.
+```
+
+---
+
+## 8. AEM / Sling caller skeletons
+
+### 8.1 Commit-anchored AEM event (content fragment)
+
+```java
+@Component
+public class ContentFragmentAuditor {
+
+    @Reference
+    private AuditEventEmitter audit;
+
+    public void onFragmentPublished(String path, String variation) {
+        if (audit.isEnabledFor("aem.content")) {
+            audit.emit(new ContentFragmentPublishedEvent(path, variation));
+        }
+    }
+}
+
+// Defined in the AEM bundle. Implements oak-audit-spi.AuditEvent — no other Oak dep.
+class ContentFragmentPublishedEvent implements AuditEvent {
+    private final String path;
+    private final String variation;
+    private final long timestamp = System.currentTimeMillis();
+
+    ContentFragmentPublishedEvent(String path, String variation) {
+        this.path = path;
+        this.variation = variation;
+    }
+
+    @Override public String getDomain()              { return "aem.content"; }
+    @Override public String getType()                { return "fragment.published"; }
+    @Override public long getTimestamp()             { return timestamp; }
+    @Override public Map<String, Object> getPayload() {
+        return Map.of("path", path, "variation", variation);
+    }
+}
+```
+
+### 8.2 Non-commit AEM event (workflow lifecycle)
+
+```java
+@Component
+public class WorkflowAuditor {
+
+    @Reference
+    private AuditEventEmitter audit;
+
+    public void onStepCompleted(String workflowId, String stepId, String initiator) {
+        // No JCR commit, no Session. Just emit.
+        if (audit.isEnabledFor("aem.workflow")) {
+            audit.emit(new WorkflowStepCompletedEvent(workflowId, stepId, initiator));
+        }
+    }
+}
+```
+
+### 8.3 Listener consuming both pipelines through one method
+
+```java
+@Component(service = AuditEventListener.class)
+public class SiemForwarder implements AuditEventListener {
+
+    @Override
+    public String getDomain() { return "aem.content"; }
+
+    @Override
+    public void onEvents(List<AuditEvent> events) {
+        for (AuditEvent e : events) {
+            Map<String, Object> p = e.getPayload();
+            // Commit-attached events carry these keys; fire-and-forget don't.
+            String sessionId = (String) p.get("commit.sessionId");
+            String userId    = (String) p.get("commit.userId");
+            siem.forward(e, sessionId, userId);   // siem.forward handles null values
+        }
+    }
+}
+```
+
+A second listener subscribing to `"security"` receives Oak's commit-attached security events through the same method; the `commit.*` keys are populated.
+
+---
+
+## 9. Trust model — explicit statement
+
+The fire-and-forget producer surface is OPEN. This is deliberate.
+
+- **Any bundle that resolves `AuditEventEmitter` can emit any event for any domain**, including `"security"`. There is no compile-time check, no reserved-domain registry, no runtime gate.
+- **Listeners receive caller-asserted data.** An event arriving through `onEvents` reflects the emitting bundle's claim, not Oak-verified truth.
+- **Consumers must NOT treat the audit trail as authoritative without correlation.** A SIEM that ingests Oak's audit stream and treats every event as Oak-attested is operating against the documented contract.
+
+### 9.1 Why this trade-off
+
+The team explored a stricter design (Proposal C in `history/07-bridge-design.md`) with compile-time reserved-domain enforcement, typed `AuditEvent` subclasses, and runtime checks. Proposal C protects against bundle-level forgery at the cost of producer flexibility — particularly: only commit-attached emission, only typed events, no opaque payloads.
+
+The user prioritized flexibility: enable any higher-stack bundle to emit, on its own schedule, for any domain. The trust trade-off is accepted at this level.
+
+### 9.2 Mitigation guidance for downstream consumers
+
+| Need | Approach |
+|---|---|
+| Distinguish Oak-attested vs caller-asserted | Check payload keys: `commit.sessionId`, `commit.userId`, `commit.timestamp` are present iff the event came from Oak's commit-attached pipeline. |
+| Filter out a specific bundle's events | Consumer maintains an allowlist of trusted domains. AEM bundle emits domain `aem.content`; SIEM rule "only trust events with domain starting with `aem.` from bundles X, Y, Z" is the consumer's responsibility. |
+| Compliance audit (Oak-verified mutations only) | Consumer subscribes to `security` domain and filters for events with `commit.*` keys populated. |
+
+This is consumer-side discipline. It is NOT enforced by the SPI.
+
+---
+
+## 10. Migration from Path α
+
+The current Path α skeleton in `history/03-skeleton/` uses `AuditEventListener.onCommit(NodeState, CommitInfo, List<AuditEvent>)`. Migrating to this design:
+
+1. **Move types** from `oak-security-spi` to a new `oak-audit-spi` module:
+   - `AuditEvent`
+   - `AuditEventListener`
+   - `AuditEvents`
+   - `AuditConfiguration` (the marker interface)
+   - `AuditBufferLifecycle`
+2. **Add to `oak-audit-spi`**:
+   - `AuditEventEmitter` OSGi service interface
+3. **Modify `AuditEventListener`**:
+   - Replace `void onCommit(NodeState, CommitInfo, List<AuditEvent>)` with `void onEvents(List<AuditEvent>)`
+   - Update Javadoc with the trust-model section (§4.2 above)
+4. **Modify `AuditEvents.Sink`**:
+   - Add `void dispatch(AuditEvent event)` method
+5. **Modify `AuditEvents` façade**:
+   - Add `static void dispatch(AuditEvent event)` method
+6. **Modify `DispatchAuditEventsHook`** (oak-core):
+   - At drain time, decorate each event's payload with `commit.sessionId`, `commit.userId`, `commit.timestamp` from `CommitInfo` before calling `registry.dispatch(...)`
+7. **Add `AuditEventEmitterImpl`** in `oak-core` as `@Component(service = AuditEventEmitter.class)` (skeleton in §6.1).
+8. **Keep in `oak-security-spi`** (now depending on `oak-audit-spi`):
+   - `SecurityAuditEvent`
+   - All concrete security event subclasses (`MemberAddedEvent`, etc.)
+   - `SecurityAuditDomain`
+
+The `MutableRoot` lifecycle hooks for the commit-attached buffer (refresh, rebase, commit-failure) are unchanged. The `WhiteboardAuditEventListenerRegistry` gains the fire-and-forget dispatch path but its filtering/sorting logic is unchanged.
+
+---
+
+## 11. Test strategy outline
+
+Detailed plan to be authored after spec approval. Scope:
+
+| Area | Tests |
+|---|---|
+| Static façade | `dispatch(event)` routes to installed Sink; NOOP behavior when no Sink |
+| `AuditEventEmitterImpl` | OSGi activation registers service; `emit` routes to façade; `isEnabledFor` short-circuits |
+| Listener registry — fire-and-forget | Single listener invoked; multiple listeners invoked in rank order; non-matching domain not invoked; per-listener try/catch isolation; null/empty events handled |
+| Listener registry — commit-attached | Existing Path α tests adapted to `onEvents` signature |
+| Payload decoration | Drain-time decoration adds `commit.sessionId`, `commit.userId`, `commit.timestamp`; preserves original payload entries; works for system commits (`OAK_UNKNOWN` userId) |
+| Mixed pipeline | One listener subscribes to `security` and receives both commit-attached events (with `commit.*` keys) and fire-and-forget events from another bundle (without those keys); content of each batch is correct |
+| Migration regression | Path α security event tests adapted; verifies `MemberAddedEvent` etc. flow through the new pipeline end-to-end |
+| Coverage | `oak-audit-spi` modelled on `oak-security-spi` coverage gate (0.99 line / 1.0 branch, opted in via POM). `oak-core` audit additions covered as part of existing `oak-core` test surface (`>80%` per AGENTS.md). |
+
+---
+
+## 12. Deferred items
+
+| Item | Trigger to revisit |
+|---|---|
+| `LoginModuleMonitor.loginSucceeded` extension + internal `MonitorAuditBridge` | Login audit becomes a concrete requirement |
+| Outbound forwarding (OSGi EventAdmin, AEM AuditLog, Sling Jobs) | When a deployment needs cross-bundle pub/sub on the audit stream; listeners can fan out themselves in the interim |
+| Reserved domains / spoofing prevention | If the trust trade-off in §9 proves problematic in practice. Would require a separate hardening revision (compile-time check, runtime gate). |
+| Async listener wrapper (analog to `BackgroundObserver`) | Reference impl deferred; listeners are responsible for non-blocking behavior in v1. |
+| Backpressure / rate limiting on fire-and-forget | Not in v1. Consumers can self-regulate if needed. |
+
+---
+
+## 13. Process note for future SPI iterations
+
+The team's prior design cycle (`history/07-bridge-design.md`) round-tripped through v3→v4→v5 on whether `AuditEvent.getOriginBundle()` belonged in v1. Sage proposed a composite revision dropping it, withdrew on reflection, and the architect re-integrated — costing ~55 minutes of QA + skeleton churn across the team.
+
+For future SPI design rounds (this spec or beyond), dependent agents (tests, security review, downstream consumers) should NOT commit detailed work against an in-flight SPI until the architect sends an explicit `[design-freeze]` tagged message. Team-lead forwards about SPI shape MUST carry the tag. Without it, dependent agents stay parked.
+
+This is a process-level control. It does not change the SPI itself; it changes when downstream work commits.
+
+---
+
+## 14. Summary
+
+| Decision | This design |
+|---|---|
+| Producer surface | OPEN — any bundle can emit any event for any domain |
+| Commit boundary on producer side | None — fire-and-forget; commit-attached path preserved for Oak-internal use |
+| Listener method | SINGLE: `onEvents(List<AuditEvent>)` |
+| `NodeState` / `CommitInfo` on listener | None — commit metadata embedded in event payload at drain time |
+| Module split | NEW `oak-audit-spi` (neutral); `oak-security-spi` and `oak-core` depend on it; consumers depend on `oak-audit-spi` only |
+| Trust model | Caller-asserted — listeners receive what the emitting bundle says happened |
+| Coverage gate | `oak-audit-spi` 0.99 line / 1.0 branch (security-module precedent); `oak-core` >80% (general rule) |
+| Outbound forwarding | Deferred |
+| Login audit | Deferred (LoginModuleMonitor extension is a future option) |
+
+---
+
+End of spec. Implementation plan to follow via the `writing-plans` skill upon user approval.
