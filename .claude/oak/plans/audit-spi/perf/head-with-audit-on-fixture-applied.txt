@@ -1,0 +1,52 @@
+=== BasicWriteTest ===
+Apache Jackrabbit Oak 2.1-SNAPSHOT
+# BasicWriteTest                   C     min     10%     50%     90%     max     N       mean 
+Oak-MemoryNS-Audit                 1      13      18      59      76     82     574      52
+
+=== AddMemberTest ===
+Apache Jackrabbit Oak 2.1-SNAPSHOT
+# AddMemberTest                    C     min     10%     50%     90%     max     N       mean 
+setup done
+Oak-MemoryNS-Audit                 1   12070   12070   13175   13777  13777       3   13007
+
+=== RemoveMemberTest ===
+Apache Jackrabbit Oak 2.1-SNAPSHOT
+# RemoveMemberTest                 C     min     10%     50%     90%     max     N       mean 
+setup done
+Oak-MemoryNS-Audit                 1   30149   30149   30149   30149  30149       1   30149
+Exception in thread "main" java.lang.OutOfMemoryError: Java heap space
+	at org.apache.jackrabbit.oak.plugins.memory.MutableNodeState.<init>(MutableNodeState.java:63)
+	at org.apache.jackrabbit.oak.plugins.memory.MutableNodeState.getMutableChildNode(MutableNodeState.java:290)
+	at org.apache.jackrabbit.oak.plugins.memory.MemoryNodeBuilder$UnconnectedHead.getMutableNodeState(MemoryNodeBuilder.java:680)
+	at org.apache.jackrabbit.oak.plugins.memory.MemoryNodeBuilder.removeProperty(MemoryNodeBuilder.java:531)
+	at org.apache.jackrabbit.oak.plugins.index.property.strategy.ContentMirrorStoreStrategy.remove(ContentMirrorStoreStrategy.java:143)
+	at org.apache.jackrabbit.oak.plugins.index.property.strategy.ContentMirrorStoreStrategy.update(ContentMirrorStoreStrategy.java:119)
+	at org.apache.jackrabbit.oak.plugins.index.reference.ReferenceEditor.update(ReferenceEditor.java:313)
+	at org.apache.jackrabbit.oak.plugins.index.reference.ReferenceEditor.leave(ReferenceEditor.java:198)
+	at org.apache.jackrabbit.oak.plugins.index.IndexUpdate.leave(IndexUpdate.java:477)
+	at org.apache.jackrabbit.oak.spi.commit.VisibleEditor.leave(VisibleEditor.java:59)
+	at org.apache.jackrabbit.oak.spi.commit.EditorDiff.process(EditorDiff.java:55)
+	at org.apache.jackrabbit.oak.spi.commit.EditorHook.processCommit(EditorHook.java:54)
+	at org.apache.jackrabbit.oak.spi.commit.CompositeHook.processCommit(CompositeHook.java:60)
+	at org.apache.jackrabbit.oak.spi.commit.CompositeHook.processCommit(CompositeHook.java:60)
+	at org.apache.jackrabbit.oak.plugins.memory.MemoryNodeStore$MemoryNodeStoreBranch.merge(MemoryNodeStore.java:292)
+	at org.apache.jackrabbit.oak.plugins.memory.MemoryNodeStore.merge(MemoryNodeStore.java:131)
+	at org.apache.jackrabbit.oak.core.MutableRoot.commit(MutableRoot.java:266)
+	at org.apache.jackrabbit.oak.jcr.delegate.SessionDelegate.commit(SessionDelegate.java:402)
+	at org.apache.jackrabbit.oak.jcr.delegate.SessionDelegate.save(SessionDelegate.java:557)
+	at org.apache.jackrabbit.oak.jcr.session.SessionImpl$9.performVoid(SessionImpl.java:460)
+	at org.apache.jackrabbit.oak.jcr.delegate.SessionDelegate.performVoid(SessionDelegate.java:306)
+	at org.apache.jackrabbit.oak.jcr.session.SessionImpl.save(SessionImpl.java:457)
+	at org.apache.jackrabbit.oak.benchmark.RemoveMembersTest.afterSuite(RemoveMembersTest.java:124)
+	at org.apache.jackrabbit.oak.benchmark.AbstractTest.tearDown(AbstractTest.java:412)
+	at org.apache.jackrabbit.oak.benchmark.AbstractTest.runTest(AbstractTest.java:263)
+	at org.apache.jackrabbit.oak.benchmark.AbstractTest.run(AbstractTest.java:199)
+	at org.apache.jackrabbit.oak.benchmark.BenchmarkRunner.main(BenchmarkRunner.java:521)
+	at org.apache.jackrabbit.oak.run.BenchmarkCommand.execute(BenchmarkCommand.java:27)
+	at org.apache.jackrabbit.oak.run.Main.main(Main.java:55)
+
+=== RemoveMemberTest (retry @ -Xmx8g) ===
+Apache Jackrabbit Oak 2.1-SNAPSHOT
+# RemoveMemberTest                 C     min     10%     50%     90%     max     N       mean 
+setup done
+Oak-MemoryNS-Audit                 1   49236   49236   49236   49236  49236       1   49236

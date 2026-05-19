@@ -23,6 +23,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
@@ -46,11 +47,22 @@ import org.apache.jackrabbit.oak.plugins.document.rdb.RDBDocumentStore;
 import org.apache.jackrabbit.oak.plugins.document.rdb.RDBOptions;
 import org.apache.jackrabbit.oak.plugins.document.util.MongoConnection;
 import org.apache.jackrabbit.oak.plugins.memory.MemoryNodeStore;
+import org.apache.jackrabbit.oak.security.audit.AuditConfigurationImpl;
+import org.apache.jackrabbit.oak.security.internal.SecurityProviderBuilder;
 import org.apache.jackrabbit.oak.segment.Segment;
+import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
+import org.apache.jackrabbit.oak.spi.audit.AuditEventListener;
 import org.apache.jackrabbit.oak.spi.blob.BlobStore;
 import org.apache.jackrabbit.oak.spi.filter.PathFilter;
+import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
+import org.apache.jackrabbit.oak.spi.security.audit.SecurityAuditDomain;
 import org.apache.jackrabbit.oak.spi.state.NodeStore;
+import org.apache.jackrabbit.oak.spi.toggle.FeatureToggle;
+import org.apache.jackrabbit.oak.spi.whiteboard.DefaultWhiteboard;
+import org.apache.jackrabbit.oak.spi.whiteboard.Tracker;
+import org.apache.jackrabbit.oak.spi.whiteboard.Whiteboard;
 import org.apache.jackrabbit.oak.stats.StatisticsProvider;
+import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -62,8 +74,11 @@ import static org.apache.jackrabbit.oak.plugins.document.rdb.RDBDocumentNodeStor
 
 public abstract class OakFixture {
 
+    private static final Logger LOG = LoggerFactory.getLogger(OakFixture.class);
+
     public static final String OAK_MEMORY = "Oak-Memory";
     public static final String OAK_MEMORY_NS = "Oak-MemoryNS";
+    public static final String OAK_MEMORY_NS_AUDIT = "Oak-MemoryNS-Audit";
 
     public static final String OAK_MONGO = "Oak-Mongo";
     public static final String OAK_MONGO_DS = "Oak-Mongo-DS";
@@ -138,6 +153,102 @@ public abstract class OakFixture {
             @Override
             public void tearDownCluster() {
                 // nothing to do
+            }
+        };
+    }
+
+    /**
+     * In-memory fixture with the audit pipeline wired and the
+     * {@code FT_AUDIT} feature toggle enabled. Companion to
+     * {@link #getMemoryNS(long)} for measuring the audit-ON cost shape
+     * (per-commit hook chain + capture-site allocation + buffer drain +
+     * listener dispatch).
+     * <p>
+     * One {@link AuditConfigurationImpl} is shared across all cluster
+     * elements: the audit pipeline uses JVM-static sinks
+     * ({@code AuditEvents.install}, {@code AuditBufferLifecycle.install})
+     * which would clobber each other under repeated init.
+     * <p>
+     * A NOOP {@link AuditEventListener} is registered for the
+     * {@link SecurityAuditDomain#NAME security} domain so that
+     * {@code AuditEvents.isEnabledFor("security")} returns {@code true}
+     * and the capture sites in
+     * {@code org.apache.jackrabbit.oak.security.user.UserManagerImpl}
+     * (member add/remove) actually allocate, buffer and dispatch
+     * events. Without a domain-matching listener, capture sites
+     * short-circuit before allocation and the benchmark degenerates
+     * into the audit-OFF measurement.
+     */
+    public static OakFixture getMemoryNSWithAudit(final long cacheSize) {
+        return new OakFixture(OAK_MEMORY_NS_AUDIT) {
+
+            private Whiteboard whiteboard;
+            private SecurityProvider securityProvider;
+            private AuditConfigurationImpl auditConfig;
+
+            private synchronized void initAuditPipelineIfNeeded() {
+                if (auditConfig != null) {
+                    return;
+                }
+                whiteboard = new DefaultWhiteboard();
+                auditConfig = new AuditConfigurationImpl();
+                // build() triggers AuditConfigurationImpl.initialize(whiteboard)
+                // — registers FT_AUDIT toggle, starts the listener tracker,
+                // installs AuditBuffer + BufferSink as the JVM-static sinks.
+                securityProvider = SecurityProviderBuilder.newBuilder()
+                        .withWhiteboard(whiteboard)
+                        .withAuditConfiguration(auditConfig)
+                        .build();
+
+                Tracker<FeatureToggle> tracker = whiteboard.track(FeatureToggle.class);
+                try {
+                    for (FeatureToggle ft : tracker.getServices()) {
+                        if (AuditConfigurationImpl.FEATURE_TOGGLE_NAME.equals(ft.getName())) {
+                            ft.setEnabled(true);
+                        }
+                    }
+                } finally {
+                    tracker.stop();
+                }
+
+                whiteboard.register(AuditEventListener.class,
+                        new BenchmarkNoopListener(SecurityAuditDomain.NAME),
+                        Map.of());
+            }
+
+            @Override
+            public Oak getOak(int clusterId) {
+                initAuditPipelineIfNeeded();
+                return newOak(new MemoryNodeStore())
+                        .with(securityProvider)
+                        .with(whiteboard);
+            }
+
+            @Override
+            public Oak[] setUpCluster(int n, StatisticsProvider statsProvider) {
+                initAuditPipelineIfNeeded();
+                Oak[] cluster = new Oak[n];
+                for (int i = 0; i < cluster.length; i++) {
+                    cluster[i] = newOak(new MemoryNodeStore())
+                            .with(securityProvider)
+                            .with(whiteboard);
+                }
+                return cluster;
+            }
+
+            @Override
+            public void tearDownCluster() {
+                if (auditConfig != null) {
+                    try {
+                        auditConfig.dispose();
+                    } catch (RuntimeException e) {
+                        LOG.warn("Audit pipeline dispose() failed during fixture teardown; continuing.", e);
+                    } finally {
+                        auditConfig = null;
+                        securityProvider = null;
+                        whiteboard = null;
+                    }
+                }
             }
         };
     }
@@ -561,6 +672,36 @@ public abstract class OakFixture {
 
     static Oak newOak(NodeStore nodeStore) {
         return new Oak(nodeStore).with(ManagementFactory.getPlatformMBeanServer());
+    }
+
+    /**
+     * Domain-scoped no-op listener used by the audit-enabled benchmark
+     * fixture ({@link #getMemoryNSWithAudit(long)}). Returning a real
+     * listener (rather than relying on the JVM-static NOOP sink) is what
+     * flips {@code AuditEvents.isEnabledFor(domain)} to {@code true} and
+     * causes capture sites to allocate and buffer events — see the
+     * {@code BufferSink.isEnabledFor} short-circuit in
+     * {@code AuditConfigurationImpl}.
+     */
+    private static final class BenchmarkNoopListener implements AuditEventListener {
+
+        private final String domain;
+
+        BenchmarkNoopListener(@NotNull String domain) {
+            this.domain = domain;
+        }
+
+        @NotNull
+        @Override
+        public String getDomain() {
+            return domain;
+        }
+
+        @Override
+        public void onEvents(@NotNull List<AuditEvent> events) {
+            // intentional no-op: the benchmark wants to exercise the
+            // capture + buffer + dispatch path, not the listener's work
+        }
     }
 
 }

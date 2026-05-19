@@ -1,0 +1,23 @@
+=== AuditEmptyCommitOverheadTest (100 commits/iter, 20s runtime, -Xmx2g) ===
+Apache Jackrabbit Oak 2.1-SNAPSHOT
+# AuditEmptyCommitOverheadTe       C     min     10%     50%     90%     max     N       mean 
+Oak-MemoryNS                       1     159     200     256     348    366      78     260
+Oak-MemoryNS-Audit                 1     171     187     252     360    377      77     261
+
+=== AuditEmptyCommitOverheadTest (500 commits/iter, 30s runtime, -Xmx2g) ===
+Apache Jackrabbit Oak 2.1-SNAPSHOT
+# AuditEmptyCommitOverheadTe       C     min     10%     50%     90%     max     N       mean 
+Oak-MemoryNS                       1    1017    1129    1618    2374   2454      19    1704
+Oak-MemoryNS-Audit                 1     980    1091    1352    2015   2085      20    1500
+
+=== AuditCaptureSiteOverheadTest (100 pairs / 200 events / iter, 30s runtime, -Xmx2g) ===
+Apache Jackrabbit Oak 2.1-SNAPSHOT
+# AuditCaptureSiteOverheadTe       C     min     10%     50%     90%     max     N       mean 
+Oak-MemoryNS                       1      11      12      13      15     18    2304      13
+Oak-MemoryNS-Audit                 1      12      13      13      15     80    2207      14
+
+=== AuditCaptureSiteOverheadTest (1000 pairs / 2000 events / iter, 30s runtime, -Xmx2g) ===
+Apache Jackrabbit Oak 2.1-SNAPSHOT
+# AuditCaptureSiteOverheadTe       C     min     10%     50%     90%     max     N       mean 
+Oak-MemoryNS                       1     118     124     140     144    152     218     138
+Oak-MemoryNS-Audit                 1     124     127     130     134    206     230     131
