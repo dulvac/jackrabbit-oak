@@ -13,6 +13,16 @@ Consumed by `oak-security-spi`, `oak-core`, and any consumer bundle.
 This module does NOT depend on `oak-security-spi`, `oak-core`, or any
 Oak-internal storage modules.
 
+Further reading
+---------------
+
+- [`docs/design.md`](docs/design.md) — canonical design spec: architecture,
+  SPI surface, commit-attached + fire-and-forget pipelines, trust model.
+- [`docs/performance/README.md`](docs/performance/README.md) — performance
+  characterization (macro slice + per-commit / per-event microbenchmarks),
+  with reproduction recipes.
+- User-facing guide: [`oak-doc/src/site/markdown/security/audit.md`](../oak-doc/src/site/markdown/security/audit.md).
+
 License
 -------
 

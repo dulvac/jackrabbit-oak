@@ -1,8 +1,8 @@
-# Cross-Stack Audit — Loose Design
+# Cross-Stack Audit — Design
 
-Companion to `history/06-scope-and-flow.md` (Path α commit-attached pipeline) and `history/07-bridge-design.md` (the team's prior narrow design, now superseded). This spec opens the producer surface to any OSGi bundle in the stack — Oak, AEM, Sling, third-party — and unifies the listener interface to a single method.
+This is the canonical design spec for the audit-event SPI shipping in `oak-audit-spi` and its consumers (`oak-security-spi`, `oak-core`). The producer surface is open to any OSGi bundle in the stack — Oak, AEM, Sling, third-party — and the listener interface is a single method.
 
-This document supersedes `history/07-bridge-design.md` per user direction: drop the bridge narrowing, restore an open producer surface, and accept the trust-model trade-off documented in §9.
+An earlier internal design round narrowed the bridge to commit-attached-only; that approach was reverted before implementation in favor of the open producer surface here, accepting the trust-model trade-off documented in §9.
 
 ---
 
@@ -475,7 +475,7 @@ The fire-and-forget producer surface is OPEN. This is deliberate.
 
 ### 9.1 Why this trade-off
 
-The team explored a stricter design (Proposal C in `history/07-bridge-design.md`) with compile-time reserved-domain enforcement, typed `AuditEvent` subclasses, and runtime checks. Proposal C protects against bundle-level forgery at the cost of producer flexibility — particularly: only commit-attached emission, only typed events, no opaque payloads.
+The team explored a stricter design (an internal "Proposal C") with compile-time reserved-domain enforcement, typed `AuditEvent` subclasses, and runtime checks. Proposal C protects against bundle-level forgery at the cost of producer flexibility — particularly: only commit-attached emission, only typed events, no opaque payloads.
 
 The user prioritized flexibility: enable any higher-stack bundle to emit, on its own schedule, for any domain. The trust trade-off is accepted at this level.
 
@@ -491,9 +491,9 @@ This is consumer-side discipline. It is NOT enforced by the SPI.
 
 ---
 
-## 10. Migration from Path α
+## 10. Migration from the earlier in-tree design
 
-The current Path α skeleton in `history/03-skeleton/` uses `AuditEventListener.onCommit(NodeState, CommitInfo, List<AuditEvent>)`. Migrating to this design:
+An earlier in-tree skeleton used `AuditEventListener.onCommit(NodeState, CommitInfo, List<AuditEvent>)` with security-event types living in `oak-security-spi`. The migration to this design:
 
 1. **Move types** from `oak-security-spi` to a new `oak-audit-spi` module:
    - `AuditEvent`
@@ -553,11 +553,7 @@ Detailed plan to be authored after spec approval. Scope:
 
 ## 13. Process note for future SPI iterations
 
-The team's prior design cycle (`history/07-bridge-design.md`) round-tripped through v3→v4→v5 on whether `AuditEvent.getOriginBundle()` belonged in v1. Sage proposed a composite revision dropping it, withdrew on reflection, and the architect re-integrated — costing ~55 minutes of QA + skeleton churn across the team.
-
-For future SPI design rounds (this spec or beyond), dependent agents (tests, security review, downstream consumers) should NOT commit detailed work against an in-flight SPI until the architect sends an explicit `[design-freeze]` tagged message. Team-lead forwards about SPI shape MUST carry the tag. Without it, dependent agents stay parked.
-
-This is a process-level control. It does not change the SPI itself; it changes when downstream work commits.
+An earlier design cycle for this work round-tripped through several revisions on whether `AuditEvent.getOriginBundle()` belonged in v1 — eventually dropped. Process lesson recorded here for future SPI iterations: dependent work (tests, security review, downstream consumers) should not commit against an in-flight SPI until the design is frozen.
 
 ---
 

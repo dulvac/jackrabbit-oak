@@ -13,4 +13,11 @@ derby.log
 .java-version
 oak-shaded-guava/dependency-reduced-pom.xml
 .DS_Store
-.claude/settings.local.json
+
+# AI tooling: kept locally for development, not part of the codebase.
+.claude/
+AGENTS.md
+CLAUDE.md
+.mcp.json
+
+wiki/
