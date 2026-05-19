@@ -4,6 +4,8 @@ This is the canonical design spec for the audit-event SPI shipping in `oak-audit
 
 An earlier internal design round narrowed the bridge to commit-attached-only; that approach was reverted before implementation in favor of the open producer surface here, accepting the trust-model trade-off documented in §9.
 
+**Layered framing — event primitives vs. pipeline ownership.** The event primitives (`AuditEvent`, `AuditEventListener`, `AuditEventEmitter`) and the static `AuditEvents` façade are domain-neutral at the type level — any bundle can construct an event for any domain string. The **pipeline wiring** in v1 is, however, security-bound: `AuditConfiguration extends SecurityConfiguration`, the pipeline contributes hooks via `SecurityConfiguration.getCommitHooks(...)`, and `AuditConfigurationImpl` lives in `oak.security.audit`. A v1-vetoed design (`docs/history/design-item-2-v1-vetoed.md`) attempted to elevate audit to a top-level Oak service with a new `CommitHookProvider` SPI in `oak-store-spi`; user constraints invalidated that direction. The current design (item 2 v2, `docs/design-item-2.md`) addresses the original "marker interface" complaint by enriching `AuditConfiguration` with a real semantic method (`isActive()`) while keeping the v1 security-bound pipeline ownership intact. The split (neutral primitives, security-bound pipeline) is the design.
+
 ---
 
 ## 1. Goals & non-goals
@@ -95,8 +97,9 @@ flowchart TB
     end
 
     subgraph SEC["oak-security-spi (existing)"]
-        SEC_EV[SecurityAuditEvent]
-        MA[MemberAddedEvent, etc.]
+        ACS[AuditConfiguration]
+        SAT[SecurityAuditTypes]
+        SAE[SecurityAuditEvents helper]
         SAD[SecurityAuditDomain]
     end
 
@@ -126,12 +129,43 @@ flowchart TB
 
 | Module | Status | Role |
 |---|---|---|
-| `oak-audit-spi` | NEW | Domain-neutral SPI: `AuditEvent`, `AuditEventListener`, `AuditEventEmitter`, `AuditEvents` static façade |
-| `oak-security-spi` | existing — depends on `oak-audit-spi` | Security-specific event subclasses (`SecurityAuditEvent`, `MemberAddedEvent`, `SecurityAuditDomain`, etc.) |
-| `oak-core` | existing — adds `AuditEventEmitterImpl` | Pipeline implementation (registry, buffer, hooks, emitter) |
+| `oak-audit-spi` | NEW | Domain-neutral SPI: `AuditEvent` (with static factory `of(domain, type, payload)`), `AuditEventListener`, `AuditEventEmitter`, `AuditEvents` static façade |
+| `oak-security-spi` | existing — depends on `oak-audit-spi` | Security domain constants (`SecurityAuditDomain`, `SecurityAuditTypes` with type-string + payload-key constants), `SecurityAuditEvents` helper class for ergonomic security-domain capture sites, `AuditConfiguration` security configuration interface (with `isActive()` pipeline-state probe) |
+| `oak-core` | existing — adds `AuditEventEmitterImpl` + `AuditConfigurationImpl` | Pipeline implementation (registry, buffer, hooks, emitter, configuration) |
 | AEM / Sling / 3rd-party | consumer | Maven dep on `oak-audit-spi` only |
 
 **Consumer compile classpath:** `oak-audit-spi`. Nothing else from Oak. No `oak-core`, no `oak-jcr`, no `oak-security-spi`.
+
+### 3.1 Per-domain helper convention
+
+Item 3 removed the per-event typed subclass hierarchy from `oak-security-spi` (the deleted classes were `SecurityAuditEvent`, `MemberAddedEvent`, `MemberRemovedEvent`, `MembersAddedBulkEvent`, `MembersRemovedBulkEvent`). The reviewer's "vocabulary leak" and "class proliferation" objections are now addressed by:
+
+- One public construction entry point on the domain-neutral SPI: `AuditEvent.of(domain, type, payload)`.
+- Per-domain helpers in the **owning module** (not in `oak-audit-spi`), exposing the bare `AuditEvent` interface — consumers cannot `instanceof`-check helper outputs, so the helper is purely a call-site ergonomic.
+
+In `oak-security-spi` the helper is `SecurityAuditEvents` (e.g. `.memberAdded(groupPath, memberPath)`, `.membersAddedBulk(...)`). The convention is informal in v1; future audit-event consumers in Oak's security stack (ACL, principal, token, login) MAY follow the same pattern, providing their own per-domain helper class in the relevant security subpackage. Codify the convention in `oak-audit-spi`'s package Javadoc when a second domain implements such a helper.
+
+### 3.2 Item 2 v2 — `AuditConfiguration` enrichment
+
+The "marker interface" complaint raised against Path α (`AuditConfiguration` shipped only `NAME` + `NOOP` + the implicit `extends SecurityConfiguration`) is addressed by adding one real semantic method:
+
+```java
+boolean isActive();
+```
+
+`AuditConfigurationImpl.isActive()` delegates to `AuditEvents.isEnabled()` — single source of truth for the predicate (the body lives in `BufferSink.isEnabled()` exclusively). The `Noop` inner class returns `false`. The drift-prevention invariant is documented on both the interface method's Javadoc and the impl's Javadoc.
+
+The v2 SPI delta is exactly one abstract method on `AuditConfiguration`. No `MutableRoot` changes, no `Oak.with(...)` additions, no `oak-store-spi` additions, no package renames. The v1-vetoed approach is preserved in `docs/history/design-item-2-v1-vetoed.md` for design history; full v2 spec in `docs/design-item-2.md`.
+
+### 3.2a Feature toggle name — deferred OAK rename
+
+`AuditConfigurationImpl.FEATURE_TOGGLE_NAME` is currently `"FT_AUDIT"`. The convention in `AGENTS.md` requires `FT_<DESCRIPTION>_OAK-<issue>` for upstream toggles. The rename to `"FT_AUDIT_OAK-<NNNNN>"` is **deferred to a future follow-up** — the upstream OAK JIRA ticket has not been filed yet, and the user (who is away) is the right person to file it. The constant deliberately **does not** appear on the public `AuditConfiguration` SPI interface in v2: putting the literal on the SPI would commit consumers to the exact value forever, making the OAK-suffix rename a breaking change rather than the additive shift it is today. When the ticket is filed, the constant updates to its OAK-suffixed value and can ALSO move to the SPI interface as a binary-additive change. The source Javadoc at `AuditConfigurationImpl:73-78` records this rationale inline so future maintainers don't move the constant prematurely.
+
+### 3.2b Pre-existing JMM observation — follow-up
+
+`AuditConfigurationImpl`'s `featureToggle`, `buffer`, and `registry` fields are plain (non-volatile) instance fields. The `getCommitHooks(workspaceName)` method reads them on commit threads while the OSGi `@Activate` / `@Deactivate` paths write them on a different thread. The path works in practice because OSGi DS provides happens-before from `@Activate` to subsequent service uses, and the long publication chain (`SecurityProviderBuilder` → `ContentRepositoryImpl` → `ContentSessionImpl` → `MutableRoot.commit`) carries the visibility forward via `InternalSecurityProvider.auditConfiguration` being `volatile`.
+
+Formally, `volatile` on these three fields would make the visibility explicit and remove the OSGi-runtime dependency. **Out of scope for v2** (item 2). Filed here so the observation doesn't drop off the radar — a future PR can add the three `volatile` keywords with minimal risk. The v2 delegating `isActive()` doesn't add to this concern: reads go through the existing volatile `AuditEvents.sink`, sidestepping the impl-field publication entirely.
 
 ---
 
@@ -495,12 +529,13 @@ This is consumer-side discipline. It is NOT enforced by the SPI.
 
 An earlier in-tree skeleton used `AuditEventListener.onCommit(NodeState, CommitInfo, List<AuditEvent>)` with security-event types living in `oak-security-spi`. The migration to this design:
 
-1. **Move types** from `oak-security-spi` to a new `oak-audit-spi` module:
+1. **Move types** from `oak-security-spi` to a new `oak-audit-spi` module (domain-neutral event primitives):
    - `AuditEvent`
    - `AuditEventListener`
    - `AuditEvents`
-   - `AuditConfiguration` (the marker interface)
    - `AuditBufferLifecycle`
+
+   `AuditConfiguration` is intentionally **NOT** moved — it stays in `oak-security-spi` because it `extends SecurityConfiguration` (pipeline ownership is security-bound in v1; see item 2 v2).
 2. **Add to `oak-audit-spi`**:
    - `AuditEventEmitter` OSGi service interface
 3. **Modify `AuditEventListener`**:
@@ -513,10 +548,15 @@ An earlier in-tree skeleton used `AuditEventListener.onCommit(NodeState, CommitI
 6. **Modify `DispatchAuditEventsHook`** (oak-core):
    - At drain time, decorate each event's payload with `commit.sessionId`, `commit.userId`, `commit.timestamp` from `CommitInfo` before calling `registry.dispatch(...)`
 7. **Add `AuditEventEmitterImpl`** in `oak-core` as `@Component(service = AuditEventEmitter.class)` (skeleton in §6.1).
-8. **Keep in `oak-security-spi`** (now depending on `oak-audit-spi`):
-   - `SecurityAuditEvent`
-   - All concrete security event subclasses (`MemberAddedEvent`, etc.)
-   - `SecurityAuditDomain`
+8. **Keep / add in `oak-security-spi`** (now depending on `oak-audit-spi`):
+   - `SecurityAuditDomain` — domain identifier constant for `"security"`.
+   - `SecurityAuditTypes` — type-string and payload-key constants (per item 3; supersedes the deleted per-event typed subclasses).
+   - `SecurityAuditEvents` — ergonomic helper class providing per-event factory methods that delegate to `AuditEvent.of(...)`.
+   - `AuditConfiguration` — security configuration interface, enriched with `isActive()` per item 2 v2.
+
+**Item 3 deletion (post-Path α):** the per-event typed subclasses (`SecurityAuditEvent`, `MemberAddedEvent`, `MemberRemovedEvent`, `MembersAddedBulkEvent`, `MembersRemovedBulkEvent`) were removed; their semantics are now encoded as `domain + type` strings via `SecurityAuditTypes`, with capture-site ergonomics provided by `SecurityAuditEvents`. See `docs/design-item-3.md`.
+
+**Item 2 v2 enrichment (post-Path α):** `AuditConfiguration` gains a `boolean isActive()` method, addressing the reviewer's "marker interface" complaint while preserving the v1 security-bound pipeline wiring. See `docs/design-item-2.md`.
 
 The `MutableRoot` lifecycle hooks for the commit-attached buffer (refresh, rebase, commit-failure) are unchanged. The `WhiteboardAuditEventListenerRegistry` gains the fire-and-forget dispatch path but its filtering/sorting logic is unchanged.
 
@@ -534,8 +574,8 @@ Detailed plan to be authored after spec approval. Scope:
 | Listener registry — commit-attached | Existing Path α tests adapted to `onEvents` signature |
 | Payload decoration | Drain-time decoration adds `commit.sessionId`, `commit.userId`, `commit.timestamp`; preserves original payload entries; works for system commits (`OAK_UNKNOWN` userId) |
 | Mixed pipeline | One listener subscribes to `security` and receives both commit-attached events (with `commit.*` keys) and fire-and-forget events from another bundle (without those keys); content of each batch is correct |
-| Migration regression | Path α security event tests adapted; verifies `MemberAddedEvent` etc. flow through the new pipeline end-to-end |
-| Coverage | `oak-audit-spi` modelled on `oak-security-spi` coverage gate (0.99 line / 1.0 branch, opted in via POM). `oak-core` audit additions covered as part of existing `oak-core` test surface (`>80%` per AGENTS.md). |
+| Migration regression | Capture-site tests adapted post item 3 (typed-event removal); `UserManagerImplAuditTest` and `AuditWiringIT` verify that `SecurityAuditEvents.memberAdded(...)`, `.memberRemoved(...)`, `.membersAddedBulk(...)`, `.membersRemovedBulk(...)` flow through the pipeline end-to-end with `domain == SecurityAuditDomain.NAME` and `type == SecurityAuditTypes.USER_MEMBER_ADDED` (etc.) |
+| Coverage | `oak-audit-spi` **100% line / 100% branch** (revised UP from 0.99 / 1.0 in item 3; the new code is small enough that 100% is trivial). `oak-security-spi` stays at its standing 100% / 100% gate. `oak-core` audit additions covered as part of the existing `oak-core` test surface (`>80%` per AGENTS.md). |
 
 ---
 
@@ -564,12 +604,18 @@ An earlier design cycle for this work round-tripped through several revisions on
 | Producer surface | OPEN — any bundle can emit any event for any domain |
 | Commit boundary on producer side | None — fire-and-forget; commit-attached path preserved for Oak-internal use |
 | Listener method | SINGLE: `onEvents(List<AuditEvent>)` |
+| Event construction | Static factory `AuditEvent.of(domain, type, payload)`; no typed subclasses on the SPI (item 3) |
+| Per-domain ergonomics | Helper classes in owning module — e.g. `SecurityAuditEvents` in `oak-security-spi` (item 3) |
+| Pipeline ownership in v1 | **Security-bound** — `AuditConfiguration extends SecurityConfiguration`, wired via `SecurityProviderBuilder.withAuditConfiguration(...)` (item 2 v2; replaces the vetoed option-a "top-level Oak service" design) |
+| `AuditConfiguration` interface | Enriched with `boolean isActive()` (item 2 v2); addresses the "marker interface" reviewer complaint while keeping the v1 wiring intact |
 | `NodeState` / `CommitInfo` on listener | None — commit metadata embedded in event payload at drain time |
-| Module split | NEW `oak-audit-spi` (neutral); `oak-security-spi` and `oak-core` depend on it; consumers depend on `oak-audit-spi` only |
+| Module split | NEW `oak-audit-spi` (event primitives are domain-neutral); `oak-security-spi` and `oak-core` depend on it; consumers depend on `oak-audit-spi` only |
 | Trust model | Caller-asserted — listeners receive what the emitting bundle says happened |
-| Coverage gate | `oak-audit-spi` 0.99 line / 1.0 branch (security-module precedent); `oak-core` >80% (general rule) |
+| Coverage gate | `oak-audit-spi` 100% / 100% (revised up in item 3); `oak-security-spi` 100% / 100%; `oak-core` >80% (general rule) |
 | Outbound forwarding | Deferred |
 | Login audit | Deferred (LoginModuleMonitor extension is a future option) |
+| `FT_AUDIT` → `FT_AUDIT_OAK-<NNNNN>` rename | Deferred — pending upstream OAK ticket allocation by the user; constant stays at `AuditConfigurationImpl`, not on SPI, until the OAK number exists. See §3.2a. |
+| `volatile` on impl `featureToggle`/`buffer`/`registry` | Deferred — pre-existing JMM observation, out of scope for item 2 v2. See §3.2b. |
 
 ---
 

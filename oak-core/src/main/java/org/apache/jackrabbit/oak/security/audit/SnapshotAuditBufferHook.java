@@ -58,6 +58,14 @@ final class SnapshotAuditBufferHook implements CommitHook {
      * Private to the audit module — consumers read events via
      * {@link org.apache.jackrabbit.oak.spi.audit.AuditEventListener#onEvents}.
      */
+    // The string value "oak.audit.events" is observable to any
+    // CommitHook service running in the same commit (CommitContext
+    // is a shared, string-keyed channel). Exfiltration via this
+    // channel is a recognised limitation under the bundle-deploy
+    // trust model (see AuditEvents.install Javadoc and design.md §9).
+    // A typed CommitContext-key system that would harden this is
+    // out of scope; cross-domain CommitHook visibility is inherent to
+    // the existing CommitContext model.
     static final String COMMIT_CONTEXT_KEY = "oak.audit.events";
 
     private final Feature featureToggle;

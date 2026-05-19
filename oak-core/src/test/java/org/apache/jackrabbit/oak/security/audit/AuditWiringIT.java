@@ -29,6 +29,7 @@ import org.apache.jackrabbit.api.security.user.User;
 import org.apache.jackrabbit.api.security.user.UserManager;
 import org.apache.jackrabbit.oak.InitialContentHelper;
 import org.apache.jackrabbit.oak.Oak;
+import org.apache.jackrabbit.oak.security.audit.AuditConfigurationImpl;
 import org.apache.jackrabbit.oak.api.ContentRepository;
 import org.apache.jackrabbit.oak.api.ContentSession;
 import org.apache.jackrabbit.oak.api.Root;
@@ -39,8 +40,8 @@ import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
 import org.apache.jackrabbit.oak.spi.audit.AuditEventListener;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
 import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
-import org.apache.jackrabbit.oak.spi.security.audit.MemberAddedEvent;
 import org.apache.jackrabbit.oak.spi.security.audit.SecurityAuditDomain;
+import org.apache.jackrabbit.oak.spi.security.audit.SecurityAuditTypes;
 import org.apache.jackrabbit.oak.spi.security.authentication.ConfigurationUtil;
 import org.apache.jackrabbit.oak.spi.security.user.UserConfiguration;
 import org.apache.jackrabbit.oak.spi.toggle.FeatureToggle;
@@ -65,7 +66,7 @@ import static org.junit.Assert.assertTrue;
  * <ol>
  *   <li>JCR {@link UserManager#createGroup(String)} → {@link Group#addMember(org.apache.jackrabbit.api.security.user.Authorizable)}.</li>
  *   <li>{@code UserManagerImpl.recordSingleMembershipAuditEvent} →
- *       {@code AuditEvents.record(root, MemberAddedEvent.of(...))}.</li>
+ *       {@code AuditEvents.record(root, SecurityAuditEvents.memberAdded(...))}.</li>
  *   <li>{@code SnapshotAuditBufferHook} → {@code DispatchAuditEventsHook} →
  *       the registered listener.</li>
  * </ol>
@@ -96,7 +97,7 @@ public class AuditWiringIT {
 
         setToggle(true);
 
-        // Listener for the security domain — that's where MemberAddedEvent lands.
+        // Listener for the security domain — that's where the member-added event lands.
         AuditEventListener securityListener = new AuditEventListener() {
             @Override public @NotNull String getDomain() { return SecurityAuditDomain.NAME; }
             @Override public void onEvents(@NotNull List<AuditEvent> events) {
@@ -148,13 +149,14 @@ public class AuditWiringIT {
     }
 
     /**
-     * The capture-site in {@code UserManagerImpl.addMember} fires
-     * {@link MemberAddedEvent} on successful group update; the event must
-     * traverse the entire pipeline to the registered listener with the
-     * commit metadata decorated.
+     * The capture-site in {@code UserManagerImpl.addMember} fires an audit
+     * event with domain {@link SecurityAuditDomain#NAME} and type
+     * {@link SecurityAuditTypes#USER_MEMBER_ADDED} on successful group
+     * update; the event must traverse the entire pipeline to the
+     * registered listener with the commit metadata decorated.
      */
     @Test
-    public void groupAddMemberFiresMemberAddedEventEndToEnd() throws Exception {
+    public void groupAddMemberFiresUserMemberAddedEndToEnd() throws Exception {
         try (ContentSession session = adminLogin()) {
             Root root = session.getLatestRoot();
             UserManager um = userManager(root);
@@ -173,16 +175,19 @@ public class AuditWiringIT {
             testUser = (User) um.getAuthorizable("auditTestUser");
             assertNotNull(testGroup);
             assertNotNull(testUser);
+            String groupPath = testGroup.getPath();
+            String memberPath = testUser.getPath();
 
             assertTrue("addMember must succeed", testGroup.addMember(testUser));
             root.commit();
 
-            // The MemberAddedEvent must have traversed the entire pipeline.
-            assertEquals("exactly one MemberAddedEvent must arrive",
+            // Exactly one user.member.added event must have traversed the
+            // entire pipeline.
+            assertEquals("exactly one member-added audit event must arrive",
                     1, received.size());
             AuditEvent event = received.get(0);
             assertEquals(SecurityAuditDomain.NAME, event.getDomain());
-            assertEquals(MemberAddedEvent.TYPE, event.getType());
+            assertEquals(SecurityAuditTypes.USER_MEMBER_ADDED, event.getType());
 
             Map<String, Object> payload = event.getPayload();
             // Commit metadata decorated by DispatchAuditEventsHook.
@@ -192,11 +197,69 @@ public class AuditWiringIT {
                     payload.containsKey("commit.userId"));
             assertTrue("commit.timestamp must be decorated",
                     payload.containsKey("commit.timestamp"));
-            // Event-specific payload.
-            assertTrue("groupPath must be in payload",
-                    payload.containsKey(MemberAddedEvent.PAYLOAD_GROUP_PATH));
-            assertTrue("memberPath must be in payload",
-                    payload.containsKey(MemberAddedEvent.PAYLOAD_MEMBER_PATH));
+            // Event-specific payload — values, not just key presence,
+            // so a future refactor that left the keys but lost the values
+            // (e.g. wrong getPath() variable in the capture site) is caught.
+            assertEquals(groupPath, payload.get(SecurityAuditTypes.PAYLOAD_GROUP_PATH));
+            assertEquals(memberPath, payload.get(SecurityAuditTypes.PAYLOAD_MEMBER_PATH));
+        }
+    }
+
+    /**
+     * Symmetric to {@link #groupAddMemberFiresUserMemberAddedEndToEnd()}:
+     * the capture-site in {@code UserManagerImpl.removeMember} fires an
+     * audit event with type
+     * {@link SecurityAuditTypes#USER_MEMBER_REMOVED} on successful group
+     * update. Exercises the {@code isRemove=true} branch of
+     * {@code recordSingleMembershipAuditEvent} end-to-end through the
+     * entire pipeline.
+     */
+    @Test
+    public void groupRemoveMemberFiresUserMemberRemovedEndToEnd() throws Exception {
+        try (ContentSession session = adminLogin()) {
+            Root root = session.getLatestRoot();
+            UserManager um = userManager(root);
+
+            // Setup: create group + user, add user as member, commit.
+            Group testGroup = um.createGroup("auditRemoveGroup");
+            User testUser = um.createUser("auditRemoveUser", "pwd");
+            root.commit();
+            root = session.getLatestRoot();
+            um = userManager(root);
+            testGroup = (Group) um.getAuthorizable("auditRemoveGroup");
+            testUser = (User) um.getAuthorizable("auditRemoveUser");
+            assertNotNull(testGroup);
+            assertNotNull(testUser);
+            assertTrue("addMember setup must succeed", testGroup.addMember(testUser));
+            root.commit();
+
+            // Clear received — the setup-commit emits user.member.added,
+            // not the event we want to pin here.
+            received.clear();
+            root = session.getLatestRoot();
+            um = userManager(root);
+            testGroup = (Group) um.getAuthorizable("auditRemoveGroup");
+            testUser = (User) um.getAuthorizable("auditRemoveUser");
+            assertNotNull(testGroup);
+            assertNotNull(testUser);
+            String groupPath = testGroup.getPath();
+            String memberPath = testUser.getPath();
+
+            // Act: remove the member and commit.
+            assertTrue("removeMember must succeed", testGroup.removeMember(testUser));
+            root.commit();
+
+            assertEquals("exactly one member-removed audit event must arrive",
+                    1, received.size());
+            AuditEvent event = received.get(0);
+            assertEquals(SecurityAuditDomain.NAME, event.getDomain());
+            assertEquals(SecurityAuditTypes.USER_MEMBER_REMOVED, event.getType());
+
+            Map<String, Object> payload = event.getPayload();
+            assertTrue("commit.sessionId must be decorated",
+                    payload.containsKey("commit.sessionId"));
+            assertEquals(groupPath, payload.get(SecurityAuditTypes.PAYLOAD_GROUP_PATH));
+            assertEquals(memberPath, payload.get(SecurityAuditTypes.PAYLOAD_MEMBER_PATH));
         }
     }
 

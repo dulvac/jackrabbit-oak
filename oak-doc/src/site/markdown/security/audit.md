@@ -50,8 +50,8 @@ and bundle-emitted custom events through one entry point.
 | Module | Role |
 |---|---|
 | `oak-audit-spi`     | Domain-neutral SPI: [AuditEvent], [AuditEventListener], [AuditEventEmitter], `AuditEvents` static façade. |
-| `oak-security-spi`  | Security-specific event subclasses (`SecurityAuditEvent`, `MemberAddedEvent`, …) and the `security` domain constant. Depends on `oak-audit-spi`. |
-| `oak-core`          | Pipeline implementation: listener registry, commit-attached buffer, drain hook, `AuditEventEmitterImpl`. |
+| `oak-security-spi`  | Security-domain constants and helpers: `SecurityAuditDomain.NAME`, `SecurityAuditTypes` (type-string constants like `USER_MEMBER_ADDED` paired with payload keys like `PAYLOAD_GROUP_PATH`), `SecurityAuditEvents` (ergonomic factories for security capture sites). The audit pipeline itself is exposed via the `AuditConfiguration` security configuration. Depends on `oak-audit-spi`. |
+| `oak-core`          | Pipeline implementation: listener registry, commit-attached buffer, drain hook, `AuditEventEmitterImpl`, `AuditConfigurationImpl`. |
 
 Consumer bundles depend on `oak-audit-spi` only. No transitive dependency on
 `oak-core`, `oak-jcr`, or `oak-security-spi` is required to implement a
@@ -83,10 +83,20 @@ public interface AuditEvent {
 - **Payload** — open map of supplementary data. Consumers MUST tolerate
   missing keys; producers MAY add keys without versioning.
 
-Concrete event classes typically extend a domain-specific base. Security
-events extend `SecurityAuditEvent` and live in
-`org.apache.jackrabbit.oak.spi.security.audit`. Bundles emitting custom
-events implement `AuditEvent` directly or define their own base class.
+The public SPI keeps only the `AuditEvent` interface. Concrete events are
+built via the static factory `AuditEvent.of(domain, type, payload)`;
+consumers discriminate events by inspecting `getDomain()` + `getType()`
+rather than by `instanceof` checks against typed subclasses.
+
+The `security` domain pins its type-string and payload-key constants in
+the `SecurityAuditTypes` class (e.g., `USER_MEMBER_ADDED`,
+`PAYLOAD_GROUP_PATH`). Security capture sites inside Oak use the
+`SecurityAuditEvents` helper class (e.g.
+`SecurityAuditEvents.memberAdded(groupPath, memberPath)`) which wraps
+the factory + constants for ergonomic call sites; listeners receive
+plain `AuditEvent` instances and never see the helper. Bundles emitting
+custom events implement `AuditEvent` directly or call
+`AuditEvent.of(...)` with their own domain string.
 
 <a name="commit_metadata_keys"></a>
 #### Commit metadata payload keys
@@ -155,6 +165,65 @@ Properties:
   exception back to the caller.
 - **No payload decoration.** The event reaches listeners with exactly the
   payload the caller provided. No `commit.*` keys are added.
+
+<a name="pipeline_state_probe"></a>
+### Probing Pipeline State
+
+Security-aware components that already hold a `SecurityProvider`
+reference can ask whether the audit pipeline is currently active via the
+`AuditConfiguration.isActive()` method — without depending on the
+implementation class or the static façade:
+
+```java
+AuditConfiguration audit =
+        securityProvider.getConfiguration(AuditConfiguration.class);
+if (audit.isActive()) {
+    // Feature toggle is ON and at least one listener is registered.
+    // Safe to do work that only matters when audit will actually
+    // dispatch (e.g. allocate richer payload context).
+}
+```
+
+`isActive()` returns `true` when the feature toggle is enabled AND at
+least one `AuditEventListener` is registered on the Whiteboard. A
+deployed-but-unused pipeline (toggle ON, no listener registered)
+reports `false`, matching the no-allocation semantics of the static
+`AuditEvents.isEnabled()` façade — the two are equivalent predicates,
+just reachable via different consumer ergonomics. The NOOP
+`AuditConfiguration` returned when no implementation is bound reports
+`false`.
+
+<a name="user_api_semantics"></a>
+### User-API-Level Audit, Not Transaction Log
+
+Oak's audit SPI captures **user-API-level** activity, not
+**transaction-log-level** activity. The distinction matters when
+choosing whether the audit SPI fits a given use case.
+
+- **What fires audit events:** capture sites at user-facing JCR APIs.
+  `UserManagerImpl.addMember(...)` / `.removeMember(...)` records member
+  add/remove events; equivalent capture sites exist (or will exist) for
+  other security-relevant APIs.
+- **What does NOT fire audit events:** changes made by commit hooks,
+  editors, or validators during commit processing. If a hook
+  transforms the tree in flight (autocreated properties, denormalised
+  indexes, side-effect writes from a `Validator` or `Editor`), those
+  tree changes are NOT recorded by the audit SPI even though they end
+  up in the merged `NodeState`.
+
+This is intentional. The audit SPI answers "**who called the API**" —
+which is the right level for security audit, compliance trail, and
+"who removed user X from group Y" investigations. It is NOT a
+transaction log; it does not enumerate every node mutation that landed
+in the merged commit.
+
+Consumers needing **every node mutation** (event sourcing, change-data
+capture, derived index rebuilding) should use Oak's
+`NodeStore.addObserver(...)` / `BackgroundObserver` mechanism instead.
+Those observers see the post-merge `NodeState` diff and capture
+mutations regardless of which API surface (or commit hook) produced
+them. The audit SPI and `NodeStore` observer answer different
+questions; deploy the one that matches your use case.
 
 <a name="emitting_events"></a>
 ### Emitting Events From A Bundle
@@ -313,3 +382,4 @@ Recommended consumer-side discipline:
 [AuditEvent]: /oak/docs/apidocs/org/apache/jackrabbit/oak/spi/audit/AuditEvent.html
 [AuditEventListener]: /oak/docs/apidocs/org/apache/jackrabbit/oak/spi/audit/AuditEventListener.html
 [AuditEventEmitter]: /oak/docs/apidocs/org/apache/jackrabbit/oak/spi/audit/AuditEventEmitter.html
+[AuditConfiguration]: /oak/docs/apidocs/org/apache/jackrabbit/oak/spi/security/audit/AuditConfiguration.html

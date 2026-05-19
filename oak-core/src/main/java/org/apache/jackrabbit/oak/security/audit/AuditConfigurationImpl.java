@@ -74,6 +74,15 @@ public class AuditConfigurationImpl extends ConfigurationBase implements AuditCo
      * Feature toggle name. The fork ships this as {@code FT_AUDIT}.
      * When upstreaming, rename to {@code FT_AUDIT_OAK-<NNNNN>} per the
      * {@code FT_<DESCRIPTION>_OAK-<issue>} convention in {@code AGENTS.md}.
+     * <p>
+     * <strong>Why not on the public SPI interface
+     * ({@link AuditConfiguration}):</strong> moving this constant to the
+     * SPI would commit the literal value to the public surface forever.
+     * The OAK ticket allocation is deferred per the team's
+     * scope-narrowing call; until then, this constant stays impl-local
+     * with the fork-shape value. When the OAK ticket lands the value
+     * updates to {@code "FT_AUDIT_OAK-<NNNNN>"} and the constant can
+     * also move to the SPI interface as a binary-additive change.
      */
     public static final String FEATURE_TOGGLE_NAME = "FT_AUDIT";
 
@@ -227,6 +236,26 @@ public class AuditConfigurationImpl extends ConfigurationBase implements AuditCo
         return List.of(
                 new SnapshotAuditBufferHook(featureToggle, buffer),
                 new DispatchAuditEventsHook(featureToggle, buffer, registry));
+    }
+
+    //------------------------------------------------< AuditConfiguration >---
+
+    /**
+     * Delegates to {@link AuditEvents#isEnabled()} — the single source of
+     * truth for "is the audit pipeline up?". The static
+     * {@code AuditEvents.sink} field is {@code volatile}, so any thread
+     * reading {@code isActive()} sees a JMM-safe value without depending
+     * on the OSGi activation publication barrier.
+     * <p>
+     * Pre-init, post-dispose, and NOOP-bound deployments all return
+     * {@code false} for free: the NOOP sink installed by default reports
+     * {@code isEnabled() == false}, {@link #initialize(Whiteboard)}
+     * installs the active sink as its LAST step, and {@link #dispose()}
+     * resets the sink to NOOP. No null-checks needed.
+     */
+    @Override
+    public boolean isActive() {
+        return AuditEvents.isEnabled();
     }
 
     //-----------------------------------------------------------< internal >---

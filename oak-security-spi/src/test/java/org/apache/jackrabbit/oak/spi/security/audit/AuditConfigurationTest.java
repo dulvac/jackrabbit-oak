@@ -19,6 +19,7 @@ package org.apache.jackrabbit.oak.spi.security.audit;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -44,5 +45,15 @@ public class AuditConfigurationTest {
     @Test
     public void noopSingletonIsNotNull() {
         assertNotNull(AuditConfiguration.NOOP);
+    }
+
+    @Test
+    public void noopIsActiveReturnsFalse() {
+        // NOOP placeholder: the audit pipeline is by definition NOT active when
+        // no implementation is bound. The Noop inner class explicitly overrides
+        // isActive() to return false (rather than inheriting any default), so
+        // any caller probing via securityProvider.getConfiguration(AuditConfiguration.class).isActive()
+        // safely reports "audit not running" on a vanilla SecurityProvider.
+        assertFalse(AuditConfiguration.NOOP.isActive());
     }
 }

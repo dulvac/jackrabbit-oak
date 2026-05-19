@@ -38,6 +38,12 @@ import org.osgi.annotation.versioning.ProviderType;
  * </ul>
  * The {@link #getDomain()} value selects the listeners that receive this
  * event.
+ * <p>
+ * Most callers do not implement this interface directly: use the static
+ * factory {@link #of(String, String, Map)} (or the no-payload overload
+ * {@link #of(String, String)}) to construct an immutable event with the
+ * current wall-clock timestamp. The package-private {@code AuditEventImpl}
+ * backs these factories.
  */
 @ProviderType
 public interface AuditEvent {
@@ -104,5 +110,70 @@ public interface AuditEvent {
     @NotNull
     default Map<String, Object> getPayload() {
         return Collections.emptyMap();
+    }
+
+    /**
+     * Creates an immutable audit event with the supplied payload and the
+     * current wall-clock timestamp. The payload Map is defensively copied
+     * via {@link Map#copyOf}; the caller's Map reference is decoupled
+     * from the event.
+     *
+     * @param domain  non-blank domain identifier.
+     * @param type    non-blank event type identifier within {@code domain}.
+     * @param payload immutable, non-null payload Map. Values are stored
+     *                by reference — see the shallow-copy note below.
+     * @return non-null event instance.
+     * @throws IllegalArgumentException if {@code domain} or {@code type} is blank.
+     *
+     * @apiNote
+     * <p><strong>Shallow-copy semantics.</strong> {@link Map#copyOf} decouples
+     * the caller's Map reference but does NOT clone payload <em>values</em>.
+     * Callers MUST pass immutable values (Strings, boxed primitives,
+     * {@link java.util.List#copyOf(java.util.Collection) List.copyOf} /
+     * {@link java.util.Set#copyOf(java.util.Collection) Set.copyOf} results).
+     * Mutating a payload value after passing it to {@code of(...)} produces
+     * undefined dispatch behavior on the commit-attached path, where capture
+     * and dispatch are separated by the surrounding commit.
+     *
+     * <p><strong>Security warning.</strong> The {@code payload} map values
+     * are forwarded verbatim to listeners. Callers MUST NOT pass:
+     * <ul>
+     *   <li>Any {@link javax.jcr.Credentials} subtype.</li>
+     *   <li>The value of a {@code rep:password} or {@code rep:credentials}
+     *       property.</li>
+     *   <li>Any token-bearing object (e.g. {@code TokenInfo},
+     *       {@code TokenCredentials}, raw token strings).</li>
+     *   <li>Any node, property, or value that could transitively expose such
+     *       data (e.g. a {@code Node} pointing at a {@code rep:User} subtree).</li>
+     * </ul>
+     * Pass user identifiers, paths, timestamps, and other non-sensitive
+     * scalars only. <strong>Oak does not redact or filter the payload at
+     * dispatch.</strong> See §9 of the audit-spi {@code design.md} for the
+     * producer-side responsibility under the open trust model.
+     */
+    @NotNull
+    static AuditEvent of(@NotNull String domain,
+                         @NotNull String type,
+                         @NotNull Map<String, Object> payload) {
+        if (domain.isBlank()) {
+            throw new IllegalArgumentException("domain must not be blank");
+        }
+        if (type.isBlank()) {
+            throw new IllegalArgumentException("type must not be blank");
+        }
+        return new AuditEventImpl(domain, type, System.currentTimeMillis(), Map.copyOf(payload));
+    }
+
+    /**
+     * Convenience overload for events with no payload.
+     *
+     * @param domain non-blank domain identifier.
+     * @param type   non-blank event type identifier within {@code domain}.
+     * @return non-null event instance with an empty payload.
+     * @throws IllegalArgumentException if {@code domain} or {@code type} is blank.
+     */
+    @NotNull
+    static AuditEvent of(@NotNull String domain, @NotNull String type) {
+        return of(domain, type, Map.of());
     }
 }

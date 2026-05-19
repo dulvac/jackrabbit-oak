@@ -31,7 +31,7 @@ import org.apache.jackrabbit.oak.spi.security.principal.PrincipalImpl;
  * {@code addMember + save + removeMember + save} cycles on a fixed
  * group / user pair, i.e. {@code 2 * pairsPerIteration} commits per
  * iteration with exactly one audit capture-site fire per commit:
- * {@code MemberAddedEvent.of(...)} resp. {@code MemberRemovedEvent.of(...)}.
+ * {@code SecurityAuditEvents.memberAdded(...)} resp. {@code SecurityAuditEvents.memberRemoved(...)}.
  *
  * Delta = (Oak-MemoryNS-Audit median) − (Oak-MemoryNS median), divided
  * by {@code 2 * pairsPerIteration}, is the per-event audit overhead

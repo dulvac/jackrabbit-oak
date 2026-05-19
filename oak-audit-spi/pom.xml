@@ -34,7 +34,7 @@
 
     <properties>
         <skip.coverage>false</skip.coverage>
-        <minimum.line.coverage>0.99</minimum.line.coverage>
+        <minimum.line.coverage>1.0</minimum.line.coverage>
         <minimum.branch.coverage>1.0</minimum.branch.coverage>
     </properties>
 
@@ -49,6 +49,18 @@
                             org.apache.jackrabbit.oak.spi.audit
                         </Export-Package>
                     </instructions>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.rat</groupId>
+                <artifactId>apache-rat-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <!-- Developer-facing design notes and microbenchmark
+                             outputs; not source files subject to license
+                             headers. -->
+                        <exclude>docs/**</exclude>
+                    </excludes>
                 </configuration>
             </plugin>
         </plugins>

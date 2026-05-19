@@ -37,10 +37,7 @@ import org.apache.jackrabbit.oak.security.user.query.UserQueryManager;
 import org.apache.jackrabbit.oak.spi.audit.AuditEvents;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
 import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
-import org.apache.jackrabbit.oak.spi.security.audit.MemberAddedEvent;
-import org.apache.jackrabbit.oak.spi.security.audit.MemberRemovedEvent;
-import org.apache.jackrabbit.oak.spi.security.audit.MembersAddedBulkEvent;
-import org.apache.jackrabbit.oak.spi.security.audit.MembersRemovedBulkEvent;
+import org.apache.jackrabbit.oak.spi.security.audit.SecurityAuditEvents;
 import org.apache.jackrabbit.oak.spi.security.principal.EveryonePrincipal;
 import org.apache.jackrabbit.oak.spi.security.principal.PrincipalConfiguration;
 import org.apache.jackrabbit.oak.spi.security.principal.PrincipalImpl;
@@ -424,8 +421,8 @@ public class UserManagerImpl implements UserManager {
             String groupPath = group.getPath();
             String memberPath = member.getPath();
             AuditEvents.record(root, isRemove
-                    ? MemberRemovedEvent.of(groupPath, memberPath)
-                    : MemberAddedEvent.of(groupPath, memberPath));
+                    ? SecurityAuditEvents.memberRemoved(groupPath, memberPath)
+                    : SecurityAuditEvents.memberAdded(groupPath, memberPath));
         } catch (RepositoryException e) {
             // Path resolution failed — drop the event rather than fail
             // the surrounding group update. Should be rare in practice.
@@ -448,8 +445,8 @@ public class UserManagerImpl implements UserManager {
         try {
             String groupPath = group.getPath();
             AuditEvents.record(root, isRemove
-                    ? MembersRemovedBulkEvent.of(groupPath, memberIds, isContentId, failedIds)
-                    : MembersAddedBulkEvent.of(groupPath, memberIds, isContentId, failedIds));
+                    ? SecurityAuditEvents.membersRemovedBulk(groupPath, memberIds, isContentId, failedIds)
+                    : SecurityAuditEvents.membersAddedBulk(groupPath, memberIds, isContentId, failedIds));
         } catch (RepositoryException e) {
             log.debug("Skipping audit event: failed to resolve group path for bulk update", e);
         }
