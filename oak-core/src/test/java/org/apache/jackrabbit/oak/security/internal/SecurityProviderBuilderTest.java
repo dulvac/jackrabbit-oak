@@ -17,27 +17,21 @@
 package org.apache.jackrabbit.oak.security.internal;
 
 import org.apache.jackrabbit.oak.AbstractSecurityTest;
-import org.apache.jackrabbit.oak.security.audit.AuditConfigurationImpl;
 import org.apache.jackrabbit.oak.spi.security.CompositeConfiguration;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
 import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
-import org.apache.jackrabbit.oak.spi.security.audit.AuditConfiguration;
 import org.apache.jackrabbit.oak.spi.security.authentication.AuthenticationConfiguration;
 import org.apache.jackrabbit.oak.spi.security.authentication.token.TokenConfiguration;
 import org.apache.jackrabbit.oak.spi.security.authorization.AuthorizationConfiguration;
 import org.apache.jackrabbit.oak.spi.security.principal.PrincipalConfiguration;
 import org.apache.jackrabbit.oak.spi.security.privilege.PrivilegeConfiguration;
 import org.apache.jackrabbit.oak.spi.security.user.UserConfiguration;
-import org.apache.jackrabbit.oak.spi.whiteboard.DefaultWhiteboard;
-import org.apache.jackrabbit.oak.spi.whiteboard.Whiteboard;
 import org.junit.Test;
 
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 
 public class SecurityProviderBuilderTest extends AbstractSecurityTest {
@@ -95,45 +89,5 @@ public class SecurityProviderBuilderTest extends AbstractSecurityTest {
         assertFalse(sp.getConfiguration(PrivilegeConfiguration.class) instanceof CompositeConfiguration);
         assertFalse(sp.getConfiguration(TokenConfiguration.class) instanceof CompositeConfiguration);
         assertFalse(sp.getConfiguration(UserConfiguration.class) instanceof CompositeConfiguration);
-    }
-
-    @Test
-    public void testDefaultNoAuditConfiguration() {
-        // No withAuditConfiguration() call — getConfiguration returns the NOOP default.
-        SecurityProvider sp = builder.build();
-        assertSame(AuditConfiguration.NOOP, sp.getConfiguration(AuditConfiguration.class));
-    }
-
-    @Test
-    public void testWithAuditConfigurationNoWhiteboard() {
-        // Audit configuration set, but no whiteboard — initialize() must NOT be invoked.
-        AuditConfiguration ac = mock(AuditConfiguration.class);
-        when(ac.getParameters()).thenReturn(ConfigurationParameters.EMPTY);
-        SecurityProvider sp = builder.withAuditConfiguration(ac).build();
-        assertSame(ac, sp.getConfiguration(AuditConfiguration.class));
-    }
-
-    @Test
-    public void testWithAuditConfigurationCustomImplWithWhiteboard() {
-        // Whiteboard present, but the AuditConfiguration is NOT an AuditConfigurationImpl —
-        // exercises the instanceof-false branch (initialize() must NOT be invoked).
-        AuditConfiguration ac = mock(AuditConfiguration.class);
-        when(ac.getParameters()).thenReturn(ConfigurationParameters.EMPTY);
-        Whiteboard wb = new DefaultWhiteboard();
-        SecurityProvider sp = builder.withWhiteboard(wb).withAuditConfiguration(ac).build();
-        assertSame(ac, sp.getConfiguration(AuditConfiguration.class));
-    }
-
-    @Test
-    public void testWithAuditConfigurationImplAndWhiteboardInitializes() {
-        // Both whiteboard and AuditConfigurationImpl present — initialize() runs.
-        AuditConfigurationImpl ac = new AuditConfigurationImpl();
-        Whiteboard wb = new DefaultWhiteboard();
-        try {
-            SecurityProvider sp = builder.withWhiteboard(wb).withAuditConfiguration(ac).build();
-            assertSame(ac, sp.getConfiguration(AuditConfiguration.class));
-        } finally {
-            ac.dispose();
-        }
     }
 }

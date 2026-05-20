@@ -16,7 +16,9 @@
  */
 package org.apache.jackrabbit.oak.fixture;
 
+import java.io.Closeable;
 import java.io.File;
+import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -185,6 +187,7 @@ public abstract class OakFixture {
             private Whiteboard whiteboard;
             private SecurityProvider securityProvider;
             private AuditConfigurationImpl auditConfig;
+            private final List<Closeable> drainObserverSubscriptions = new ArrayList<>();
 
             private synchronized void initAuditPipelineIfNeeded() {
                 if (auditConfig != null) {
@@ -192,12 +195,18 @@ public abstract class OakFixture {
                 }
                 whiteboard = new DefaultWhiteboard();
                 auditConfig = new AuditConfigurationImpl();
-                // build() triggers AuditConfigurationImpl.initialize(whiteboard)
-                // — registers FT_AUDIT toggle, starts the listener tracker,
-                // installs AuditBuffer + BufferSink as the JVM-static sinks.
+                // Audit is no longer a SecurityConfiguration in v3 — initialize
+                // the pipeline directly (registers FT_AUDIT toggle, starts the
+                // listener tracker, installs AuditBuffer + BufferSink as the
+                // JVM-static sinks). The drain observer is attached per-store
+                // below via store.addObserver(...) — the bare-metal embedded
+                // path (design-v3-observer-drain.md §6 line 663). We don't use
+                // Oak.with(Observer) because we pass a custom whiteboard via
+                // .with(whiteboard), which bypasses Oak's default-whiteboard
+                // auto-attach at Oak.java:300-302.
+                auditConfig.initialize(whiteboard);
                 securityProvider = SecurityProviderBuilder.newBuilder()
                         .withWhiteboard(whiteboard)
-                        .withAuditConfiguration(auditConfig)
                         .build();
 
                 Tracker<FeatureToggle> tracker = whiteboard.track(FeatureToggle.class);
@@ -216,12 +225,18 @@ public abstract class OakFixture {
                         Map.of());
             }
 
+            private synchronized Oak buildOakWithAudit() {
+                MemoryNodeStore store = new MemoryNodeStore();
+                drainObserverSubscriptions.add(store.addObserver(auditConfig.getDrainObserver()));
+                return newOak(store)
+                        .with(securityProvider)
+                        .with(whiteboard);
+            }
+
             @Override
             public Oak getOak(int clusterId) {
                 initAuditPipelineIfNeeded();
-                return newOak(new MemoryNodeStore())
-                        .with(securityProvider)
-                        .with(whiteboard);
+                return buildOakWithAudit();
             }
 
             @Override
@@ -229,15 +244,26 @@ public abstract class OakFixture {
                 initAuditPipelineIfNeeded();
                 Oak[] cluster = new Oak[n];
                 for (int i = 0; i < cluster.length; i++) {
-                    cluster[i] = newOak(new MemoryNodeStore())
-                            .with(securityProvider)
-                            .with(whiteboard);
+                    cluster[i] = buildOakWithAudit();
                 }
                 return cluster;
             }
 
             @Override
             public void tearDownCluster() {
+                // Close observer subscriptions first so the drain observer
+                // detaches from each MemoryNodeStore before dispose() tears
+                // down the pipeline sinks behind it.
+                synchronized (this) {
+                    for (Closeable subscription : drainObserverSubscriptions) {
+                        try {
+                            subscription.close();
+                        } catch (IOException e) {
+                            LOG.warn("Audit drain-observer subscription close failed during fixture teardown; continuing.", e);
+                        }
+                    }
+                    drainObserverSubscriptions.clear();
+                }
                 if (auditConfig != null) {
                     try {
                         auditConfig.dispose();

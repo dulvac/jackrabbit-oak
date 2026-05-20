@@ -20,6 +20,9 @@ import java.io.Closeable;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.apache.jackrabbit.oak.commons.junit.LogCustomizer;
 
 import javax.jcr.Credentials;
 import javax.jcr.SimpleCredentials;
@@ -40,8 +43,10 @@ import org.apache.jackrabbit.oak.spi.audit.AuditEventListener;
 import org.apache.jackrabbit.oak.spi.audit.AuditEvents;
 import org.apache.jackrabbit.oak.spi.commit.CommitInfo;
 import org.apache.jackrabbit.oak.spi.commit.DefaultValidator;
+import org.apache.jackrabbit.oak.spi.commit.EmptyHook;
 import org.apache.jackrabbit.oak.spi.commit.Validator;
 import org.apache.jackrabbit.oak.spi.commit.ValidatorProvider;
+import org.apache.jackrabbit.oak.spi.state.NodeBuilder;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
 import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
 import org.apache.jackrabbit.oak.spi.security.authentication.ConfigurationUtil;
@@ -55,6 +60,7 @@ import org.jetbrains.annotations.NotNull;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.slf4j.event.Level;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -63,25 +69,28 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * End-to-end integration test exercising both audit pipelines through a real
- * {@link SecurityProviderBuilder}-wired {@link AuditConfigurationImpl}. Uses
- * {@link MemoryNodeStore} for a real but in-process Oak instance.
+ * End-to-end integration test exercising both audit pipelines through a
+ * direct {@link AuditConfigurationImpl} install. Uses {@link MemoryNodeStore}
+ * for a real but in-process Oak instance.
  * <p>
- * The fixture deliberately uses the production wiring path:
+ * The fixture uses the v3 wiring path:
  * <ol>
- *   <li>{@link SecurityProviderBuilder#withAuditConfiguration(org.apache.jackrabbit.oak.spi.security.audit.AuditConfiguration)}
- *       + {@link SecurityProviderBuilder#withWhiteboard(Whiteboard)} drive
- *       {@link AuditConfigurationImpl#initialize(Whiteboard)} on
- *       {@link SecurityProviderBuilder#build()}.</li>
- *   <li>The {@code AuditConfigurationImpl} registers itself as a
- *       {@link org.apache.jackrabbit.oak.spi.security.SecurityConfiguration}
- *       that contributes the audit commit hooks — so Oak's commit chain
- *       picks them up automatically with correct hook ordering.</li>
- *   <li>Teardown calls {@link AuditConfigurationImpl#dispose()} — the same
- *       code path that OSGi {@code @Deactivate} uses.</li>
+ *   <li>{@link AuditConfigurationImpl#initialize(Whiteboard)} installs the
+ *       audit feature toggle, listener registry, buffer and capture-time
+ *       sink onto the whiteboard.</li>
+ *   <li>{@code store.addObserver(audit.getDrainObserver())} attaches the
+ *       {@link AuditDrainObserver} directly to the {@code MemoryNodeStore} —
+ *       the bare-metal embedded path (design-v3-observer-drain.md §6 line 663).
+ *       We don't use {@code Oak.with(Observer)} because we pass a custom
+ *       whiteboard via {@code Oak.with(Whiteboard)}, which replaces Oak's
+ *       default anonymous-override whiteboard and bypasses the auto-attach
+ *       at {@code Oak.java:300-302}.</li>
+ *   <li>Teardown closes the {@code Observable.addObserver} {@code Closeable}
+ *       and calls {@link AuditConfigurationImpl#dispose()} — the same code
+ *       path that OSGi {@code @Deactivate} uses.</li>
  * </ol>
- * No test mirror of {@code BufferSink} or hook wiring exists in this class;
- * a bug in either pipeline will surface here.
+ * No test mirror of {@code BufferSink} or observer wiring exists in this
+ * class; a bug in either pipeline will surface here.
  */
 public class AuditPipelineIT {
 
@@ -91,6 +100,7 @@ public class AuditPipelineIT {
 
     private Whiteboard whiteboard;
     private AuditConfigurationImpl auditConfig;
+    private Closeable drainObserverSubscription;
     private Registration listenerRegistration;
     private List<AuditEvent> received;
     private ContentRepository repository;
@@ -103,9 +113,12 @@ public class AuditPipelineIT {
         received = new CopyOnWriteArrayList<>();
 
         auditConfig = new AuditConfigurationImpl();
+        // v3 wiring: audit pipeline is independent of SecurityProvider.
+        // initialize() installs sinks/registry/buffer/toggle; the drain Observer
+        // is attached to the Oak below via oak.with(audit.getDrainObserver()).
+        auditConfig.initialize(whiteboard);
         securityProvider = SecurityProviderBuilder.newBuilder()
                 .withWhiteboard(whiteboard)
-                .withAuditConfiguration(auditConfig)
                 .build();
 
         // JAAS — wire the default authentication configuration from the
@@ -129,7 +142,14 @@ public class AuditPipelineIT {
         };
         listenerRegistration = whiteboard.register(AuditEventListener.class, listener, Map.of());
 
-        repository = new Oak(new MemoryNodeStore(InitialContentHelper.INITIAL_CONTENT))
+        MemoryNodeStore store = new MemoryNodeStore(InitialContentHelper.INITIAL_CONTENT);
+        // Bare-metal embedded wiring: attach the drain observer directly to the
+        // Observable. We can't use Oak.with(Observer) here because the test
+        // replaces Oak's default whiteboard via .with(whiteboard), which bypasses
+        // the auto-attach at Oak.java:300-302. See AuditPipelineIT class Javadoc.
+        drainObserverSubscription = store.addObserver(auditConfig.getDrainObserver());
+
+        repository = new Oak(store)
                 .with(securityProvider)
                 .with(whiteboard)
                 .createContentRepository();
@@ -140,6 +160,9 @@ public class AuditPipelineIT {
     @After
     public void tearDown() throws Exception {
         try {
+            if (drainObserverSubscription != null) {
+                drainObserverSubscription.close();
+            }
             if (listenerRegistration != null) {
                 listenerRegistration.unregister();
             }
@@ -242,7 +265,9 @@ public class AuditPipelineIT {
         // — the main fixture's repository can't carry the validator without
         // breaking the success-path tests. The audit pipeline state on the
         // whiteboard is shared, which is what we want to exercise.
-        ContentRepository repo2 = new Oak(new MemoryNodeStore(InitialContentHelper.INITIAL_CONTENT))
+        MemoryNodeStore store2 = new MemoryNodeStore(InitialContentHelper.INITIAL_CONTENT);
+        Closeable observer2 = store2.addObserver(auditConfig.getDrainObserver());
+        ContentRepository repo2 = new Oak(store2)
                 .with(securityProvider)
                 .with(whiteboard)
                 .with(new ThrowingValidatorProvider("trigger-failure"))
@@ -277,6 +302,7 @@ public class AuditPipelineIT {
             assertEquals("commit.sessionId decorates with current session",
                     session.toString(), d.getPayload().get("commit.sessionId"));
         } finally {
+            observer2.close();
             if (repo2 instanceof Closeable) {
                 ((Closeable) repo2).close();
             }
@@ -342,9 +368,9 @@ public class AuditPipelineIT {
 
     /**
      * With the feature toggle disabled, neither pipeline emits to listeners.
-     * Pins the {@code if (!featureToggle.isEnabled()) return} early-returns
-     * in both {@code SnapshotAuditBufferHook} and {@code DispatchAuditEventsHook},
-     * as well as the toggle gate in {@code BufferSink}.
+     * Pins the {@code if (!featureToggle.isEnabled()) return} early-return
+     * in {@code AuditDrainObserver} as well as the toggle gate in
+     * {@code BufferSink}.
      */
     @Test
     public void toggleDisabledShortCircuitsEntirePipeline() throws Exception {
@@ -448,7 +474,7 @@ public class AuditPipelineIT {
      * Listener that throws {@code RuntimeException} from {@code onEvents}
      * must not prevent other listeners on the same domain from receiving
      * the event. Pins per-listener isolation in
-     * {@code DispatchAuditEventsHook.dispatchOne} (commit-attached).
+     * {@code AuditDrainObserver.dispatchOne} (commit-attached).
      */
     @Test
     public void listenerRuntimeExceptionDoesNotPreventOtherListeners() throws Exception {
@@ -587,6 +613,124 @@ public class AuditPipelineIT {
         } finally {
             regA.unregister();
             regB.unregister();
+        }
+    }
+
+    //------------------------< masquerade-prevention (sage invariant I8) >---
+
+    /**
+     * End-to-end verification of design §9 invariant I8: audit pipeline
+     * failure MUST NOT masquerade as a commit failure to the merge caller.
+     * <p>
+     * A poisoned {@link AuditEvent} whose {@code getDomain()} throws on the
+     * SECOND call (i.e. at drain time, after capture-time
+     * {@code BufferSink.record} successfully consulted it) drives the
+     * {@link AuditDrainObserver} into its outer {@code catch (Throwable)}
+     * barrier. The barrier swallows the throw and logs WARN; the merge
+     * thread sees no exception and {@link Root#commit()} returns normally.
+     * <p>
+     * Without the outer barrier, this throw would propagate out of
+     * {@code AuditDrainObserver.contentChanged} → through
+     * {@code CompositeObserver.contentChanged} (no per-observer isolation
+     * at {@code CompositeObserver.java:46-53}) → into the NodeStore impl's
+     * post-merge observer dispatch → surfacing as a RuntimeException to
+     * the merge caller despite the durable commit having succeeded. On
+     * DocumentNodeStore, the inner catch at
+     * {@code DocumentNodeStore.java:1130-1139} would even suppress
+     * unrelated commit-apply failures.
+     */
+    @Test
+    public void poisonedEventDoesNotMaskCommitAsFailure() throws Exception {
+        LogCustomizer log = LogCustomizer.forLogger(AuditDrainObserver.class)
+                .enable(Level.WARN).create();
+        log.starting();
+        try {
+            // Counter-based poison: getDomain() returns DOMAIN on the FIRST
+            // call (BufferSink.record's isEnabledFor probe — must succeed so
+            // the event enters the buffer) and throws on all subsequent calls
+            // (groupByDomain at drain time). Models a producer-side bug that
+            // surfaces only at dispatch.
+            AtomicInteger calls = new AtomicInteger();
+            AuditEvent counterPoison = new AuditEvent() {
+                @Override public @NotNull String getDomain() {
+                    if (calls.incrementAndGet() <= 1) {
+                        return DOMAIN;
+                    }
+                    throw new RuntimeException("synthetic-drain-time-poison");
+                }
+                @Override public @NotNull String getType() { return "poison.type"; }
+                @Override public long getTimestamp() { return 0L; }
+                @Override public @NotNull Map<String, Object> getPayload() {
+                    return Map.of();
+                }
+            };
+
+            try (ContentSession session = login()) {
+                Root root = session.getLatestRoot();
+                AuditEvents.record(root, counterPoison);
+                root.getTree("/").setProperty("scratch-masquerade", "v");
+
+                // The CORE assertion — Root.commit() MUST return normally.
+                // A regression that removed the outer barrier would surface
+                // the drain-time throw here as a CommitFailedException.
+                root.commit();
+
+                // Listener never received the poisoned event — groupByDomain
+                // threw before dispatch.
+                assertTrue("listener must not see the poisoned event",
+                        received.isEmpty());
+
+                // WARN log fired exactly once with the session id for
+                // diagnostics. If this WARN ever fires in CI on a non-test
+                // path, treat as a bug — the barrier is a safety net for
+                // producer-side bugs, not a steady-state code path.
+                List<String> logs = log.getLogs();
+                assertEquals("outer Throwable barrier must log exactly one WARN line",
+                        1, logs.size());
+                assertTrue("WARN must include session id; was: " + logs.get(0),
+                        logs.get(0).contains(session.toString()));
+            }
+        } finally {
+            log.finished();
+        }
+    }
+
+    //---------------------------------------------< migration-path no-op >---
+
+    /**
+     * Migration commits — the path {@code RepositoryUpgrade.java:549} and
+     * {@code :569} use — drive {@code NodeStore.merge(...)} directly with
+     * {@link CommitInfo#EMPTY}, bypassing {@code MutableRoot}. None of the
+     * capture sites ({@code UserManagerImpl.recordSingleMembershipAuditEvent},
+     * fire-and-forget {@link AuditEvents#dispatch}) are reached by such
+     * commits, so the per-session buffer remains empty for the migration's
+     * synthetic {@code CommitInfo.OAK_UNKNOWN} session id.
+     * <p>
+     * The drain observer is invoked by the NodeStore (the migration commit
+     * succeeds) but its short-circuit at
+     * {@code AuditDrainObserver.doContentChanged} — {@code buffer.drain(sessionId)}
+     * returns {@code null}, drives no dispatch. Pins design §8 + §10 row 1's
+     * "migration-path no-op" assertion.
+     */
+    @Test
+    public void directMergeWithEmptyCommitInfoProducesNoListenerCalls() throws Exception {
+        // Fresh MemoryNodeStore — the fixture's `store` is already wired
+        // to the singleton drain observer for the @Before-driven Oak.
+        // Using a separate Observable here keeps the test isolated and
+        // makes the migration semantic explicit: this store is being
+        // driven without MutableRoot in the picture.
+        MemoryNodeStore migrationStore = new MemoryNodeStore(InitialContentHelper.INITIAL_CONTENT);
+        Closeable observerHandle = migrationStore.addObserver(auditConfig.getDrainObserver());
+        try {
+            // Drive a direct merge — the RepositoryUpgrade pattern.
+            NodeBuilder builder = migrationStore.getRoot().builder();
+            builder.setProperty("migration.marker", "test-value");
+            migrationStore.merge(builder, EmptyHook.INSTANCE, CommitInfo.EMPTY);
+
+            assertTrue("migration commit (CommitInfo.EMPTY) must produce no listener invocations",
+                    received.isEmpty());
+        } finally {
+            observerHandle.close();
         }
     }
 

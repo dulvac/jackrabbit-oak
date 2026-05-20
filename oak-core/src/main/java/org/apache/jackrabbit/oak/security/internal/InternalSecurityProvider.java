@@ -20,7 +20,6 @@ import org.apache.jackrabbit.oak.commons.collections.SetUtils;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
 import org.apache.jackrabbit.oak.spi.security.SecurityConfiguration;
 import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
-import org.apache.jackrabbit.oak.spi.security.audit.AuditConfiguration;
 import org.apache.jackrabbit.oak.spi.security.authentication.AuthenticationConfiguration;
 import org.apache.jackrabbit.oak.spi.security.authentication.token.TokenConfiguration;
 import org.apache.jackrabbit.oak.spi.security.authorization.AuthorizationConfiguration;
@@ -46,20 +45,6 @@ class InternalSecurityProvider implements SecurityProvider, WhiteboardAware {
     private PrincipalConfiguration principalConfiguration;
 
     private TokenConfiguration tokenConfiguration;
-
-    /**
-     * Audit configuration. Defaults to {@link AuditConfiguration#NOOP}
-     * so callers of {@link #getConfiguration(Class)} receive a non-null
-     * configuration whether or not an implementation is bound — same
-     * pattern as {@code UserConfigurationImpl#unbindBlobAccessProvider}.
-     * The NOOP contributes no commit hooks.
-     * <p>
-     * The field is {@code volatile} because it is mutated
-     * post-construction on the OSGi DS thread (via
-     * {@link SecurityProviderRegistration} dynamic binding) and read on
-     * commit threads (via {@link #getConfigurations()}).
-     */
-    private volatile AuditConfiguration auditConfiguration = AuditConfiguration.NOOP;
 
     private Whiteboard whiteboard;
 
@@ -100,10 +85,6 @@ class InternalSecurityProvider implements SecurityProvider, WhiteboardAware {
             return tokenConfiguration;
         }
 
-        if (AuditConfiguration.NAME.equals(name)) {
-            return auditConfiguration;
-        }
-
         return null;
     }
 
@@ -116,8 +97,7 @@ class InternalSecurityProvider implements SecurityProvider, WhiteboardAware {
                 userConfiguration,
                 privilegeConfiguration,
                 principalConfiguration,
-                tokenConfiguration,
-                auditConfiguration
+                tokenConfiguration
         );
     }
 
@@ -147,14 +127,6 @@ class InternalSecurityProvider implements SecurityProvider, WhiteboardAware {
 
         if (configurationClass == TokenConfiguration.class) {
             return (T) tokenConfiguration;
-        }
-
-        if (configurationClass == AuditConfiguration.class) {
-            // Returns AuditConfiguration.NOOP when no impl is bound — never null.
-            // Typed lookup only — audit is not reachable via
-            // getConfiguration(SecurityConfiguration.class) to avoid
-            // shadowing the six core types in code that probes generically.
-            return (T) auditConfiguration;
         }
 
         throw new IllegalArgumentException("Unsupported security configuration class " + configurationClass);
@@ -192,15 +164,6 @@ class InternalSecurityProvider implements SecurityProvider, WhiteboardAware {
 
     public void setTokenConfiguration(TokenConfiguration tokenConfiguration) {
         this.tokenConfiguration = tokenConfiguration;
-    }
-
-    /**
-     * Sets the audit configuration. Passing {@code null} restores the
-     * {@link AuditConfiguration#NOOP} default — the field is never null
-     * after construction.
-     */
-    public void setAuditConfiguration(@Nullable AuditConfiguration auditConfiguration) {
-        this.auditConfiguration = (auditConfiguration != null) ? auditConfiguration : AuditConfiguration.NOOP;
     }
 
 }

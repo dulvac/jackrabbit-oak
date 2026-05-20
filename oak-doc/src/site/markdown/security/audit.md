@@ -49,9 +49,9 @@ and bundle-emitted custom events through one entry point.
 
 | Module | Role |
 |---|---|
-| `oak-audit-spi`     | Domain-neutral SPI: [AuditEvent], [AuditEventListener], [AuditEventEmitter], `AuditEvents` static façade. |
-| `oak-security-spi`  | Security-domain constants and helpers: `SecurityAuditDomain.NAME`, `SecurityAuditTypes` (type-string constants like `USER_MEMBER_ADDED` paired with payload keys like `PAYLOAD_GROUP_PATH`), `SecurityAuditEvents` (ergonomic factories for security capture sites). The audit pipeline itself is exposed via the `AuditConfiguration` security configuration. Depends on `oak-audit-spi`. |
-| `oak-core`          | Pipeline implementation: listener registry, commit-attached buffer, drain hook, `AuditEventEmitterImpl`, `AuditConfigurationImpl`. |
+| `oak-audit-spi`     | Domain-neutral SPI: [AuditEvent], [AuditEventListener], [AuditEventEmitter], `AuditEvents` static façade, and [AuditConfiguration] (typed handle on the pipeline's runtime state). |
+| `oak-security-spi`  | Security-domain constants and helpers only: `SecurityAuditDomain.NAME`, `SecurityAuditTypes` (type-string constants like `USER_MEMBER_ADDED` paired with payload keys like `PAYLOAD_GROUP_PATH`), `SecurityAuditEvents` (ergonomic factories for security capture sites). Depends on `oak-audit-spi`. **`AuditConfiguration` itself moved to `oak-audit-spi`** because audit is no longer modeled as a `SecurityConfiguration` (see below). |
+| `oak-core`          | Pipeline implementation: listener registry, commit-attached buffer, `AuditDrainObserver` (a `NodeStore` `Observer` that drains the buffer on commit success), `AuditEventEmitterImpl`, `AuditConfigurationImpl`. |
 
 Consumer bundles depend on `oak-audit-spi` only. No transitive dependency on
 `oak-core`, `oak-jcr`, or `oak-security-spi` is required to implement a
@@ -123,18 +123,29 @@ listeners MUST NOT attempt to resolve it to a real user.
 
 Used by Oak-internal capture sites such as user-management API calls. Events
 are buffered against the writing session and only dispatched when
-`Root.commit()` succeeds. If validators reject the commit or the merge fails,
+`Root.commit()` succeeds — strictly **after** durable persistence, not inside
+the commit hook chain. If validators reject the commit or the merge fails,
 the buffered events are discarded.
 
 The dispatch sequence is:
 
 1. Capture site appends an event to the per-session ThreadLocal buffer.
-2. The session calls `Root.commit()`; validators run.
-3. On success, `DispatchAuditEventsHook` drains the buffer, decorates each
-   event with `commit.sessionId`, `commit.userId`, `commit.timestamp`, and
-   hands the list to the listener registry.
+2. The session calls `Root.commit()`; commit hooks and validators run; the
+   merge persists durably.
+3. `AuditDrainObserver` — a `NodeStore` `Observer` registered by
+   `AuditConfigurationImpl` — fires on the commit thread (synchronously,
+   via Oak's `ChangeDispatcher`). It short-circuits on `CommitInfo.isExternal()`,
+   then drains the buffer for the originating session id, decorates each event
+   with `commit.sessionId`, `commit.userId`, `commit.timestamp`, and hands the
+   list to the listener registry.
 4. The registry sorts listeners by rank, then the dispatch path filters by
    domain and invokes each matching listener's `onEvents(List<AuditEvent>)`.
+
+The Observer-based drain replaces the pair of commit hooks used in earlier
+revisions of the SPI: events no longer transit the `CommitContext`, and
+dispatch happens **after** durable persistence (eliminating the ghost-event
+window where a successful pre-validation dispatch could be followed by a
+durable-commit failure).
 
 Capture sites inside Oak record events through the internal `AuditEvents`
 façade; this path is not part of the public consumer surface. Bundles wishing
@@ -169,20 +180,32 @@ Properties:
 <a name="pipeline_state_probe"></a>
 ### Probing Pipeline State
 
-Security-aware components that already hold a `SecurityProvider`
-reference can ask whether the audit pipeline is currently active via the
-`AuditConfiguration.isActive()` method — without depending on the
-implementation class or the static façade:
+Components can ask whether the audit pipeline is currently active via the
+[AuditConfiguration]`.isActive()` method — without depending on the
+implementation class or the static façade. `AuditConfiguration` is an
+OSGi service published by `AuditConfigurationImpl`; resolve it via a
+DS `@Reference`:
 
 ```java
-AuditConfiguration audit =
-        securityProvider.getConfiguration(AuditConfiguration.class);
-if (audit.isActive()) {
-    // Feature toggle is ON and at least one listener is registered.
-    // Safe to do work that only matters when audit will actually
-    // dispatch (e.g. allocate richer payload context).
+@Component(service = MyComponent.class)
+public class MyComponent {
+
+    @Reference
+    private AuditConfiguration audit;
+
+    public void doWork() {
+        if (audit.isActive()) {
+            // Feature toggle is ON and at least one listener is registered.
+            // Safe to do work that only matters when audit will actually
+            // dispatch (e.g. allocate richer payload context).
+        }
+    }
 }
 ```
+
+Embedded callers (tests, `oak-run` tools) can resolve the same handle
+from a `Whiteboard` tracker, or call `AuditEvents.isEnabled()` on the
+static façade — both predicates AND together exactly the same way.
 
 `isActive()` returns `true` when the feature toggle is enabled AND at
 least one `AuditEventListener` is registered on the Whiteboard. A
@@ -190,8 +213,14 @@ deployed-but-unused pipeline (toggle ON, no listener registered)
 reports `false`, matching the no-allocation semantics of the static
 `AuditEvents.isEnabled()` façade — the two are equivalent predicates,
 just reachable via different consumer ergonomics. The NOOP
-`AuditConfiguration` returned when no implementation is bound reports
-`false`.
+`AuditConfiguration` (returned when no implementation is bound at all)
+reports `false`.
+
+Note: `AuditConfiguration` is **no longer** reachable via
+`SecurityProvider.getConfiguration(AuditConfiguration.class)`. Audit is
+a top-level Oak concern in this version of the SPI, not a
+`SecurityConfiguration`. Components migrating from earlier revisions
+should switch to `@Reference AuditConfiguration` or a Whiteboard lookup.
 
 <a name="user_api_semantics"></a>
 ### User-API-Level Audit, Not Transaction Log
@@ -382,4 +411,4 @@ Recommended consumer-side discipline:
 [AuditEvent]: /oak/docs/apidocs/org/apache/jackrabbit/oak/spi/audit/AuditEvent.html
 [AuditEventListener]: /oak/docs/apidocs/org/apache/jackrabbit/oak/spi/audit/AuditEventListener.html
 [AuditEventEmitter]: /oak/docs/apidocs/org/apache/jackrabbit/oak/spi/audit/AuditEventEmitter.html
-[AuditConfiguration]: /oak/docs/apidocs/org/apache/jackrabbit/oak/spi/security/audit/AuditConfiguration.html
+[AuditConfiguration]: /oak/docs/apidocs/org/apache/jackrabbit/oak/spi/audit/AuditConfiguration.html

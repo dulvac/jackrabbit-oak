@@ -4,7 +4,29 @@ This is the canonical design spec for the audit-event SPI shipping in `oak-audit
 
 An earlier internal design round narrowed the bridge to commit-attached-only; that approach was reverted before implementation in favor of the open producer surface here, accepting the trust-model trade-off documented in §9.
 
-**Layered framing — event primitives vs. pipeline ownership.** The event primitives (`AuditEvent`, `AuditEventListener`, `AuditEventEmitter`) and the static `AuditEvents` façade are domain-neutral at the type level — any bundle can construct an event for any domain string. The **pipeline wiring** in v1 is, however, security-bound: `AuditConfiguration extends SecurityConfiguration`, the pipeline contributes hooks via `SecurityConfiguration.getCommitHooks(...)`, and `AuditConfigurationImpl` lives in `oak.security.audit`. A v1-vetoed design (`docs/history/design-item-2-v1-vetoed.md`) attempted to elevate audit to a top-level Oak service with a new `CommitHookProvider` SPI in `oak-store-spi`; user constraints invalidated that direction. The current design (item 2 v2, `docs/design-item-2.md`) addresses the original "marker interface" complaint by enriching `AuditConfiguration` with a real semantic method (`isActive()`) while keeping the v1 security-bound pipeline ownership intact. The split (neutral primitives, security-bound pipeline) is the design.
+**Layered framing — event primitives vs. pipeline ownership.** The event primitives (`AuditEvent`, `AuditEventListener`, `AuditEventEmitter`) and the static `AuditEvents` façade are domain-neutral at the type level — any bundle can construct an event for any domain string. The **pipeline wiring** in v1/v2 was security-bound (`AuditConfiguration extends SecurityConfiguration`, hooks contributed via `SecurityConfiguration.getCommitHooks(...)`); the v3 rearchitecture (see status note below) elevates the pipeline to a top-level Oak concern via a `NodeStore` `Observer`, with `AuditConfiguration` moved to `oak-audit-spi`.
+
+---
+
+## 0. Status — v3 Observer-based drain rearchitecture
+
+**This document describes the v2 architecture (hook-based, security-bound).** The audit pipeline has since been rearchitected to v3 (Observer-based, top-level). See [`design-v3-observer-drain.md`](design-v3-observer-drain.md) for the canonical v3 design spec; the rest of this document is preserved as the v2 reference (the design that informs the captured-event primitives, trust model, payload conventions, and listener contract — all unchanged by v3).
+
+**What v3 changes:**
+
+- `AuditConfiguration` interface moved from `oak-security-spi/spi/security/audit/` → `oak-audit-spi/spi/audit/`. No longer `extends SecurityConfiguration`.
+- The pair of commit hooks (`SnapshotAuditBufferHook` + `DispatchAuditEventsHook`) replaced by a single `AuditDrainObserver` registered as an OSGi `Observer` service. `ObserverTracker` attaches it to the root NodeStore. Drain fires on the commit thread, **after** durable persistence.
+- `SecurityProviderBuilder.withAuditConfiguration(...)`, `InternalSecurityProvider.setAuditConfiguration(...)`, and `SecurityProviderRegistration.bindAuditConfiguration(...)` are GONE. Audit is wired independently of the SecurityProvider.
+- `CommitContext` is no longer used to ferry audit events between hooks; events drain directly from the per-thread `AuditBuffer` inside the Observer.
+- Embedded callers attach the drain Observer via `((Observable) store).addObserver(audit.getDrainObserver())` (see `design-v3-observer-drain.md` §6 for the why-not-`Oak.with(Observer)` caveat).
+
+**What v3 keeps byte-identical:** `AuditEvent`, `AuditEventListener`, `AuditEventEmitter`, `AuditEvents` static façade, `AuditBuffer` ThreadLocal, `CommitMetadataDecorator` payload-decoration invariant, capture-site contracts (`UserManagerImpl` etc.), trust model (§9 below), `MutableRoot` lifecycle callouts.
+
+**Cross-references for design archaeology:**
+
+- [`design-v3-observer-drain.md`](design-v3-observer-drain.md) — current canonical design.
+- [`history/design-item-2-v1-vetoed.md`](history/design-item-2-v1-vetoed.md) — earlier v1 attempt at top-level audit via a new `CommitHookProvider` SPI; vetoed for scope reasons. v3 reaches the same architectural goal via a different mechanism (Observer, not new SPI in oak-store-spi).
+- Sections §1-§14 below describe the v2 design as a layered reference for the unchanged primitives.
 
 ---
 
@@ -163,9 +185,13 @@ The v2 SPI delta is exactly one abstract method on `AuditConfiguration`. No `Mut
 
 ### 3.2b Pre-existing JMM observation — follow-up
 
-`AuditConfigurationImpl`'s `featureToggle`, `buffer`, and `registry` fields are plain (non-volatile) instance fields. The `getCommitHooks(workspaceName)` method reads them on commit threads while the OSGi `@Activate` / `@Deactivate` paths write them on a different thread. The path works in practice because OSGi DS provides happens-before from `@Activate` to subsequent service uses, and the long publication chain (`SecurityProviderBuilder` → `ContentRepositoryImpl` → `ContentSessionImpl` → `MutableRoot.commit`) carries the visibility forward via `InternalSecurityProvider.auditConfiguration` being `volatile`.
+**RESOLVED in v3.** `AuditConfigurationImpl`'s `featureToggle`, `buffer`, and `registry` fields are still plain (non-volatile) instance fields, but the publication path is now formally analyzed and documented inline in the impl. The v3 rearchitecture removed `getCommitHooks(workspaceName)` (and with it the commit-thread read on these fields via the security pipeline), so reads now happen either (a) on the @Activate / @Deactivate thread (SCR-published, same-thread chain), (b) via the volatile `AuditEvents.sink` from capture sites (publication barrier provided by the sink itself), or (c) on the commit thread via `Observer.contentChanged`, after the `ServiceRegistration` publication barrier established by `BundleContext.registerService` in `@Activate`. All three paths satisfy the JMM happens-before contract. See the JMM-safety comment block on the field declarations in `AuditConfigurationImpl` for the canonical analysis (folded in per sage's v3 invariant pass).
 
-Formally, `volatile` on these three fields would make the visibility explicit and remove the OSGi-runtime dependency. **Out of scope for v2** (item 2). Filed here so the observation doesn't drop off the radar — a future PR can add the three `volatile` keywords with minimal risk. The v2 delegating `isActive()` doesn't add to this concern: reads go through the existing volatile `AuditEvents.sink`, sidestepping the impl-field publication entirely.
+If a future change ever shares the singleton across pipelines OR introduces cross-thread mutation of these fields, the invariant breaks — they MUST then be made `volatile` (or properly immutable via constructor injection). The inline source note captures the trigger.
+
+Original v2 observation preserved below for design history:
+
+> `AuditConfigurationImpl`'s `featureToggle`, `buffer`, and `registry` fields are plain (non-volatile) instance fields. The `getCommitHooks(workspaceName)` method reads them on commit threads while the OSGi `@Activate` / `@Deactivate` paths write them on a different thread. The path works in practice because OSGi DS provides happens-before from `@Activate` to subsequent service uses, and the long publication chain (`SecurityProviderBuilder` → `ContentRepositoryImpl` → `ContentSessionImpl` → `MutableRoot.commit`) carries the visibility forward via `InternalSecurityProvider.auditConfiguration` being `volatile`.
 
 ---
 

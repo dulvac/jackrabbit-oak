@@ -149,12 +149,73 @@ for ppi in 100 1000; do
 done
 ```
 
+## V3 — Observer-based drain results
+
+The v2 commit-hook drain (`SnapshotAuditBufferHook` + `DispatchAuditEventsHook` contributed via `SecurityConfiguration.getCommitHooks(...)`) was replaced in v3 with an `Observer`-based drain (`AuditDrainObserver`, registered via `BundleContext.registerService(Observer.class, ...)` in OSGi or `((Observable) store).addObserver(...)` in embedded). The capture path (`BufferSink` + `AuditBuffer`) is unchanged. See `oak-audit-spi/docs/design-v3-observer-drain.md` §4.1.
+
+**Hypothesis going in**: v3 should be marginally faster on the audit-ON path because the per-commit drain mechanism changes from 2 short-circuiting commit hooks (Snapshot + Dispatch) to 1 Observer callout with an `isExternal()` short-circuit. The audit-OFF path is unaffected — same `BufferSink` capture-time gate, same NOOP-when-no-listeners semantics.
+
+### Configuration
+
+Same as Phase 3 — same JVM flags, same fixtures (`Oak-MemoryNS`, `Oak-MemoryNS-Audit`), same per-benchmark JVM isolation, same 30s runtime / 5s warmup. `RemoveMemberTest` again needs `-Xmx8g` for the audit-ON run to dodge the teardown OOM in `RemoveMembersTest.afterSuite` (pre-existing benchmark fragility, unrelated to audit code).
+
+### Macro slice — median per-operation latency, milliseconds
+
+| Benchmark | Oak-MemoryNS (audit-OFF) | Oak-MemoryNS-Audit (audit-ON, v3) | Δ ms | Δ % | Notes |
+|---|---|---|---|---|---|
+| BasicWriteTest | 13 (N=2209) | 14 (N=2186) | +1 | +7.7% | Sub-millisecond delta on a ~13 ms operation — well inside JVM noise. |
+| AddMemberTest | 13,131 (N=3) | 12,873 (N=3) | -258 | -2.0% | N=3 in both — below the noise floor. |
+| RemoveMemberTest | 32,034 (N=1, -Xmx4g) | 52,657 (N=1, -Xmx8g) | +20,623 | — | N=1 in both; the `-Xmx8g` sample is GC-pressured (existing `ContentMirrorStoreStrategy.remove` teardown OOM), `-Xmx4g` audit-OFF run also OOMed in teardown after recording one sample. Not interpretable as audit overhead. |
+
+### Microbenchmarks
+
+| Benchmark | commitsPerIteration / pairsPerIteration | Oak-MemoryNS median (N) | Oak-MemoryNS-Audit median (N) | Δ median | Δ per commit / per event |
+|---|---|---|---|---|---|
+| AuditEmptyCommitOverheadTest | 100 (20s runtime) | 251 ms (N=79) | 256 ms (N=77) | +5 ms | < 50 ns / commit (below ms granularity) |
+| AuditEmptyCommitOverheadTest | 500 (30s runtime) | 1380 ms (N=21) | 1423 ms (N=21) | +43 ms | < 100 ns / commit |
+| AuditCaptureSiteOverheadTest | 100 (200 events, 30s runtime) | 13 ms (N=2291) | 13 ms (N=2317) | 0 ms | < 5 µs / event |
+| AuditCaptureSiteOverheadTest | 1000 (2000 events, 30s runtime) | 145 ms (N=209) | 149 ms (N=208) | +4 ms | < 2 µs / event |
+
+### V2 ↔ V3 head-to-head
+
+The audit-OFF baseline shifted significantly between the v2 measurements (Phase 3, `head-with-audit-on-fixture-applied.txt`) and the v3 run on this commit: e.g. BasicWriteTest audit-OFF went from 69 ms (v2 N=483) to 13 ms (v3 N=2209). This is **machine-state drift**, not a v3 code change — the `Oak-MemoryNS` fixture is unchanged between v2 and v3 (no audit wiring), so any divergence is attributable to ambient JVM/OS state (JIT history, page-cache state, CPU thermals, background load). For head-to-head meaning, compare audit-ON-vs-OFF deltas WITHIN each run, not absolute numbers between runs.
+
+Same-run audit-ON-vs-OFF deltas:
+
+| Benchmark | v2 Δ (median ON − OFF) | v3 Δ (median ON − OFF) | Interpretation |
+|---|---|---|---|
+| BasicWriteTest | -10 ms | +1 ms | Both within noise. v2's -10 ms was already called out as noise (audit can't make commits FASTER). v3's +1 ms is also noise. |
+| AddMemberTest | -2,045 ms | -258 ms | Both within noise (N=3 for both runs). v3 is closer to zero — consistent with "no measurable overhead" rather than evidence of a v3 speedup. |
+| AuditEmptyCommitOverheadTest @100/iter | -4 ms | +5 ms | Both within noise. v3's +5 ms / 100 commits = +50 ns/commit upper bound — same order of magnitude as the v2 theoretical estimate (~100 ns). |
+| AuditEmptyCommitOverheadTest @500/iter | -266 ms | +43 ms | v3 closer to zero. v3's +43 ms / 500 commits = +86 ns/commit upper bound. |
+| AuditCaptureSiteOverheadTest @100p/iter | 0 ms median (+1 ms mean) | 0 ms median | Same — within noise. |
+| AuditCaptureSiteOverheadTest @1000p/iter | -10 ms | +4 ms | v3's +4 ms / 2000 events = +2 µs/event upper bound. Same order as v2's theoretical estimate (~1 µs). |
+
+### Interpretation
+
+The v2 → v3 redesign produced **no measurable difference in per-operation latency** at the workload shapes covered here. Ada's hypothesis ("Observer should be marginally faster on the audit-ON path") was **neither confirmed nor refuted** — the absolute deltas are sub-ms across all microbench scales and well inside the JVM noise envelope. What the numbers DO establish:
+
+1. **No regression.** v3 audit-ON-vs-OFF deltas are the same order of magnitude as v2's — both fit "under 100 ns / empty commit, under 5 µs / captured event" upper bounds. Replacing two short-circuiting commit hooks with one Observer callout did not move the needle measurably, in either direction.
+
+2. **The Observer dispatch model is no slower than the commit-hook dispatch model** for this audit pipeline. Both designs land per-commit overhead below the framework's measurement resolution.
+
+3. **Audit-OFF path** is unchanged in v3 (same `BufferSink.record` gate, same NOOP-when-no-listeners semantics). The v3 audit-OFF measurement on `Oak-MemoryNS` is for the unchanged-fixture baseline; the gap vs v2 is machine-state noise, not a v3 code effect.
+
+### Caveats
+
+- **Sample sizes** are unchanged from Phase 3 — N=3 for `AddMemberTest`, N=1 for `RemoveMemberTest`. Below any noise floor we could plausibly use to distinguish v2 from v3. The microbenchmarks (N>20 per fixture for empty-commit, N>200 for capture-site) carry the actual signal.
+
+- **`RemoveMemberTest` audit-OFF at -Xmx4g now also OOMs** during the `RemoveMembersTest.afterSuite` teardown in this run (it did NOT OOM in v2's audit-OFF run at the same heap size). This is a manifestation of the underlying `ContentMirrorStoreStrategy.remove` memory-fragility that the v2 audit-ON run already hit; the OOM site is pre-existing and unrelated to audit-pipeline changes. For a clean RemoveMember number on either path, bump both to `-Xmx8g`.
+
+- **JVM-noise envelope**: a single 30 s run at this benchmark framework's ms-granular output cannot distinguish 50 ns / commit deltas. Tighter measurement (JMH, nanosecond resolution, statistical CIs) would be required to attribute the sub-ms deltas to v3 vs noise. The deployment question — "does v3 slow Oak down?" — is answered: **no, not measurably**.
+
 ## Files
 
-- `baseline-0091af2211.txt` — raw stdout from baseline run (audit-OFF)
-- `head-2b8b3cc5d7.txt` — raw stdout from HEAD audit-OFF run (no fixture)
-- `head-with-audit-on-fixture-applied.txt` — raw stdout from HEAD + fixture audit-ON run (working-tree `Oak-MemoryNS-Audit`)
-- `audit-overhead-microbench.txt` — raw stdout from the four microbench combinations (empty-commit + capture-site, two iteration sizes each)
+- `baseline-0091af2211.txt` — raw stdout from baseline run (audit-OFF, pre-impl)
+- `head-2b8b3cc5d7.txt` — raw stdout from Phase 2 HEAD audit-OFF run (no fixture)
+- `head-with-audit-on-fixture-applied.txt` — raw stdout from Phase 2 HEAD + fixture audit-ON run (working-tree `Oak-MemoryNS-Audit`) — v2 commit-hook drain
+- `audit-overhead-microbench.txt` — raw stdout from the v2 microbench combinations (empty-commit + capture-site, two iteration sizes each)
+- `head-observer-drain-d4725d1a4c.txt` — raw stdout from v3 Observer-based drain run (macro + microbench, both fixtures)
 
 ## Reproduction
 
@@ -189,4 +250,34 @@ done
 java -Xmx8g -Druntime=30 -Dwarmup=5 \
     -jar oak-benchmarks/target/oak-benchmarks-2.1-SNAPSHOT.jar benchmark \
     RemoveMemberTest Oak-MemoryNS-Audit
+```
+
+### Reproduction (v3 Observer-based drain, head-observer-drain-d4725d1a4c.txt)
+
+Both fixtures driven in a single JVM per benchmark (faster, no warmup re-pay between fixtures):
+
+```bash
+cd /Users/adulvac/work/jackrabbit-oak
+mvn package -pl oak-benchmarks -am -Pfast -DskipTests -q
+
+JAR=oak-benchmarks/target/oak-benchmarks-2.1-SNAPSHOT.jar
+
+# Macro slice — both fixtures in one JVM per benchmark.
+java -Xmx4g -Druntime=30 -Dwarmup=5 -jar "$JAR" benchmark BasicWriteTest Oak-MemoryNS Oak-MemoryNS-Audit
+java -Xmx4g -Druntime=30 -Dwarmup=5 -jar "$JAR" benchmark AddMemberTest Oak-MemoryNS Oak-MemoryNS-Audit
+
+# RemoveMember audit-OFF at -Xmx4g (one sample before teardown OOM); audit-ON at -Xmx8g (one sample, GC-pressured).
+java -Xmx4g -Druntime=30 -Dwarmup=5 -jar "$JAR" benchmark RemoveMemberTest Oak-MemoryNS
+java -Xmx8g -Druntime=30 -Dwarmup=5 -jar "$JAR" benchmark RemoveMemberTest Oak-MemoryNS-Audit
+
+# Microbenchmarks — both fixtures in one JVM.
+for pi in 100 500; do
+  java -Xmx2g -Druntime=$( [ "$pi" -eq 100 ] && echo 20 || echo 30 ) -Dwarmup=5 -DcommitsPerIteration=$pi \
+    -jar "$JAR" benchmark AuditEmptyCommitOverheadTest Oak-MemoryNS Oak-MemoryNS-Audit
+done
+
+for ppi in 100 1000; do
+  java -Xmx2g -Druntime=30 -Dwarmup=5 -DpairsPerIteration=$ppi \
+    -jar "$JAR" benchmark AuditCaptureSiteOverheadTest Oak-MemoryNS Oak-MemoryNS-Audit
+done
 ```

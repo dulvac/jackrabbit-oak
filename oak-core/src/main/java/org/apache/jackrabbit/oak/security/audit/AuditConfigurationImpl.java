@@ -23,18 +23,16 @@ import java.util.Map;
 import org.apache.jackrabbit.oak.api.Root;
 import org.apache.jackrabbit.oak.osgi.OsgiWhiteboard;
 import org.apache.jackrabbit.oak.spi.audit.AuditBufferLifecycle;
+import org.apache.jackrabbit.oak.spi.audit.AuditConfiguration;
 import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
 import org.apache.jackrabbit.oak.spi.audit.AuditEventListener;
 import org.apache.jackrabbit.oak.spi.audit.AuditEvents;
-import org.apache.jackrabbit.oak.spi.commit.CommitHook;
-import org.apache.jackrabbit.oak.spi.security.ConfigurationBase;
-import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
-import org.apache.jackrabbit.oak.spi.security.SecurityConfiguration;
-import org.apache.jackrabbit.oak.spi.security.audit.AuditConfiguration;
+import org.apache.jackrabbit.oak.spi.commit.Observer;
 import org.apache.jackrabbit.oak.spi.toggle.Feature;
 import org.apache.jackrabbit.oak.spi.whiteboard.Whiteboard;
 import org.jetbrains.annotations.NotNull;
 import org.osgi.framework.BundleContext;
+import org.osgi.framework.ServiceRegistration;
 import org.osgi.service.component.annotations.Activate;
 import org.osgi.service.component.annotations.Component;
 import org.osgi.service.component.annotations.Deactivate;
@@ -54,21 +52,24 @@ import org.slf4j.LoggerFactory;
  *     calls into the buffer.</li>
  *     <li>Tracks {@code AuditEventListener} services on the Whiteboard
  *     via {@link WhiteboardAuditEventListenerRegistry}.</li>
- *     <li>Contributes two commit hooks via
- *     {@link #getCommitHooks(String)}:
- *     {@link SnapshotAuditBufferHook} (regular) and
- *     {@link DispatchAuditEventsHook} (post-validation).</li>
+ *     <li>Registers an {@link AuditDrainObserver} as an OSGi {@link Observer}
+ *     service; Oak's {@code ObserverTracker} (in {@code oak-jcr}'s
+ *     {@code RepositoryManager}) picks it up and subscribes it to the root
+ *     NodeStore. The observer drains the buffer on commit success and
+ *     dispatches events to listeners.</li>
  * </ul>
- * Registered as both {@link AuditConfiguration} (for typed lookup) and
- * {@link SecurityConfiguration} (for hook contribution via
- * {@code SecurityProvider.getConfigurations()}).
+ * Registered as {@link AuditConfiguration} only. Audit is no longer a
+ * {@code SecurityConfiguration}: no commit-hook contribution, no
+ * {@code SecurityProvider.getConfiguration(AuditConfiguration.class)} lookup.
+ * Embedded callers obtain the drain observer via {@link #getDrainObserver()}.
  * <p>
- * When the feature toggle is disabled both hooks short-circuit and
- * capture is a no-op — see {@link AuditEvents#isEnabled()}.
+ * When the feature toggle is disabled, capture is a no-op and the observer
+ * short-circuits — see {@link AuditEvents#isEnabled()} and
+ * {@link AuditDrainObserver#contentChanged}.
  */
-@Component(service = {AuditConfiguration.class, SecurityConfiguration.class})
+@Component(service = AuditConfiguration.class)
 @Designate(ocd = AuditConfigurationImpl.Configuration.class)
-public class AuditConfigurationImpl extends ConfigurationBase implements AuditConfiguration {
+public class AuditConfigurationImpl implements AuditConfiguration {
 
     /**
      * Feature toggle name. The fork ships this as {@code FT_AUDIT}.
@@ -98,9 +99,58 @@ public class AuditConfigurationImpl extends ConfigurationBase implements AuditCo
 
     private static final Logger log = LoggerFactory.getLogger(AuditConfigurationImpl.class);
 
-    private Feature featureToggle;
-    private AuditBuffer buffer;
-    private WhiteboardAuditEventListenerRegistry registry;
+    // Package-private (not private) on the internal-state fields so
+    // AuditConfigurationImplTest can mock-replace them to verify the
+    // dispose-order invariant via Mockito InOrder. Production callers MUST
+    // NOT touch these fields directly — go through initialize() / dispose().
+    //
+    // JMM-safety. featureToggle, buffer, registry, and drainObserver are
+    // package-private and non-volatile by design. The invariant they rely on:
+    // they are mutated only by initialize(Whiteboard) and dispose(), which
+    // the contract specifies must each run exactly once and on the same
+    // thread; reads happen either
+    //   (a) on that same thread — the static AuditEvents.record / dispatch
+    //       facade reads through the AuditEvents.sink field (itself volatile,
+    //       providing the publication barrier), and getDrainObserver() is
+    //       called by activate() on the SCR thread AFTER initialize() on the
+    //       SCR thread; or
+    //   (b) on a commit thread that arrives via Observer.contentChanged,
+    //       after the ServiceRegistration publication barrier established
+    //       by BundleContext.registerService in activate().
+    // Both paths satisfy the JMM happens-before contract without per-field
+    // volatile. If a future change adds a "share the singleton across
+    // pipelines" pattern OR cross-thread mutation of these fields, this
+    // invariant breaks — at that point the fields MUST be made volatile (or
+    // properly immutable via constructor injection). Flagged by sage in
+    // the v3 invariant pass; recorded here so the next maintainer doesn't
+    // have to re-derive it.
+    Feature featureToggle;
+    AuditBuffer buffer;
+    WhiteboardAuditEventListenerRegistry registry;
+
+    /**
+     * Singleton {@link AuditDrainObserver} instance constructed by
+     * {@link #initialize(Whiteboard)} and zeroed by {@link #dispose()}.
+     * Exposed via {@link #getDrainObserver()} as an {@link Observer}.
+     * <p>
+     * Singleton-not-factory by design: each {@code AuditConfigurationImpl}
+     * owns at most one Observer because (a) the {@link AuditBuffer}
+     * {@code ThreadLocal} is buffer-instance-scoped, so multiple Observer
+     * instances would compete for the same drain, and (b) the destructive
+     * {@code buffer.drain(sessionId)} contract is the cleanup mechanism —
+     * double-attach would mask future non-destructive-drain refactors.
+     */
+    AuditDrainObserver drainObserver;
+
+    /**
+     * OSGi service registration for the {@link AuditDrainObserver}. Held
+     * so {@link #deactivate} can unregister and let {@code ObserverTracker}
+     * close its subscription on the root NodeStore. {@code null} outside
+     * the OSGi-active window; embedded callers manage observer lifetime
+     * through their own {@code ((Observable) store).addObserver(...)} call
+     * (see class Javadoc and design-v3-observer-drain.md §6).
+     */
+    ServiceRegistration<?> observerRegistration;
 
     public AuditConfigurationImpl() {
         super();
@@ -111,22 +161,40 @@ public class AuditConfigurationImpl extends ConfigurationBase implements AuditCo
     private void activate(@NotNull Configuration configuration,
                           @NotNull BundleContext bundleContext,
                           @NotNull Map<String, Object> properties) {
-        setParameters(ConfigurationParameters.of(properties));
+        // Step 1-4: install sinks/registry/buffer/toggle. Capture-site
+        // record(...) calls reach the buffer as soon as initialize returns.
+        // The singleton AuditDrainObserver is also constructed inside
+        // initialize() (step 5 below) so the impl is fully wired before
+        // we publish anything externally.
         initialize(new OsgiWhiteboard(bundleContext));
+        // Step 6 LAST: publish the Observer service. ObserverTracker
+        // (oak-store-spi/.../spi/commit/ObserverTracker.java, instantiated
+        // per-NodeStoreService in DocumentNodeStoreService, SegmentNodeStoreRegistrar,
+        // CompositeNodeStoreService) subscribes it to the root NodeStore.
+        // Any commit thread racing with activation that reaches step 6 before
+        // ObserverTracker has noticed the service will simply miss the drain
+        // on this one commit — events stay in the per-thread buffer until the
+        // next commit on the same session. No correctness risk.
+        observerRegistration = bundleContext.registerService(
+                Observer.class.getName(), getDrainObserver(), null);
     }
 
     /**
      * Non-OSGi entry point for wiring up the audit pipeline. Called by
      * {@link #activate} in OSGi deployments after the {@code BundleContext}
-     * has been unwrapped into an {@code OsgiWhiteboard}, and by
-     * {@code SecurityProviderBuilder} in embedded / test deployments
-     * directly. The same code path runs in both worlds.
+     * has been unwrapped into an {@code OsgiWhiteboard}, and by embedded
+     * callers (tests, {@code OakFixture}) directly.
+     * <p>
+     * <strong>Embedded callers must follow up with
+     * {@link #getDrainObserver()}</strong> to obtain the Observer and attach
+     * it to the root NodeStore. See {@link #getDrainObserver()} Javadoc for
+     * the recommended attach pattern and the {@code Oak.with(Observer)}
+     * caveat. Also see design-v3-observer-drain.md §6.
      * <p>
      * <strong>Must be called exactly once per instance.</strong> Calling
      * it more than once orphans the previous {@code Feature} toggle and
      * registry tracker, and silently overwrites the static
-     * {@link AuditEvents} / {@link AuditBufferLifecycle} sinks — v1 does
-     * not enforce single-call semantics, it's a contract. To rewire,
+     * {@link AuditEvents} / {@link AuditBufferLifecycle} sinks. To rewire,
      * call {@link #dispose()} first.
      *
      * @param whiteboard the whiteboard to register the {@code Feature}
@@ -144,21 +212,91 @@ public class AuditConfigurationImpl extends ConfigurationBase implements AuditCo
 
         AuditEvents.install(new BufferSink(featureToggle, registry, buffer));
 
+        // Construct the singleton AuditDrainObserver LAST in initialize().
+        // This closes a potential TOCTOU window in the OSGi @Activate flow:
+        // ObserverTracker (which subscribes to Observer services on a
+        // background thread) might fire the bootstrap CommitInfo.EMPTY_EXTERNAL
+        // invocation before @Activate returns. With the singleton constructed
+        // here (inside initialize, which @Activate calls FIRST), getDrainObserver()
+        // is safe to call from anywhere in @Activate after this point.
+        drainObserver = new AuditDrainObserver(featureToggle, buffer, registry);
+
         log.info("Audit pipeline activated. Toggle '{}' = {}.",
                 FEATURE_TOGGLE_NAME, featureToggle.isEnabled());
     }
 
+    /**
+     * Returns the singleton {@link Observer} bound to this pipeline's
+     * buffer, registry, and feature toggle. Constructed once by
+     * {@link #initialize(Whiteboard)} and cached for the lifetime of this
+     * {@code AuditConfigurationImpl} instance; zeroed by {@link #dispose()}.
+     * <p>
+     * The singleton shape is deliberate. Each {@code AuditConfigurationImpl}
+     * owns at most one Observer because (a) the {@link AuditBuffer}
+     * {@code ThreadLocal} is buffer-instance-scoped, so multiple Observer
+     * instances would compete for the same drain on every commit thread,
+     * and (b) the destructive {@code buffer.drain(sessionId)} contract is
+     * the cleanup mechanism — a future non-destructive-drain refactor
+     * would silently turn double-attach into double-dispatch.
+     * <p>
+     * Embedded callers pass the returned Observer to
+     * {@code ((Observable) store).addObserver(...)}, holding the returned
+     * {@code Closeable} for tear-down. {@code Oak.with(Observer)} is
+     * <em>not</em> a reliable embedded path when the caller also passes
+     * {@code Oak.with(Whiteboard)} to replace Oak's default whiteboard:
+     * the auto-attach at {@code Oak.java:300-302} is wired to the default
+     * whiteboard's anonymous override only. See
+     * design-v3-observer-drain.md §6.
+     * <p>
+     * OSGi callers never invoke this method directly — {@code @Activate}
+     * does, then publishes the singleton via
+     * {@code BundleContext.registerService(...)}.
+     *
+     * @return the singleton drain observer; never {@code null}.
+     * @throws IllegalStateException when called before
+     *         {@link #initialize(Whiteboard)} OR after {@link #dispose()}
+     *         (both states leave {@code drainObserver == null}).
+     */
+    public @NotNull Observer getDrainObserver() {
+        if (drainObserver == null) {
+            throw new IllegalStateException(
+                    "AuditConfigurationImpl.initialize(...) must be called first" +
+                            " (or dispose() has already run)");
+        }
+        return drainObserver;
+    }
+
+    // Package-private (was private) so the test suite can invoke the
+    // OSGi-shaped tear-down flow directly to verify the
+    // "unregister before dispose internals" ordering invariant via
+    // Mockito InOrder. OSGi DS resolves @Deactivate via reflection;
+    // package-private access does not change DS binding.
     @Deactivate
-    private void deactivate() {
+    void deactivate() {
+        // Step 0: unregister the Observer service FIRST. ObserverTracker
+        // notices the service disappear → closes its subscription on the
+        // root NodeStore → no further contentChanged calls reach our
+        // AuditDrainObserver. A commit thread that's mid-way through
+        // contentChanged when this runs is protected by the outer Throwable
+        // barrier in AuditDrainObserver.contentChanged (defense in depth).
+        if (observerRegistration != null) {
+            try {
+                observerRegistration.unregister();
+            } catch (RuntimeException e) {
+                log.warn("Audit deactivate: observerRegistration.unregister() failed; continuing.", e);
+            } finally {
+                observerRegistration = null;
+            }
+        }
         dispose();
     }
 
     /**
      * Non-OSGi tear-down entry point, paired with
      * {@link #initialize(Whiteboard)}. Called by {@link #deactivate} in
-     * OSGi deployments and directly by tests / embedded callers. Safe to
-     * call when no pipeline was previously initialized — each step
-     * guards against unset state.
+     * OSGi deployments (after observer unregistration) and directly by
+     * tests / embedded callers. Safe to call when no pipeline was
+     * previously initialized — each step guards against unset state.
      * <p>
      * Each cleanup step is wrapped in its own try/catch so an exception
      * at one step does not skip the rest: an OSGi deactivate that leaves
@@ -166,7 +304,31 @@ public class AuditConfigurationImpl extends ConfigurationBase implements AuditCo
      * noisy log.
      */
     public void dispose() {
-        // Order matters — see Risk 5 in 01-architecture.md.
+        // Order matters — see Risk 5 in 01-architecture.md (carried over from v2).
+
+        // Precondition: the Observer must be detached from the root NodeStore
+        // BEFORE we tear down the pipeline state it references. The outer
+        // Throwable barrier in AuditDrainObserver.contentChanged is the safety
+        // net, but the dispose-order invariant is the policy.
+        // - OSGi path: @Deactivate calls observerRegistration.unregister() then
+        //   zeros the field before invoking dispose(); precondition trivially
+        //   satisfied.
+        // - Embedded path: observerRegistration is null (no OSGi
+        //   registerService call); precondition trivially satisfied. The
+        //   embedded caller is separately responsible for closing the
+        //   Closeable returned by ((Observable) store).addObserver(...) BEFORE
+        //   calling dispose() — that Closeable is owned by the caller, not by
+        //   AuditConfigurationImpl, because tests/fixtures need explicit
+        //   lifecycle control over their per-store subscriptions.
+        // - Misuse case (e.g. test calls dispose() directly after @Activate
+        //   without invoking @Deactivate): caught here, loud failure with
+        //   actionable message.
+        if (observerRegistration != null) {
+            throw new IllegalStateException(
+                    "Observer registration must be unregistered before dispose(). " +
+                            "OSGi @Deactivate handles this automatically; " +
+                            "direct callers must unregister first.");
+        }
 
         // 1. Close the feature toggle FIRST. AuditEvents.isEnabled()
         //    immediately returns false, so any new capture-site call
@@ -206,8 +368,7 @@ public class AuditConfigurationImpl extends ConfigurationBase implements AuditCo
         }
         // 4. Drain the deactivator thread's ThreadLocal. Residual entries
         //    on other threads are bounded by worker-pool × in-flight
-        //    sessions; acknowledged trade-off for v1 (no weak-reference
-        //    machinery).
+        //    sessions; acknowledged trade-off (no weak-reference machinery).
         if (buffer != null) {
             try {
                 buffer.clearAll();
@@ -217,25 +378,10 @@ public class AuditConfigurationImpl extends ConfigurationBase implements AuditCo
                 buffer = null;
             }
         }
+        // 5. Zero the cached singleton observer. Subsequent getDrainObserver()
+        //    calls throw IllegalStateException — same contract as pre-init.
+        drainObserver = null;
         log.info("Audit pipeline deactivated.");
-    }
-
-    //----------------------------------------------< SecurityConfiguration >---
-    @NotNull
-    @Override
-    public String getName() {
-        return NAME;
-    }
-
-    @NotNull
-    @Override
-    public List<? extends CommitHook> getCommitHooks(@NotNull String workspaceName) {
-        if (featureToggle == null || buffer == null || registry == null) {
-            return List.of();
-        }
-        return List.of(
-                new SnapshotAuditBufferHook(featureToggle, buffer),
-                new DispatchAuditEventsHook(featureToggle, buffer, registry));
     }
 
     //------------------------------------------------< AuditConfiguration >---
@@ -321,7 +467,7 @@ public class AuditConfigurationImpl extends ConfigurationBase implements AuditCo
                     // JVM-level pathology (OutOfMemoryError) is caught here too but
                     // re-triggers on the next allocation and surfaces through normal channels.
                     // Do not narrow this catch to RuntimeException without re-reading the
-                    // design discussion. See: audit-spi/01-architecture.md §6.
+                    // design discussion. See: design-v3-observer-drain.md §4.1.
                     log.warn("AuditEventListener {} threw {} on fire-and-forget dispatch in domain '{}'; isolating from other listeners.",
                             listener.getClass().getName(), t.getClass().getSimpleName(), domain, t);
                 }

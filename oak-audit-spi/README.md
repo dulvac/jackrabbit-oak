@@ -7,6 +7,9 @@ Domain-neutral audit SPI. Defines:
 - `AuditEventListener` — single-method consumer interface (`onEvents`).
 - `AuditEventEmitter` — OSGi service for any bundle to emit events.
 - `AuditEvents` — static façade for Oak-internal capture sites.
+- `AuditConfiguration` — typed handle on the pipeline's runtime state
+  (`isActive()`, `NAME`, `NOOP`). Not a `SecurityConfiguration` — audit is a
+  top-level Oak concern.
 
 Consumed by `oak-security-spi`, `oak-core`, and any consumer bundle.
 
@@ -16,11 +19,17 @@ Oak-internal storage modules.
 Further reading
 ---------------
 
-- [`docs/design.md`](docs/design.md) — canonical design spec: architecture,
-  SPI surface, commit-attached + fire-and-forget pipelines, trust model.
+- [`docs/design-v3-observer-drain.md`](docs/design-v3-observer-drain.md) —
+  **current canonical design spec.** v3 Observer-based drain rearchitecture:
+  pipeline ownership, OSGi/embedded wiring, threading invariants, test
+  rewiring.
+- [`docs/design.md`](docs/design.md) — v2 design reference (commit-hook based,
+  security-bound pipeline). Section §0 cross-references the v3 changes; the
+  remaining sections describe the unchanged event primitives, trust model, and
+  listener contract.
 - [`docs/performance/README.md`](docs/performance/README.md) — performance
   characterization (macro slice + per-commit / per-event microbenchmarks),
-  with reproduction recipes.
+  with reproduction recipes. Includes the v2-vs-v3 head-to-head.
 - User-facing guide: [`oak-doc/src/site/markdown/security/audit.md`](../oak-doc/src/site/markdown/security/audit.md).
 
 License

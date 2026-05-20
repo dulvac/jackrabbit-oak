@@ -67,16 +67,17 @@ import static org.junit.Assert.assertTrue;
  *   <li>JCR {@link UserManager#createGroup(String)} → {@link Group#addMember(org.apache.jackrabbit.api.security.user.Authorizable)}.</li>
  *   <li>{@code UserManagerImpl.recordSingleMembershipAuditEvent} →
  *       {@code AuditEvents.record(root, SecurityAuditEvents.memberAdded(...))}.</li>
- *   <li>{@code SnapshotAuditBufferHook} → {@code DispatchAuditEventsHook} →
- *       the registered listener.</li>
+ *   <li>{@code AuditDrainObserver} (fires on commit success) → the registered
+ *       listener.</li>
  * </ol>
- * Asserts the entire chain: capture-site → buffer → snapshot hook →
- * decorator → dispatch hook → listener.
+ * Asserts the entire chain: capture-site → buffer → observer drain →
+ * decorator → listener.
  */
 public class AuditWiringIT {
 
     private Whiteboard whiteboard;
     private AuditConfigurationImpl auditConfig;
+    private Closeable drainObserverSubscription;
     private List<AuditEvent> received;
     private ContentRepository repository;
     private SecurityProvider securityProvider;
@@ -87,9 +88,15 @@ public class AuditWiringIT {
         received = new CopyOnWriteArrayList<>();
 
         auditConfig = new AuditConfigurationImpl();
+        // v3 wiring: audit pipeline is no longer a SecurityConfiguration.
+        // initialize() installs sinks/registry/buffer/toggle. The drain Observer
+        // is attached to the MemoryNodeStore directly below; we can't rely on
+        // Oak.with(Observer)'s auto-attach because .with(whiteboard) replaces
+        // Oak's default whiteboard and bypasses the auto-attach at
+        // Oak.java:300-302. See design-v3-observer-drain.md §6 line 663.
+        auditConfig.initialize(whiteboard);
         securityProvider = SecurityProviderBuilder.newBuilder()
                 .withWhiteboard(whiteboard)
-                .withAuditConfiguration(auditConfig)
                 .build();
 
         Configuration.setConfiguration(
@@ -106,7 +113,10 @@ public class AuditWiringIT {
         };
         whiteboard.register(AuditEventListener.class, securityListener, Map.of());
 
-        repository = new Oak(new MemoryNodeStore(InitialContentHelper.INITIAL_CONTENT))
+        MemoryNodeStore store = new MemoryNodeStore(InitialContentHelper.INITIAL_CONTENT);
+        drainObserverSubscription = store.addObserver(auditConfig.getDrainObserver());
+
+        repository = new Oak(store)
                 .with(securityProvider)
                 .with(whiteboard)
                 .createContentRepository();
@@ -115,6 +125,9 @@ public class AuditWiringIT {
     @After
     public void tearDown() throws Exception {
         try {
+            if (drainObserverSubscription != null) {
+                drainObserverSubscription.close();
+            }
             if (auditConfig != null) {
                 auditConfig.dispose();
             }
@@ -190,7 +203,7 @@ public class AuditWiringIT {
             assertEquals(SecurityAuditTypes.USER_MEMBER_ADDED, event.getType());
 
             Map<String, Object> payload = event.getPayload();
-            // Commit metadata decorated by DispatchAuditEventsHook.
+            // Commit metadata decorated by AuditDrainObserver (via CommitMetadataDecorator).
             assertTrue("commit.sessionId must be decorated",
                     payload.containsKey("commit.sessionId"));
             assertTrue("commit.userId must be decorated",

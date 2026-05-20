@@ -30,9 +30,8 @@ import javax.jcr.Session;
  * <ul>
  *   <li>{@code AuditBufferLifecycle.onRefresh(sessionId)} on each
  *   {@code root.refresh()} pre-commit;</li>
- *   <li>two extra hooks in the commit chain
- *   ({@code SnapshotAuditBufferHook} + {@code DispatchAuditEventsHook})
- *   that short-circuit on empty buffer.</li>
+ *   <li>one extra observer in the commit-dispatch chain
+ *   ({@code AuditDrainObserver}) that short-circuits on empty buffer.</li>
  * </ul>
  *
  * Delta = (Oak-MemoryNS-Audit median) − (Oak-MemoryNS median), divided
