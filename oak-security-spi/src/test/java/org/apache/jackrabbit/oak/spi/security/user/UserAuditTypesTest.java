@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.jackrabbit.oak.spi.security.audit;
+package org.apache.jackrabbit.oak.spi.security.user;
 
 import java.lang.reflect.Constructor;
 import java.util.List;
@@ -26,7 +26,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 
-public class SecurityAuditTypesTest {
+public class UserAuditTypesTest {
 
     @Test
     public void allTypeStringsAreNonBlank() {
@@ -60,32 +60,25 @@ public class SecurityAuditTypesTest {
     public void privateConstructorIsReachableForCoverage() throws Exception {
         // Constants-only class: private constructor guards against
         // accidental instantiation; reflection-invoked for line coverage.
-        Constructor<SecurityAuditTypes> ctor = SecurityAuditTypes.class.getDeclaredConstructor();
+        Constructor<UserAuditTypes> ctor = UserAuditTypes.class.getDeclaredConstructor();
         ctor.setAccessible(true);
         assertNotNull(ctor.newInstance());
     }
 
-    /**
-     * The four published type strings. Update this list when adding
-     * new {@code USER_*} / {@code ACL_*} / etc. constants.
-     */
     private static List<String> typeStrings() {
         return List.of(
-                SecurityAuditTypes.USER_MEMBER_ADDED,
-                SecurityAuditTypes.USER_MEMBER_REMOVED,
-                SecurityAuditTypes.USER_MEMBERS_ADDED_BULK,
-                SecurityAuditTypes.USER_MEMBERS_REMOVED_BULK);
+                UserAuditTypes.USER_MEMBER_ADDED,
+                UserAuditTypes.USER_MEMBER_REMOVED,
+                UserAuditTypes.USER_MEMBERS_ADDED_BULK,
+                UserAuditTypes.USER_MEMBERS_REMOVED_BULK);
     }
 
-    /**
-     * The five published payload keys.
-     */
     private static List<String> payloadKeys() {
         return List.of(
-                SecurityAuditTypes.PAYLOAD_GROUP_PATH,
-                SecurityAuditTypes.PAYLOAD_MEMBER_PATH,
-                SecurityAuditTypes.PAYLOAD_MEMBER_IDS,
-                SecurityAuditTypes.PAYLOAD_IS_CONTENT_ID,
-                SecurityAuditTypes.PAYLOAD_FAILED_IDS);
+                UserAuditTypes.PAYLOAD_GROUP_PATH,
+                UserAuditTypes.PAYLOAD_MEMBER_PATH,
+                UserAuditTypes.PAYLOAD_MEMBER_IDS,
+                UserAuditTypes.PAYLOAD_IS_CONTENT_ID,
+                UserAuditTypes.PAYLOAD_FAILED_IDS);
     }
 }

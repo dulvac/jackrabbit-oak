@@ -55,7 +55,7 @@ public class WhiteboardAuditEventListenerRegistryTest {
         try {
             assertEquals(0, reg.getListeners().size());
             assertFalse(reg.hasAnyListener());
-            assertFalse(reg.hasListenerFor("security"));
+            assertFalse(reg.hasListenerFor("oak.security"));
         } finally {
             reg.stop();
         }
@@ -67,10 +67,10 @@ public class WhiteboardAuditEventListenerRegistryTest {
         WhiteboardAuditEventListenerRegistry reg = new WhiteboardAuditEventListenerRegistry();
         reg.start(wb);
         try {
-            wb.register(AuditEventListener.class, new StubListener("security", 0), Map.of());
+            wb.register(AuditEventListener.class, new StubListener("oak.security", 0), Map.of());
             assertEquals(1, reg.getListeners().size());
             assertTrue(reg.hasAnyListener());
-            assertTrue(reg.hasListenerFor("security"));
+            assertTrue(reg.hasListenerFor("oak.security"));
         } finally {
             reg.stop();
         }
@@ -107,11 +107,11 @@ public class WhiteboardAuditEventListenerRegistryTest {
         WhiteboardAuditEventListenerRegistry reg = new WhiteboardAuditEventListenerRegistry();
         reg.start(wb);
         try {
-            // First call when no listener for "security" exists.
-            assertFalse(reg.hasListenerFor("security"));
+            // First call when no listener for "oak.security" exists.
+            assertFalse(reg.hasListenerFor("oak.security"));
             // Register and re-check — must observe the new registration.
-            wb.register(AuditEventListener.class, new StubListener("security", 0), Map.of());
-            assertTrue(reg.hasListenerFor("security"));
+            wb.register(AuditEventListener.class, new StubListener("oak.security", 0), Map.of());
+            assertTrue(reg.hasListenerFor("oak.security"));
             // Different domain must still return false.
             assertFalse(reg.hasListenerFor("aem.content"));
         } finally {
@@ -189,14 +189,14 @@ public class WhiteboardAuditEventListenerRegistryTest {
         reg.start(wb);
         try {
             Registration r = wb.register(AuditEventListener.class,
-                    new StubListener("security", 0), Map.of());
+                    new StubListener("oak.security", 0), Map.of());
             assertEquals(1, reg.getListeners().size());
-            assertTrue(reg.hasListenerFor("security"));
+            assertTrue(reg.hasListenerFor("oak.security"));
 
             r.unregister();
 
             assertEquals(0, reg.getListeners().size());
-            assertFalse(reg.hasListenerFor("security"));
+            assertFalse(reg.hasListenerFor("oak.security"));
             assertFalse(reg.hasAnyListener());
         } finally {
             reg.stop();

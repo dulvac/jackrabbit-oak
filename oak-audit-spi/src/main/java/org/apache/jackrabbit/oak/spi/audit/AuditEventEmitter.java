@@ -39,9 +39,11 @@ import org.osgi.annotation.versioning.ProviderType;
  * listener throwing does not prevent others from running. Any
  * {@link Throwable} (including {@link RuntimeException} and {@link Error}
  * subclasses such as {@link LinkageError}) is logged at {@code WARN} and
- * never propagates back to the caller. See §6 of
- * {@code 01-architecture.md} for the rationale on catching {@code Throwable}
- * rather than {@code RuntimeException}.
+ * never propagates back to the caller. The barrier catches {@code Throwable}
+ * rather than {@code RuntimeException} so JVM-level failures from a
+ * misconfigured consumer bundle (missing transitive dependency,
+ * {@link OutOfMemoryError}, etc.) cannot prevent other listeners from
+ * receiving the event.
  * <p>
  * <strong>Trust model:</strong> any bundle that resolves this service can
  * emit any event for any domain. The event payload reflects the emitting

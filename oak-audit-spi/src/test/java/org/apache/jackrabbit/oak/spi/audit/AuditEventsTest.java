@@ -49,9 +49,9 @@ public class AuditEventsTest {
     @Test
     public void facadeNoOpWhenNoSinkInstalled() {
         assertFalse(AuditEvents.isEnabled());
-        assertFalse(AuditEvents.isEnabledFor("security"));
-        AuditEvents.record(mock(Root.class), fixedEvent("security"));
-        AuditEvents.dispatch(fixedEvent("security"));
+        assertFalse(AuditEvents.isEnabledFor("test.domain"));
+        AuditEvents.record(mock(Root.class), fixedEvent("test.domain"));
+        AuditEvents.dispatch(fixedEvent("test.domain"));
         // no exception, no observable effect — verified by no sink installed
     }
 
@@ -64,7 +64,7 @@ public class AuditEventsTest {
             @Override public void record(@NotNull Root root, @NotNull AuditEvent event) { received.set(event); }
             @Override public void dispatch(@NotNull AuditEvent event) { /* not used */ }
         });
-        AuditEvent e = fixedEvent("security");
+        AuditEvent e = fixedEvent("test.domain");
         AuditEvents.record(mock(Root.class), e);
         assertSame(e, received.get());
     }

@@ -41,7 +41,7 @@ import org.apache.jackrabbit.oak.spi.audit.AuditEventListener;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
 import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
 import org.apache.jackrabbit.oak.spi.security.audit.SecurityAuditDomain;
-import org.apache.jackrabbit.oak.spi.security.audit.SecurityAuditTypes;
+import org.apache.jackrabbit.oak.spi.security.user.UserAuditTypes;
 import org.apache.jackrabbit.oak.spi.security.authentication.ConfigurationUtil;
 import org.apache.jackrabbit.oak.spi.security.user.UserConfiguration;
 import org.apache.jackrabbit.oak.spi.toggle.FeatureToggle;
@@ -66,7 +66,7 @@ import static org.junit.Assert.assertTrue;
  * <ol>
  *   <li>JCR {@link UserManager#createGroup(String)} → {@link Group#addMember(org.apache.jackrabbit.api.security.user.Authorizable)}.</li>
  *   <li>{@code UserManagerImpl.recordSingleMembershipAuditEvent} →
- *       {@code AuditEvents.record(root, SecurityAuditEvents.memberAdded(...))}.</li>
+ *       {@code AuditEvents.record(root, UserAuditEvents.memberAdded(...))}.</li>
  *   <li>{@code AuditDrainObserver} (fires on commit success) → the registered
  *       listener.</li>
  * </ol>
@@ -88,12 +88,11 @@ public class AuditWiringIT {
         received = new CopyOnWriteArrayList<>();
 
         auditConfig = new AuditConfigurationImpl();
-        // v3 wiring: audit pipeline is no longer a SecurityConfiguration.
         // initialize() installs sinks/registry/buffer/toggle. The drain Observer
         // is attached to the MemoryNodeStore directly below; we can't rely on
         // Oak.with(Observer)'s auto-attach because .with(whiteboard) replaces
         // Oak's default whiteboard and bypasses the auto-attach at
-        // Oak.java:300-302. See design-v3-observer-drain.md §6 line 663.
+        // Oak.java:300-302.
         auditConfig.initialize(whiteboard);
         securityProvider = SecurityProviderBuilder.newBuilder()
                 .withWhiteboard(whiteboard)
@@ -164,7 +163,7 @@ public class AuditWiringIT {
     /**
      * The capture-site in {@code UserManagerImpl.addMember} fires an audit
      * event with domain {@link SecurityAuditDomain#NAME} and type
-     * {@link SecurityAuditTypes#USER_MEMBER_ADDED} on successful group
+     * {@link UserAuditTypes#USER_MEMBER_ADDED} on successful group
      * update; the event must traverse the entire pipeline to the
      * registered listener with the commit metadata decorated.
      */
@@ -200,7 +199,7 @@ public class AuditWiringIT {
                     1, received.size());
             AuditEvent event = received.get(0);
             assertEquals(SecurityAuditDomain.NAME, event.getDomain());
-            assertEquals(SecurityAuditTypes.USER_MEMBER_ADDED, event.getType());
+            assertEquals(UserAuditTypes.USER_MEMBER_ADDED, event.getType());
 
             Map<String, Object> payload = event.getPayload();
             // Commit metadata decorated by AuditDrainObserver (via CommitMetadataDecorator).
@@ -213,8 +212,8 @@ public class AuditWiringIT {
             // Event-specific payload — values, not just key presence,
             // so a future refactor that left the keys but lost the values
             // (e.g. wrong getPath() variable in the capture site) is caught.
-            assertEquals(groupPath, payload.get(SecurityAuditTypes.PAYLOAD_GROUP_PATH));
-            assertEquals(memberPath, payload.get(SecurityAuditTypes.PAYLOAD_MEMBER_PATH));
+            assertEquals(groupPath, payload.get(UserAuditTypes.PAYLOAD_GROUP_PATH));
+            assertEquals(memberPath, payload.get(UserAuditTypes.PAYLOAD_MEMBER_PATH));
         }
     }
 
@@ -222,7 +221,7 @@ public class AuditWiringIT {
      * Symmetric to {@link #groupAddMemberFiresUserMemberAddedEndToEnd()}:
      * the capture-site in {@code UserManagerImpl.removeMember} fires an
      * audit event with type
-     * {@link SecurityAuditTypes#USER_MEMBER_REMOVED} on successful group
+     * {@link UserAuditTypes#USER_MEMBER_REMOVED} on successful group
      * update. Exercises the {@code isRemove=true} branch of
      * {@code recordSingleMembershipAuditEvent} end-to-end through the
      * entire pipeline.
@@ -266,13 +265,13 @@ public class AuditWiringIT {
                     1, received.size());
             AuditEvent event = received.get(0);
             assertEquals(SecurityAuditDomain.NAME, event.getDomain());
-            assertEquals(SecurityAuditTypes.USER_MEMBER_REMOVED, event.getType());
+            assertEquals(UserAuditTypes.USER_MEMBER_REMOVED, event.getType());
 
             Map<String, Object> payload = event.getPayload();
             assertTrue("commit.sessionId must be decorated",
                     payload.containsKey("commit.sessionId"));
-            assertEquals(groupPath, payload.get(SecurityAuditTypes.PAYLOAD_GROUP_PATH));
-            assertEquals(memberPath, payload.get(SecurityAuditTypes.PAYLOAD_MEMBER_PATH));
+            assertEquals(groupPath, payload.get(UserAuditTypes.PAYLOAD_GROUP_PATH));
+            assertEquals(memberPath, payload.get(UserAuditTypes.PAYLOAD_MEMBER_PATH));
         }
     }
 

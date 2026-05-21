@@ -73,14 +73,13 @@ import static org.junit.Assert.fail;
  * direct {@link AuditConfigurationImpl} install. Uses {@link MemoryNodeStore}
  * for a real but in-process Oak instance.
  * <p>
- * The fixture uses the v3 wiring path:
+ * Wiring path:
  * <ol>
  *   <li>{@link AuditConfigurationImpl#initialize(Whiteboard)} installs the
  *       audit feature toggle, listener registry, buffer and capture-time
  *       sink onto the whiteboard.</li>
  *   <li>{@code store.addObserver(audit.getDrainObserver())} attaches the
- *       {@link AuditDrainObserver} directly to the {@code MemoryNodeStore} —
- *       the bare-metal embedded path (design-v3-observer-drain.md §6 line 663).
+ *       {@link AuditDrainObserver} directly to the {@code MemoryNodeStore}.
  *       We don't use {@code Oak.with(Observer)} because we pass a custom
  *       whiteboard via {@code Oak.with(Whiteboard)}, which replaces Oak's
  *       default anonymous-override whiteboard and bypasses the auto-attach
@@ -113,9 +112,8 @@ public class AuditPipelineIT {
         received = new CopyOnWriteArrayList<>();
 
         auditConfig = new AuditConfigurationImpl();
-        // v3 wiring: audit pipeline is independent of SecurityProvider.
         // initialize() installs sinks/registry/buffer/toggle; the drain Observer
-        // is attached to the Oak below via oak.with(audit.getDrainObserver()).
+        // is attached per-store below via Observable.addObserver(...).
         auditConfig.initialize(whiteboard);
         securityProvider = SecurityProviderBuilder.newBuilder()
                 .withWhiteboard(whiteboard)
@@ -514,8 +512,10 @@ public class AuditPipelineIT {
      * Listener that throws {@code NoClassDefFoundError} (an
      * {@link Error}, not an {@link Exception}) from {@code onEvents}
      * must not prevent other listeners from receiving the event. Pins
-     * the catch-{@code Throwable} contract documented in
-     * {@code audit-spi/01-architecture.md §6}.
+     * the catch-{@code Throwable} contract: any {@link Throwable}
+     * subtype out of {@code onEvents} is isolated to the misbehaving
+     * listener, never escaping into the dispatch loop or the surrounding
+     * commit.
      */
     @Test
     public void listenerNoClassDefFoundErrorIsIsolated() throws Exception {

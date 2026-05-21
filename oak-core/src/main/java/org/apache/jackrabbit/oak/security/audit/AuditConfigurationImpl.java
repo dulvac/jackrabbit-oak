@@ -58,9 +58,9 @@ import org.slf4j.LoggerFactory;
  *     NodeStore. The observer drains the buffer on commit success and
  *     dispatches events to listeners.</li>
  * </ul>
- * Registered as {@link AuditConfiguration} only. Audit is no longer a
- * {@code SecurityConfiguration}: no commit-hook contribution, no
- * {@code SecurityProvider.getConfiguration(AuditConfiguration.class)} lookup.
+ * Registered as {@link AuditConfiguration} only — not a
+ * {@code SecurityConfiguration}, contributes no commit hooks, not reachable
+ * via {@code SecurityProvider.getConfiguration(AuditConfiguration.class)}.
  * Embedded callers obtain the drain observer via {@link #getDrainObserver()}.
  * <p>
  * When the feature toggle is disabled, capture is a no-op and the observer
@@ -121,9 +121,7 @@ public class AuditConfigurationImpl implements AuditConfiguration {
     // volatile. If a future change adds a "share the singleton across
     // pipelines" pattern OR cross-thread mutation of these fields, this
     // invariant breaks — at that point the fields MUST be made volatile (or
-    // properly immutable via constructor injection). Flagged by sage in
-    // the v3 invariant pass; recorded here so the next maintainer doesn't
-    // have to re-derive it.
+    // properly immutable via constructor injection).
     Feature featureToggle;
     AuditBuffer buffer;
     WhiteboardAuditEventListenerRegistry registry;
@@ -148,7 +146,7 @@ public class AuditConfigurationImpl implements AuditConfiguration {
      * close its subscription on the root NodeStore. {@code null} outside
      * the OSGi-active window; embedded callers manage observer lifetime
      * through their own {@code ((Observable) store).addObserver(...)} call
-     * (see class Javadoc and design-v3-observer-drain.md §6).
+     * (see class Javadoc).
      */
     ServiceRegistration<?> observerRegistration;
 
@@ -189,7 +187,7 @@ public class AuditConfigurationImpl implements AuditConfiguration {
      * {@link #getDrainObserver()}</strong> to obtain the Observer and attach
      * it to the root NodeStore. See {@link #getDrainObserver()} Javadoc for
      * the recommended attach pattern and the {@code Oak.with(Observer)}
-     * caveat. Also see design-v3-observer-drain.md §6.
+     * caveat.
      * <p>
      * <strong>Must be called exactly once per instance.</strong> Calling
      * it more than once orphans the previous {@code Feature} toggle and
@@ -245,8 +243,7 @@ public class AuditConfigurationImpl implements AuditConfiguration {
      * <em>not</em> a reliable embedded path when the caller also passes
      * {@code Oak.with(Whiteboard)} to replace Oak's default whiteboard:
      * the auto-attach at {@code Oak.java:300-302} is wired to the default
-     * whiteboard's anonymous override only. See
-     * design-v3-observer-drain.md §6.
+     * whiteboard's anonymous override only.
      * <p>
      * OSGi callers never invoke this method directly — {@code @Activate}
      * does, then publishes the singleton via
@@ -304,7 +301,9 @@ public class AuditConfigurationImpl implements AuditConfiguration {
      * noisy log.
      */
     public void dispose() {
-        // Order matters — see Risk 5 in 01-architecture.md (carried over from v2).
+        // Order matters: close the feature toggle first so any racing capture
+        // short-circuits before reaching state we're about to tear down; then
+        // stop discovery; then NOOP the static façades; then drain the buffer.
 
         // Precondition: the Observer must be detached from the root NodeStore
         // BEFORE we tear down the pipeline state it references. The outer
@@ -466,8 +465,8 @@ public class AuditConfigurationImpl implements AuditConfiguration {
                     // throws e.g. LinkageError must not fail the commit for unrelated work.
                     // JVM-level pathology (OutOfMemoryError) is caught here too but
                     // re-triggers on the next allocation and surfaces through normal channels.
-                    // Do not narrow this catch to RuntimeException without re-reading the
-                    // design discussion. See: design-v3-observer-drain.md §4.1.
+                    // Do not narrow this catch to RuntimeException — listener Throwables
+                    // (any kind) must not escape into the dispatch caller.
                     log.warn("AuditEventListener {} threw {} on fire-and-forget dispatch in domain '{}'; isolating from other listeners.",
                             listener.getClass().getName(), t.getClass().getSimpleName(), domain, t);
                 }

@@ -14,34 +14,38 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.jackrabbit.oak.spi.security.audit;
+package org.apache.jackrabbit.oak.spi.security.user;
+
+import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
+import org.apache.jackrabbit.oak.spi.security.audit.SecurityAuditDomain;
 
 /**
- * Stable type-string constants for events in the
- * {@link SecurityAuditDomain security} domain, plus their payload keys.
+ * Stable type-string constants and payload keys for user-management audit
+ * events. All events declared here share the
+ * {@link SecurityAuditDomain#NAME oak.security} domain.
  * <p>
- * Listeners discriminate among security events by combining
+ * Listener bundles discriminate user-management events by combining
  * {@code event.getDomain().equals(SecurityAuditDomain.NAME)} with
- * {@code event.getType().equals(SecurityAuditTypes.USER_MEMBER_ADDED)}
- * (or another constant defined here). Capture sites in Oak's security
- * modules use the matching factory in {@link SecurityAuditEvents} which
- * references these constants internally.
+ * {@code event.getType().equals(UserAuditTypes.USER_MEMBER_ADDED)}
+ * (or another constant declared here).
  * <p>
- * Each {@code USER_*} / {@code ACL_*} / future {@code TOKEN_*} constant
- * is paired with Javadoc describing which {@code PAYLOAD_*} keys its
- * events carry.
+ * Each {@code USER_*} constant is paired with Javadoc describing which
+ * {@code PAYLOAD_*} keys its events carry. Future sub-domains under
+ * {@code oak.security} (ACL, principal, token) declare their own
+ * type-string classes alongside their respective configuration packages.
  * <p>
- * <strong>Why a class rather than an interface.</strong> Per Effective
- * Java Item 22, constants belong in a {@code public final class} with a
- * private constructor — never in an interface. The older
- * {@code *Constants} interfaces still present in {@code oak-security-spi}
- * (e.g. {@code PrivilegeConstants}) predate that guidance and remain for
- * backward compatibility; this class follows the modern idiom.
- * Consequently, {@link SecurityAuditEvents} references these constants by
- * qualified name ({@code SecurityAuditTypes.USER_MEMBER_ADDED}); there is
- * no {@code implements SecurityAuditTypes} clause and none is expected.
+ * <strong>Asymmetric exposure.</strong> This class is the read-side
+ * vocabulary; the producer-side factories ({@code UserAuditEvents} in
+ * {@code oak-core}) are package-private by design. The partition is
+ * defense-in-depth — it raises the bar for casual forging of
+ * Oak-user-management events but does not prevent it (an external bundle
+ * can still call {@link AuditEvent#of(String, String, java.util.Map)}
+ * directly with this domain + a type from this class). Listeners that
+ * need to distinguish Oak-attested events from fire-and-forget emissions
+ * MUST check the {@code commit.*} keys in the payload — see the trust
+ * contract on {@link AuditEvent#getPayload()}.
  */
-public final class SecurityAuditTypes {
+public final class UserAuditTypes {
 
     // ── Type strings ──────────────────────────────────────────────────
 
@@ -96,7 +100,7 @@ public final class SecurityAuditTypes {
      */
     public static final String PAYLOAD_FAILED_IDS = "failedIds";
 
-    private SecurityAuditTypes() {
+    private UserAuditTypes() {
         // constants
     }
 }

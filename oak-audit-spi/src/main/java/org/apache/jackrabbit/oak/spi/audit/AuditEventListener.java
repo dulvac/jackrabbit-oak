@@ -37,7 +37,7 @@ import org.osgi.annotation.versioning.ConsumerType;
  * broadly to ensure that one misconfigured listener (e.g., a
  * {@link LinkageError} from a missing transitive dependency) cannot
  * prevent other listeners from receiving events or abort the surrounding
- * commit. See §6 of {@code 01-architecture.md} for the rationale.
+ * commit.
  * <p>
  * Listener invocation order is determined by {@link #getRank()} (higher
  * value first). The dispatcher applies a stable sort, so listeners with

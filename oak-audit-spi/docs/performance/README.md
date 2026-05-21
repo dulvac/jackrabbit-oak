@@ -56,7 +56,7 @@ Net: **a handful of nanoseconds per commit, bounded by NOOP method dispatch**.
 
 ## Audit-ON benchmark
 
-The deferred audit-ON fixture is now live as `Oak-MemoryNS-Audit`. It wires `AuditConfigurationImpl` via `SecurityProviderBuilder`, flips the `FT_AUDIT` toggle ON, and registers a no-op `AuditEventListener` for the `security` domain — so the capture sites in `UserManagerImpl#recordSingleMembershipAuditEvent` actually allocate, buffer, and dispatch events instead of short-circuiting at `AuditEvents.isEnabledFor("security")`.
+The deferred audit-ON fixture is now live as `Oak-MemoryNS-Audit`. It wires `AuditConfigurationImpl` directly (no SecurityProvider involvement — audit is no longer a `SecurityConfiguration`), attaches the drain Observer to each MemoryNodeStore, flips the `FT_AUDIT` toggle ON, and registers a no-op `AuditEventListener` for the `oak.security` domain — so the capture sites in `UserManagerImpl#recordSingleMembershipAuditEvent` actually allocate, buffer, and dispatch events instead of short-circuiting at `AuditEvents.isEnabledFor(SecurityAuditDomain.NAME)`.
 
 Implementation: `OakFixture.getMemoryNSWithAudit(long)` + `OakRepositoryFixture.getMemoryNSWithAudit(long)`, wired into `BenchmarkRunner.allFixtures`. Sanity-tested by `MemoryNSWithAuditFixtureTest` in `oak-run-commons` — fails the build if the fixture ever regresses into the silent audit-OFF state that bit Phase 3.
 

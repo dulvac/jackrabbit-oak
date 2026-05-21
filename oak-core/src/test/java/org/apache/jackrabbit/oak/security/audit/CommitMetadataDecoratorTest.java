@@ -45,7 +45,7 @@ public class CommitMetadataDecoratorTest {
 
     @Test
     public void decoratesPayloadWithCommitMetadata() {
-        AuditEvent in = original("security", "member.added", Map.of("group", "/g", "member", "/m"));
+        AuditEvent in = original("oak.security", "member.added", Map.of("group", "/g", "member", "/m"));
         CommitInfo info = new CommitInfo("session-1", "alice", Map.of(), false);
         List<AuditEvent> out = CommitMetadataDecorator.decorate(List.of(in), info);
         assertEquals(1, out.size());
@@ -81,7 +81,7 @@ public class CommitMetadataDecoratorTest {
 
     @Test
     public void systemCommitUserIdIsOakUnknown() {
-        AuditEvent in = original("security", "system.event", Map.of());
+        AuditEvent in = original("oak.security", "system.event", Map.of());
         // CommitInfo with null userId resolves to OAK_UNKNOWN
         CommitInfo info = CommitInfo.EMPTY;
         AuditEvent decorated = CommitMetadataDecorator.decorate(List.of(in), info).get(0);
@@ -91,9 +91,9 @@ public class CommitMetadataDecoratorTest {
 
     @Test
     public void preservesOrderOfEvents() {
-        AuditEvent a = original("security", "a", Map.of());
-        AuditEvent b = original("security", "b", Map.of());
-        AuditEvent c = original("security", "c", Map.of());
+        AuditEvent a = original("oak.security", "a", Map.of());
+        AuditEvent b = original("oak.security", "b", Map.of());
+        AuditEvent c = original("oak.security", "c", Map.of());
         CommitInfo info = new CommitInfo("s", "u", Map.of(), false);
         List<AuditEvent> out = CommitMetadataDecorator.decorate(asList(a, b, c), info);
         assertEquals("a", out.get(0).getType());
@@ -113,7 +113,7 @@ public class CommitMetadataDecoratorTest {
 
     @Test
     public void decoratorOverwritesCallerProvidedSessionId() {
-        AuditEvent in = original("security", "x",
+        AuditEvent in = original("oak.security", "x",
                 Map.of(CommitMetadataDecorator.KEY_SESSION_ID, "spoofed-session"));
         CommitInfo info = new CommitInfo("real-session", "alice", Map.of(), false);
         AuditEvent decorated = CommitMetadataDecorator.decorate(List.of(in), info).get(0);
@@ -124,7 +124,7 @@ public class CommitMetadataDecoratorTest {
 
     @Test
     public void decoratorOverwritesCallerProvidedUserId() {
-        AuditEvent in = original("security", "x",
+        AuditEvent in = original("oak.security", "x",
                 Map.of(CommitMetadataDecorator.KEY_USER_ID, "admin"));
         CommitInfo info = new CommitInfo("s", "alice", Map.of(), false);
         AuditEvent decorated = CommitMetadataDecorator.decorate(List.of(in), info).get(0);
@@ -135,7 +135,7 @@ public class CommitMetadataDecoratorTest {
 
     @Test
     public void decoratorOverwritesCallerProvidedTimestamp() {
-        AuditEvent in = original("security", "x",
+        AuditEvent in = original("oak.security", "x",
                 Map.of(CommitMetadataDecorator.KEY_TIMESTAMP, 99999999L));
         // CommitInfo's date is set internally to System.currentTimeMillis()
         // at construction; we read the actual value via getDate() to
@@ -155,7 +155,7 @@ public class CommitMetadataDecoratorTest {
      */
     @Test
     public void decoratorOverwritesAcrossValueTypes() {
-        AuditEvent in = original("security", "x",
+        AuditEvent in = original("oak.security", "x",
                 Map.of(CommitMetadataDecorator.KEY_TIMESTAMP, "definitely-a-string-not-a-long"));
         CommitInfo info = new CommitInfo("s", "u", Map.of(), false);
         AuditEvent decorated = CommitMetadataDecorator.decorate(List.of(in), info).get(0);
@@ -177,7 +177,7 @@ public class CommitMetadataDecoratorTest {
      */
     @Test
     public void decoratorAddsCommitKeysWhenAbsent() {
-        AuditEvent in = original("security", "x", Map.of());
+        AuditEvent in = original("oak.security", "x", Map.of());
         CommitInfo info = new CommitInfo("s", "u", Map.of(), false);
         AuditEvent decorated = CommitMetadataDecorator.decorate(List.of(in), info).get(0);
         assertTrue(decorated.getPayload().containsKey(CommitMetadataDecorator.KEY_SESSION_ID));
@@ -189,7 +189,7 @@ public class CommitMetadataDecoratorTest {
 
     @Test
     public void decoratedPayloadIsUnmodifiable() {
-        AuditEvent in = original("security", "x", Map.of("k", "v"));
+        AuditEvent in = original("oak.security", "x", Map.of("k", "v"));
         CommitInfo info = new CommitInfo("s", "u", Map.of(), false);
         AuditEvent decorated = CommitMetadataDecorator.decorate(List.of(in), info).get(0);
         try {

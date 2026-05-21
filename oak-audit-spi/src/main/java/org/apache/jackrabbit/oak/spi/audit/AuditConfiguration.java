@@ -24,13 +24,13 @@ import org.osgi.annotation.versioning.ProviderType;
  * Oak components can probe the pipeline without depending on its
  * implementation class.
  *
- * <p><strong>Wiring.</strong> Audit is a top-level Oak concern in v3 —
- * <em>not</em> a {@code SecurityConfiguration}. Implementations are
- * registered on the {@link org.apache.jackrabbit.oak.spi.whiteboard.Whiteboard}
- * (and, in OSGi deployments, as an OSGi service of this type). The pipeline
+ * <p><strong>Wiring.</strong> Audit is a top-level Oak concern, not a
+ * {@code SecurityConfiguration}. Implementations are registered on the
+ * {@link org.apache.jackrabbit.oak.spi.whiteboard.Whiteboard} (and, in
+ * OSGi deployments, as an OSGi service of this type). The pipeline
  * subscribes to the root NodeStore's
  * {@link org.apache.jackrabbit.oak.spi.commit.Observable} for commit
- * notifications; commit hook contribution is no longer used.
+ * notifications; it contributes no commit hooks.
  *
  * <p><strong>Cardinality:</strong> unary optional. Multiple implementations
  * are not supported — the {@link AuditBufferLifecycle} is a singleton install
@@ -47,9 +47,8 @@ import org.osgi.annotation.versioning.ProviderType;
 public interface AuditConfiguration {
 
     /**
-     * Name of the audit configuration. Stable across releases. Retained
-     * from the v2 SPI surface to keep identity for tooling that may have
-     * coded against the constant.
+     * Name of the audit configuration. Stable across releases — tooling
+     * may have coded against the constant.
      */
     String NAME = "org.apache.jackrabbit.oak.audit";
 

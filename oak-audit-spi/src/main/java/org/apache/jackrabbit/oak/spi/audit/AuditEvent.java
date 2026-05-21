@@ -53,7 +53,7 @@ public interface AuditEvent {
      * an {@link AuditEventListener} only receives events whose
      * {@code getDomain()} matches its own {@link AuditEventListener#getDomain()}.
      *
-     * @return non-null domain name (e.g. {@code "security"}, {@code "aem.content"}).
+     * @return non-null domain name (e.g. {@code "oak.security"}, {@code "aem.content"}).
      */
     @NotNull
     String getDomain();
@@ -91,10 +91,10 @@ public interface AuditEvent {
      * implementation returns an empty map; concrete event types override
      * this to expose typed accessors and include their fields here.
      * <p>
-     * For commit-attached events, the {@code DispatchAuditEventsHook} adds
-     * entries with the keys {@code commit.sessionId}, {@code commit.userId},
-     * and {@code commit.timestamp} at drain time. Fire-and-forget events
-     * do not carry these entries.
+     * For commit-attached events, Oak's drain path adds entries with the
+     * keys {@code commit.sessionId}, {@code commit.userId}, and
+     * {@code commit.timestamp} when the buffer is drained on commit
+     * success. Fire-and-forget events do not carry these entries.
      * <p>
      * <strong>Trust contract.</strong> Oak <em>unconditionally overrides</em>
      * any caller-supplied values for the {@code commit.sessionId},

@@ -227,7 +227,9 @@ public interface AuditConfiguration {
 
 The current file `oak-security-spi/src/main/java/org/apache/jackrabbit/oak/spi/security/audit/AuditConfiguration.java` is deleted. The accompanying test `AuditConfigurationTest.java` is deleted.
 
-The peer files in the same package stay where they are (`SecurityAuditDomain`, `SecurityAuditEvents`, `SecurityAuditTypes`, `package-info.java`) — these are security-DOMAIN constants and helpers; they remain a legitimate part of `oak-security-spi` because they describe events whose meaning IS security-related, even though the pipeline carrying them is now domain-neutral.
+The peer files in the same package stay where they are (`SecurityAuditDomain`, `package-info.java`) — these are security-DOMAIN constants; they remain a legitimate part of `oak-security-spi` because they describe events whose meaning IS security-related, even though the pipeline carrying them is now domain-neutral.
+
+**Post-freeze cleanup (commit `b1960e81a4`):** further consolidation happened after design freeze. `SecurityAuditEvents` was deleted; its producer-side helpers moved into a package-private `UserAuditEvents` in `oak-core/.../security/user/`, co-located with the capture site (`UserManagerImpl`). `SecurityAuditTypes` was renamed to `UserAuditTypes` and moved alongside the user SPI at `oak-security-spi/.../spi/security/user/`. `SecurityAuditDomain.NAME` changed value from `"security"` to `"oak.security"` to namespace the domain. The Module Layout table in `oak-doc/src/site/markdown/security/audit.md` reflects the post-cleanup shape and is the canonical reference for the current package layout.
 
 Consumers that imported `org.apache.jackrabbit.oak.spi.security.audit.AuditConfiguration` MUST switch to `org.apache.jackrabbit.oak.spi.audit.AuditConfiguration`. On the fork this is a one-shot rename — we control all callers. On upstreaming, the path is additive-then-removed (add the new interface in a release; mark the old one `@Deprecated` for one release; remove). Alex's input on the deprecation cadence is solicited.
 
@@ -235,7 +237,7 @@ Consumers that imported `org.apache.jackrabbit.oak.spi.security.audit.AuditConfi
 
 **`oak-audit-spi/.../spi/audit/package-info.java`** — bump from `@Version("1.0.0")` to `@Version("1.1.0")`. Per team-lead's call: adding the `AuditConfiguration` interface is textbook binary-additive (every existing consumer that imported `AuditEvent`, `AuditEventListener`, `AuditEvents`, `AuditEventEmitter`, `AuditBufferLifecycle`, `AuditEventAware` continues to work unchanged; the new interface is opt-in). OSGi version semantics measure binary compatibility, not human notions of "package enlargement". `1.1.0` is the correct minor bump; `2.0.0` would falsely signal a breaking change to bnd baseline-check tooling and downstream consumers.
 
-**`oak-security-spi/.../spi/security/audit/package-info.java`** — MAJOR bump required because `AuditConfiguration` is REMOVED from this package (it moves to `oak-audit-spi`). The bnd baseline check will flag the removal otherwise. Whatever the current `@Version` of the security-audit subpackage is (likely `1.0.0` or `1.1.0`), increment the major component. The remaining files in the package (`SecurityAuditDomain`, `SecurityAuditEvents`, `SecurityAuditTypes`) are unchanged.
+**`oak-security-spi/.../spi/security/audit/package-info.java`** — MAJOR bump required because `AuditConfiguration` is REMOVED from this package (it moves to `oak-audit-spi`). The bnd baseline check will flag the removal otherwise. Whatever the current `@Version` of the security-audit subpackage is (likely `1.0.0` or `1.1.0`), increment the major component. Post-freeze cleanup (see §3.2): the package was further trimmed — only `SecurityAuditDomain` and `package-info.java` remain in `spi/security/audit/`; `SecurityAuditTypes` moved to `spi/security/user/` (as `UserAuditTypes`) and `SecurityAuditEvents` was deleted (helpers moved to a package-private `UserAuditEvents` in `oak-core/.../security/user/`). MAJOR bump is still the correct call for both packages because of the `AuditConfiguration` removal plus the relocations.
 
 ---
 
@@ -797,7 +799,7 @@ All eight invariants confirmed. Design is locked on this foundation.
 Coverage gates:
 - `oak-audit-spi`: 100% line / 100% branch (preserves design.md §11). The NEW `AuditConfiguration.Noop.isActive()` body needs one line of test coverage.
 - `oak-core` audit subpackage: covered by named tests per AGENTS.md's >80% rule. The new `AuditDrainObserver` should be fully covered.
-- `oak-security-spi`: 100% line / 100% branch UNCHANGED. We're REMOVING the AuditConfiguration interface from this module — no new gate concerns. The remaining audit-domain files (`SecurityAuditDomain`, `SecurityAuditEvents`, `SecurityAuditTypes`) keep their existing coverage.
+- `oak-security-spi`: 100% line / 100% branch UNCHANGED. We're REMOVING the AuditConfiguration interface from this module — no new gate concerns. The remaining audit-domain file in `spi/security/audit/` — `SecurityAuditDomain` — keeps its existing coverage. (Post-freeze cleanup: `SecurityAuditEvents` was deleted; `SecurityAuditTypes` was renamed to `UserAuditTypes` and moved to `spi/security/user/`, where it is covered alongside the rest of the user SPI. See §3.2.)
 
 ---
 
@@ -814,7 +816,7 @@ For the record, so future maintainers don't try to revive a vetoed path or hunt 
 - ✅ Fire-and-forget dispatch path — UNCHANGED.
 - ✅ Trust model in design.md §9 — UNCHANGED.
 - ✅ MutableRoot lifecycle callouts (3 lines) — UNCHANGED.
-- ✅ `SecurityAuditDomain`, `SecurityAuditEvents`, `SecurityAuditTypes` (security-domain constants/helpers) — UNCHANGED.
+- ✅ `SecurityAuditDomain` (security-domain constant) — UNCHANGED in location. (Post-freeze cleanup: `SecurityAuditDomain.NAME` changed value from `"security"` to `"oak.security"`; `SecurityAuditEvents` was deleted (replaced by package-private `UserAuditEvents` in `oak-core/.../security/user/`); `SecurityAuditTypes` was renamed to `UserAuditTypes` and moved to `oak-security-spi/.../spi/security/user/`. See §3.2.)
 - ✅ UserManagerImpl capture sites — UNCHANGED.
 - ✅ `oak-store-spi` — NOT touched (no new SPIs added there).
 - ✅ `oak-core/Oak.java` — NOT touched.

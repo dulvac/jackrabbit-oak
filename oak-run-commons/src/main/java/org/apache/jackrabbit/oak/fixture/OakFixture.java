@@ -172,8 +172,8 @@ public abstract class OakFixture {
      * which would clobber each other under repeated init.
      * <p>
      * A NOOP {@link AuditEventListener} is registered for the
-     * {@link SecurityAuditDomain#NAME security} domain so that
-     * {@code AuditEvents.isEnabledFor("security")} returns {@code true}
+     * {@link SecurityAuditDomain#NAME oak.security} domain so that
+     * {@code AuditEvents.isEnabledFor("oak.security")} returns {@code true}
      * and the capture sites in
      * {@code org.apache.jackrabbit.oak.security.user.UserManagerImpl}
      * (member add/remove) actually allocate, buffer and dispatch
@@ -195,16 +195,11 @@ public abstract class OakFixture {
                 }
                 whiteboard = new DefaultWhiteboard();
                 auditConfig = new AuditConfigurationImpl();
-                // Audit is no longer a SecurityConfiguration in v3 — initialize
-                // the pipeline directly (registers FT_AUDIT toggle, starts the
-                // listener tracker, installs AuditBuffer + BufferSink as the
-                // JVM-static sinks). The drain observer is attached per-store
-                // below via store.addObserver(...) — the bare-metal embedded
-                // path (design-v3-observer-drain.md §6 line 663). We don't use
-                // Oak.with(Observer) because we pass a custom whiteboard via
-                // .with(whiteboard), which bypasses Oak's default-whiteboard
-                // auto-attach at Oak.java:300-302.
                 auditConfig.initialize(whiteboard);
+                // Drain observer is attached per-store below via
+                // store.addObserver(...). Oak.with(Observer) auto-attaches only
+                // against Oak's default whiteboard (Oak.java:300-302); our
+                // .with(whiteboard) call replaces it.
                 securityProvider = SecurityProviderBuilder.newBuilder()
                         .withWhiteboard(whiteboard)
                         .build();

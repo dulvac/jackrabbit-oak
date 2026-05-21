@@ -35,9 +35,8 @@ import org.slf4j.LoggerFactory;
  * {@link Observer} that drains the {@link AuditBuffer} on commit success
  * and dispatches captured events to all registered {@link AuditEventListener}s.
  * <p>
- * Replaces the v2 {@code SnapshotAuditBufferHook} + {@code DispatchAuditEventsHook}
- * pair. The observer fires synchronously on the same thread as the
- * surrounding {@code MutableRoot.commit()} — by the contract of
+ * The observer fires synchronously on the same thread as the surrounding
+ * {@code MutableRoot.commit()} — by the contract of
  * {@link org.apache.jackrabbit.oak.spi.commit.Observable#addObserver}
  * the call is made from the commit dispatch path, before
  * {@code NodeStore.merge(...)} returns. This preserves the
@@ -67,9 +66,9 @@ import org.slf4j.LoggerFactory;
  *   would mask a different kind of failure entirely. The outer Throwable
  *   barrier guarantees audit never masquerades as a commit failure.</li>
  *   <li><strong>Inner barrier</strong> per listener (in {@code dispatchOne}).
- *   Preserves the v2 invariant: a misconfigured consumer bundle whose
- *   listener throws {@link LinkageError}, {@link OutOfMemoryError}, or
- *   other {@link Throwable} subtypes does not stop other listeners.</li>
+ *   A misconfigured consumer bundle whose listener throws
+ *   {@link LinkageError}, {@link OutOfMemoryError}, or other {@link Throwable}
+ *   subtypes does not stop other listeners.</li>
  * </ul>
  *
  * <p><strong>DO NOT wrap this Observer in {@code BackgroundObserver}.</strong>
@@ -109,8 +108,8 @@ final class AuditDrainObserver implements Observer {
         // audit pipeline can never destabilise unrelated observer work. The
         // per-listener barrier inside dispatchOne catches listener-induced
         // failures; this outer catch protects against drain/decorator bugs.
-        // Do NOT narrow this catch to RuntimeException without re-reading
-        // design-v3-observer-drain.md §9 invariant I8.
+        // Do NOT narrow this catch to RuntimeException — any Throwable
+        // escaping here masquerades as a commit failure to the merge caller.
         try {
             doContentChanged(info);
         } catch (Throwable t) {
@@ -172,8 +171,8 @@ final class AuditDrainObserver implements Observer {
             // throws e.g. LinkageError must not crash the commit-dispatch path for
             // unrelated work. JVM-level pathology (OutOfMemoryError) is caught here
             // too but re-triggers on the next allocation and surfaces through normal
-            // channels. Do not narrow this catch to RuntimeException without
-            // re-reading the design discussion. See: design-v3-observer-drain.md §4.1.
+            // channels. Do not narrow this catch to RuntimeException — listener
+            // Throwables (any kind) must not escape into the dispatch loop.
             log.warn("AuditEventListener {} threw {} for {} event(s) in domain '{}'; isolating from other listeners.",
                     listener.getClass().getName(), t.getClass().getSimpleName(),
                     events.size(), listener.getDomain(), t);

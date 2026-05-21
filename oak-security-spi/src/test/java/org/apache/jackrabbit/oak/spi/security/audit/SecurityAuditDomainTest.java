@@ -27,7 +27,7 @@ public class SecurityAuditDomainTest {
 
     @Test
     public void nameConstantIsStable() {
-        assertEquals("security", SecurityAuditDomain.NAME);
+        assertEquals("oak.security", SecurityAuditDomain.NAME);
     }
 
     @Test

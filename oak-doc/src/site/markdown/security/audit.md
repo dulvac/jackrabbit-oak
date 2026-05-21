@@ -50,8 +50,8 @@ and bundle-emitted custom events through one entry point.
 | Module | Role |
 |---|---|
 | `oak-audit-spi`     | Domain-neutral SPI: [AuditEvent], [AuditEventListener], [AuditEventEmitter], `AuditEvents` static façade, and [AuditConfiguration] (typed handle on the pipeline's runtime state). |
-| `oak-security-spi`  | Security-domain constants and helpers only: `SecurityAuditDomain.NAME`, `SecurityAuditTypes` (type-string constants like `USER_MEMBER_ADDED` paired with payload keys like `PAYLOAD_GROUP_PATH`), `SecurityAuditEvents` (ergonomic factories for security capture sites). Depends on `oak-audit-spi`. **`AuditConfiguration` itself moved to `oak-audit-spi`** because audit is no longer modeled as a `SecurityConfiguration` (see below). |
-| `oak-core`          | Pipeline implementation: listener registry, commit-attached buffer, `AuditDrainObserver` (a `NodeStore` `Observer` that drains the buffer on commit success), `AuditEventEmitterImpl`, `AuditConfigurationImpl`. |
+| `oak-security-spi`  | Security-domain constants: `SecurityAuditDomain.NAME` (the `"oak.security"` domain string) and per-sub-domain type-string classes (e.g., `UserAuditTypes` in the `spi.security.user` package). Depends on `oak-audit-spi`. `AuditConfiguration` lives in `oak-audit-spi`, not here — audit is not a `SecurityConfiguration`. |
+| `oak-core`          | Pipeline implementation: listener registry, commit-attached buffer, `AuditDrainObserver` (a `NodeStore` `Observer` that drains the buffer on commit success), `AuditEventEmitterImpl`, `AuditConfigurationImpl`. Producer-side factories (e.g., `UserAuditEvents` for membership capture sites) are package-private to their owning sub-package. |
 
 Consumer bundles depend on `oak-audit-spi` only. No transitive dependency on
 `oak-core`, `oak-jcr`, or `oak-security-spi` is required to implement a
@@ -72,7 +72,7 @@ public interface AuditEvent {
 ```
 
 - **Domain** — namespace identifying the event source category. Built-in
-  domains include `"security"` (defined by `SecurityAuditDomain.NAME`).
+  domains include `"oak.security"` (defined by `SecurityAuditDomain.NAME`).
   Bundles defining new event types choose their own domain string; the SPI
   imposes no schema.
 - **Type** — stable identifier within the domain (e.g.
@@ -88,15 +88,17 @@ built via the static factory `AuditEvent.of(domain, type, payload)`;
 consumers discriminate events by inspecting `getDomain()` + `getType()`
 rather than by `instanceof` checks against typed subclasses.
 
-The `security` domain pins its type-string and payload-key constants in
-the `SecurityAuditTypes` class (e.g., `USER_MEMBER_ADDED`,
-`PAYLOAD_GROUP_PATH`). Security capture sites inside Oak use the
-`SecurityAuditEvents` helper class (e.g.
-`SecurityAuditEvents.memberAdded(groupPath, memberPath)`) which wraps
-the factory + constants for ergonomic call sites; listeners receive
-plain `AuditEvent` instances and never see the helper. Bundles emitting
-custom events implement `AuditEvent` directly or call
-`AuditEvent.of(...)` with their own domain string.
+The `oak.security` domain pins its type-string and payload-key constants
+in per-sub-domain classes alongside the security area they describe —
+e.g., user-membership types live in `UserAuditTypes` in the
+`spi.security.user` package (`USER_MEMBER_ADDED`, `PAYLOAD_GROUP_PATH`,
+etc.). Capture sites inside Oak use package-local factory helpers
+(e.g., `UserAuditEvents.memberAdded(groupPath, memberPath)` in
+`oak-core/.../security/user/`) which wrap the factory + constants for
+ergonomic call sites; listeners receive plain `AuditEvent` instances
+and never see the helper. Bundles emitting custom events implement
+`AuditEvent` directly or call `AuditEvent.of(...)` with their own
+domain string.
 
 <a name="commit_metadata_keys"></a>
 #### Commit metadata payload keys
@@ -334,7 +336,7 @@ public class SiemForwarder implements AuditEventListener {
 
     @Override
     public String getDomain() {
-        return "security";
+        return "oak.security";
     }
 
     @Override
@@ -378,7 +380,7 @@ Contract notes:
 The fire-and-forget producer surface is open by design.
 
 - Any bundle that resolves `AuditEventEmitter` can emit any event for any
-  domain, including `"security"`. There is no compile-time check, no reserved
+  domain, including `"oak.security"`. There is no compile-time check, no reserved
   domain registry, and no runtime gate on the emitting bundle.
 - Listeners therefore receive caller-asserted data. An event arriving through
   `onEvents` reflects the emitting bundle's claim, not Oak-verified truth.
@@ -405,7 +407,7 @@ Recommended consumer-side discipline:
 |---|---|
 | Distinguish Oak-attested mutations from caller-asserted events. | Inspect for `commit.sessionId` in the payload. Present implies commit-attached. |
 | Restrict trusted producers. | Maintain a consumer-side allowlist of trusted domain prefixes and reject unknown domains. |
-| Compliance audit (Oak-verified writes only). | Subscribe to `"security"` and filter for events carrying the `commit.*` keys. |
+| Compliance audit (Oak-verified writes only). | Subscribe to `"oak.security"` and filter for events carrying the `commit.*` keys. |
 
 <!-- references -->
 [AuditEvent]: /oak/docs/apidocs/org/apache/jackrabbit/oak/spi/audit/AuditEvent.html

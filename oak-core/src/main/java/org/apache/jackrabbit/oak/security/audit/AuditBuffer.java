@@ -71,26 +71,15 @@ final class AuditBuffer implements AuditBufferLifecycle.Listener {
             bySession = new HashMap<>(4);
             tl.set(bySession);
         }
-        List<AuditEvent> list = bySession.get(sessionId);
-        if (list == null) {
-            list = new ArrayList<>(4);
-            bySession.put(sessionId, list);
-        }
+        List<AuditEvent> list = bySession.computeIfAbsent(sessionId, k -> new ArrayList<>(4));
         list.add(event);
     }
 
     /**
-     * Returns the staged events for {@code sessionId} <strong>without</strong>
-     * removing them from the buffer. Used by
-     * {@link SnapshotAuditBufferHook} so that, if a later hook in the
-     * chain throws and the merge retries, the events are still present
-     * on the next attempt. The {@link DispatchAuditEventsHook} (on
-     * commit success) and {@code AuditBufferLifecycle.onCommitFailed} /
-     * {@code .onRefresh} (on failure) are the authorities that clear
-     * the buffer.
-     * <p>
-     * The returned list is the live backing list — callers must not
-     * mutate it.
+     * Test-only inspector. Returns the staged events for {@code sessionId}
+     * <strong>without</strong> removing them. The returned list is the
+     * live backing list — callers must not mutate it. Production drain
+     * goes through {@link #drain(String)}.
      *
      * @param sessionId session id, non-null.
      * @return the staged events, or {@code null} when nothing was
@@ -136,22 +125,10 @@ final class AuditBuffer implements AuditBufferLifecycle.Listener {
      * calls {@link #record(String, AuditEvent)}, {@link #drain(String)},
      * or the {@code AuditBufferLifecycle} listener is invoked. The
      * resulting residual leak is bounded by
-     * {@code worker-pool × in-flight sessions}; acknowledged for v1.
+     * {@code worker-pool × in-flight sessions}.
      */
     void clearAll() {
         tl.remove();
-    }
-
-    /**
-     * Test-only accessor. Returns {@code true} when the {@link ThreadLocal}
-     * backing map has been allocated on the current thread — i.e. at
-     * least one {@link #record(String, AuditEvent)} call has happened
-     * since the last full drain.
-     *
-     * @return whether the per-thread map has been allocated.
-     */
-    boolean isAllocatedOnCurrentThread() {
-        return tl.get() != null;
     }
 
     //----------------------------------------< AuditBufferLifecycle.Listener >---

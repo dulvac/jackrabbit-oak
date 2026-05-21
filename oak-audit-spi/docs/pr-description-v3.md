@@ -14,6 +14,14 @@ OAK-XXXXX: audit-spi v3 — Observer-based commit-attached drain, decouple from 
 
 (JIRA number TBD per team-lead's filing cadence.)
 
+## Design at a glance
+
+For a one-page text/ASCII view of the audit pipeline — both producer paths,
+key components, and module layering — see
+[`oak-audit-spi/docs/design-overview.md`](oak-audit-spi/docs/design-overview.md).
+Full design spec is in
+[`oak-audit-spi/docs/design-v3-observer-drain.md`](oak-audit-spi/docs/design-v3-observer-drain.md).
+
 ## Summary
 
 Replaces the audit pipeline's pair of commit hooks (`SnapshotAuditBufferHook` +
@@ -216,7 +224,7 @@ checklist held byte-identical or strictly stronger. Highlights:
 - [x] `AuditWiringIT` UserManagerImpl → buffer → Observer → listener
        end-to-end with `commit.*` payload assertions.
 - [ ] Manual smoke in an OSGi container with `FT_AUDIT` flipped ON and a
-       listener subscribed to the `security` domain (pre-merge sanity).
+       listener subscribed to the `oak.security` domain (pre-merge sanity).
 - [ ] Confirm no transitive impact in `oak-jcr`, `oak-store-document`,
        `oak-segment-tar`, `oak-upgrade` (alex's cross-Oak sanity in #13
        found no callers; CI will confirm).

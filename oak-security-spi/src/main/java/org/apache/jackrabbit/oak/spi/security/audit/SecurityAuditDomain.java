@@ -17,17 +17,26 @@
 package org.apache.jackrabbit.oak.spi.security.audit;
 
 /**
- * Domain constants for security audit events. Future domains (e.g.
- * indexing, query, blob) will define their own constants alongside this
- * one in the same {@code audit} subpackage.
+ * Domain constant for events produced by Oak security modules.
+ * <p>
+ * Sub-domains under {@code oak.security} (user, ACL, principal, token)
+ * share this single domain string and discriminate via the event
+ * {@code type} field — see {@link org.apache.jackrabbit.oak.spi.security.user.UserAuditTypes}
+ * for the user-management type vocabulary. Other Oak areas (e.g.
+ * indexing, query, blob) declare their own domain-constant classes in
+ * their respective SPI modules — not here.
  */
 public final class SecurityAuditDomain {
 
     /**
      * Domain name for events produced by Oak security modules
      * (user management, ACLs, principal management, tokens, etc.).
+     * Namespaced with the {@code oak.} prefix so listeners hosted in
+     * mixed environments (Sling, AEM, third-party bundles) can
+     * disambiguate Oak's security events from same-named domains
+     * defined by other layers.
      */
-    public static final String NAME = "security";
+    public static final String NAME = "oak.security";
 
     private SecurityAuditDomain() {
         // constants class

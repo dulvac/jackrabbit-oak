@@ -49,8 +49,7 @@ import static org.junit.Assert.fail;
 /**
  * Behavioural coverage for {@link AuditConfigurationImpl} — both the
  * {@link AuditConfigurationImpl#isActive() isActive()} reporter and the
- * lifecycle / drain-observer accessor surface added in v3 (per
- * {@code design-v3-observer-drain.md} §4.2 + §10 row 6).
+ * lifecycle / drain-observer accessor surface.
  * <p>
  * Two test layers:
  * <ul>

@@ -44,7 +44,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Unit tests for {@link AuditDrainObserver}, the v3 {@code Observer} that
+ * Unit tests for {@link AuditDrainObserver}, the {@code Observer} that
  * drains the per-thread {@link AuditBuffer} on commit success and dispatches
  * the captured events to registered {@link AuditEventListener}s.
  * <p>
@@ -64,8 +64,7 @@ import static org.junit.Assert.assertTrue;
  * are all non-null, and {@code BufferSink} ensures only well-formed
  * {@link AuditEvent} instances enter the buffer. The barrier exists as
  * defense in depth (a misbehaving event from a buggy producer must not
- * masquerade as a commit failure to the merge thread —
- * see {@code design-v3-observer-drain.md} §9 invariant I8). To exercise
+ * masquerade as a commit failure to the merge thread). To exercise
  * that barrier in a test, {@link #poisonedEventGetDomainThrowsCaughtByOuterBarrier}
  * stages an event whose {@code getDomain()} throws. If this WARN ever
  * fires in CI on a non-test path, treat it as a bug.
@@ -259,8 +258,7 @@ public class AuditDrainObserverTest {
     /**
      * Per-listener {@code dispatchOne} {@link RuntimeException} isolation:
      * a listener whose {@code onEvents} throws does not stop other
-     * listeners on the same domain from receiving the event. Preserves
-     * the v2 invariant byte-for-byte.
+     * listeners on the same domain from receiving the event.
      */
     @Test
     public void listenerRuntimeExceptionDoesNotPreventOtherListeners() {

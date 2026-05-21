@@ -210,10 +210,10 @@ public class SecurityProviderRegistrationTest extends AbstractSecurityTest {
 
         SecurityProvider service = context.getService(SecurityProvider.class);
         assertNotNull(service);
-        // 6 configurations: authentication, authorization, user, privilege,
-        // principal, token. Audit is no longer a SecurityConfiguration in v3 —
-        // the pipeline is owned by AuditConfigurationImpl and registered as
-        // an Observer service instead.
+        // 6 SecurityConfigurations: authentication, authorization, user,
+        // privilege, principal, token. Audit is not a SecurityConfiguration —
+        // it's owned by AuditConfigurationImpl and registered separately as
+        // an Observer service.
         assertEquals(6, IterableUtils.size(IterableUtils.filter(service.getConfigurations(), x -> x != null)));
     }
 
