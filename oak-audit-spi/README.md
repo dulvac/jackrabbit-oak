@@ -19,17 +19,13 @@ Oak-internal storage modules.
 Further reading
 ---------------
 
-- [`docs/design-v3-observer-drain.md`](docs/design-v3-observer-drain.md) —
-  **current canonical design spec.** v3 Observer-based drain rearchitecture:
-  pipeline ownership, OSGi/embedded wiring, threading invariants, test
-  rewiring.
-- [`docs/design.md`](docs/design.md) — v2 design reference (commit-hook based,
-  security-bound pipeline). Section §0 cross-references the v3 changes; the
-  remaining sections describe the unchanged event primitives, trust model, and
-  listener contract.
+- [`docs/design-overview.md`](docs/design-overview.md) — one-page text/ASCII
+  view of the pipeline (both producer paths, key components, module layering).
+- [`docs/design.md`](docs/design.md) — full design spec (SPI shape, OSGi /
+  embedded wiring, threading invariants, test patterns).
 - [`docs/performance/README.md`](docs/performance/README.md) — performance
   characterization (macro slice + per-commit / per-event microbenchmarks),
-  with reproduction recipes. Includes the v2-vs-v3 head-to-head.
+  with reproduction recipes.
 - User-facing guide: [`oak-doc/src/site/markdown/security/audit.md`](../oak-doc/src/site/markdown/security/audit.md).
 
 License

@@ -1,58 +1,53 @@
-# Cross-Stack Audit — Design
+# Audit pipeline design
 
-This is the canonical design spec for the audit-event SPI shipping in `oak-audit-spi` and its consumers (`oak-security-spi`, `oak-core`). The producer surface is open to any OSGi bundle in the stack — Oak, AEM, Sling, third-party — and the listener interface is a single method.
+This document specifies the design of Oak's audit pipeline:
+- the SPI surface in `oak-audit-spi` and the security-domain extensions in `oak-security-spi`,
+- the pipeline implementation in `oak-core`,
+- OSGi wiring,
+- embedded (non-OSGi) wiring,
+- threading and ordering invariants,
+- the test patterns that pin the contracts.
 
-An earlier internal design round narrowed the bridge to commit-attached-only; that approach was reverted before implementation in favor of the open producer surface here, accepting the trust-model trade-off documented in §9.
-
-**Layered framing — event primitives vs. pipeline ownership.** The event primitives (`AuditEvent`, `AuditEventListener`, `AuditEventEmitter`) and the static `AuditEvents` façade are domain-neutral at the type level — any bundle can construct an event for any domain string. The **pipeline wiring** in v1/v2 was security-bound (`AuditConfiguration extends SecurityConfiguration`, hooks contributed via `SecurityConfiguration.getCommitHooks(...)`); the v3 rearchitecture (see status note below) elevates the pipeline to a top-level Oak concern via a `NodeStore` `Observer`, with `AuditConfiguration` moved to `oak-audit-spi`.
-
----
-
-## 0. Status — v3 Observer-based drain rearchitecture
-
-**This document describes the v2 architecture (hook-based, security-bound).** The audit pipeline has since been rearchitected to v3 (Observer-based, top-level). See [`design-v3-observer-drain.md`](design-v3-observer-drain.md) for the canonical v3 design spec; the rest of this document is preserved as the v2 reference (the design that informs the captured-event primitives, trust model, payload conventions, and listener contract — all unchanged by v3).
-
-**What v3 changes:**
-
-- `AuditConfiguration` interface moved from `oak-security-spi/spi/security/audit/` → `oak-audit-spi/spi/audit/`. No longer `extends SecurityConfiguration`.
-- The pair of commit hooks (`SnapshotAuditBufferHook` + `DispatchAuditEventsHook`) replaced by a single `AuditDrainObserver` registered as an OSGi `Observer` service. `ObserverTracker` attaches it to the root NodeStore. Drain fires on the commit thread, **after** durable persistence.
-- `SecurityProviderBuilder.withAuditConfiguration(...)`, `InternalSecurityProvider.setAuditConfiguration(...)`, and `SecurityProviderRegistration.bindAuditConfiguration(...)` are GONE. Audit is wired independently of the SecurityProvider.
-- `CommitContext` is no longer used to ferry audit events between hooks; events drain directly from the per-thread `AuditBuffer` inside the Observer.
-- Embedded callers attach the drain Observer via `((Observable) store).addObserver(audit.getDrainObserver())` (see `design-v3-observer-drain.md` §6 for the why-not-`Oak.with(Observer)` caveat).
-
-**What v3 keeps byte-identical:** `AuditEvent`, `AuditEventListener`, `AuditEventEmitter`, `AuditEvents` static façade, `AuditBuffer` ThreadLocal, `CommitMetadataDecorator` payload-decoration invariant, capture-site contracts (`UserManagerImpl` etc.), trust model (§9 below), `MutableRoot` lifecycle callouts.
-
-**Cross-references for design archaeology:**
-
-- [`design-v3-observer-drain.md`](design-v3-observer-drain.md) — current canonical design.
-- [`history/design-item-2-v1-vetoed.md`](history/design-item-2-v1-vetoed.md) — earlier v1 attempt at top-level audit via a new `CommitHookProvider` SPI; vetoed for scope reasons. v3 reaches the same architectural goal via a different mechanism (Observer, not new SPI in oak-store-spi).
-- Sections §1-§14 below describe the v2 design as a layered reference for the unchanged primitives.
+For a one-page overview suitable for terminal `cat` and PR descriptions, see [`design-overview.md`](design-overview.md). For the user-facing guide (consumers of the SPI), see [`oak-doc/src/site/markdown/security/audit.md`](../../oak-doc/src/site/markdown/security/audit.md).
 
 ---
 
-## 1. Goals & non-goals
+## 0. Executive summary
 
-### Goals
+The audit pipeline transports structured `AuditEvent`s from Oak-internal capture sites (and any OSGi bundle resolving `AuditEventEmitter`) to bundle-registered `AuditEventListener` consumers, gated by a feature toggle and a per-domain listener registry.
 
-- One dispatch place for ALL audit events regardless of origin.
-- Higher-stack code (AEM, Sling, third-party bundles) can issue events for their own domains, on their own schedule, without committing through Oak.
-- Trivial AEM call site: `@Reference AuditEventEmitter` + `emit(event)`.
-- Coexists with the existing Path α commit-attached security audit pipeline.
-- No compile-time coupling between consumer bundles and `oak-security-spi`.
+There are two delivery paths:
 
-### Non-goals
+- **Commit-attached** — Oak-internal capture sites (e.g. `UserManagerImpl`) call `AuditEvents.record(root, event)`. Events land in a per-session `ThreadLocal` `AuditBuffer`, and a `NodeStore` `Observer` (`AuditDrainObserver`) drains and dispatches them after the surrounding `Root.commit()` durably persists. Events carry `commit.sessionId` / `commit.userId` / `commit.timestamp` payload entries injected by `CommitMetadataDecorator` at drain time; a failed commit drops the buffer.
+- **Fire-and-forget** — Any OSGi bundle resolves `AuditEventEmitter` via `@Reference` and calls `emit(event)`. The event is dispatched synchronously on the calling thread; no buffering, no commit boundary, no payload decoration.
 
-- Spoofing prevention at the SPI level. Any bundle can emit any domain. The trust model is documented (§9), not enforced by the type system or runtime gates.
-- Reserved domains.
-- Commit-boundary semantics on the producer side.
-- Outbound forwarding to OSGi EventAdmin or AEM AuditLog. Deferred; listeners can fan out themselves if needed.
-- `getOriginBundle()` on AuditEvent. Explicitly excluded; per-source attribution is the consumer's responsibility (via payload conventions).
+Both paths converge on a single dispatch method (`AuditEventListener.onEvents(List<AuditEvent>)`) and share one listener registry. Failure isolation is layered: an OUTER `Throwable` barrier in `AuditDrainObserver.contentChanged` prevents audit from masquerading as a commit failure, and an INNER per-listener `Throwable` barrier on both paths prevents one misbehaving listener from stopping the others.
+
+Pipeline ownership lives in `AuditConfigurationImpl` (`oak-core`), which is registered as an OSGi service of type `AuditConfiguration` (a top-level Oak concern — **not** a `SecurityConfiguration`).
+
+---
+
+## 1. Commit flow
+
+```
+MutableRoot.commit()
+  → store.merge(builder, getCommitHook(), commitInfo)         [thread T1]
+      → ResetCommitAttributeHook
+      → SecurityConfiguration hooks
+      → EditorHook(validators)
+      → durable commit
+      → ChangeDispatcher.contentChanged(rootAfter, commitInfo)  [synchronous, same thread T1]
+          └─ AuditDrainObserver.contentChanged(root, info)      [drains buffer, decorates, dispatches]
+  → returns to MutableRoot
+```
+
+The observer fires synchronously on the same thread as the commit, AFTER durable persistence, BEFORE `store.merge` returns. The threading invariant — single-threaded session, `ThreadLocal` buffer keyed by session id — is preserved across the drain.
+
+Confirmed against all four production NodeStore implementations (`Memory`, `Segment`, `Document`, `Composite`): all route through `ChangeDispatcher`, which invokes observers synchronously on the commit thread.
 
 ---
 
 ## 2. Architecture overview
-
-Two producer paths feed a single listener registry. Both paths converge on one listener method.
 
 ```mermaid
 flowchart LR
@@ -66,10 +61,11 @@ flowchart LR
         DISP["dispatch(event)"]
     end
 
-    subgraph PATH_CA["Commit-attached path (oak-core, existing)"]
+    subgraph PATH_CA["Commit-attached path (oak-core)"]
         BUF["ThreadLocal AuditBuffer"]
         VAL["Validators"]
-        DRAIN["DispatchAuditEventsHook<br>(decorate payload + drain)"]
+        DURABLE["Durable commit"]
+        OBS["AuditDrainObserver<br>(decorate payload + drain)"]
     end
 
     EMIT["AuditEventEmitterImpl<br>(oak-core, OSGi @Component)"]
@@ -84,8 +80,9 @@ flowchart LR
     OAK_CAP --> REC
     REC --> BUF
     BUF --> VAL
-    VAL -->|merge ok| DRAIN
-    DRAIN --> REG
+    VAL -->|merge ok| DURABLE
+    DURABLE -->|ChangeDispatcher.contentChanged| OBS
+    OBS --> REG
 
     AEM_CAP -->|"@Reference emit"| EMIT
     EMIT --> DISP
@@ -97,552 +94,693 @@ flowchart LR
     style PROD fill:#fff4e0
     style EMIT fill:#e0ffe0
     style LISTENERS fill:#f0e0ff
+    style OBS fill:#e0e0ff
 ```
 
-**Invariant:** there is ONE registry, ONE listener method. The two paths differ only in:
-- whether events are buffered (commit-attached) or dispatched immediately (fire-and-forget)
-- whether the event payload carries commit metadata keys (set by the drain hook on commit success)
+The commit-attached path flows `OAK_CAP → REC → BUF → VAL → DURABLE → OBS → REG`; the fire-and-forget path flows `AEM_CAP → EMIT → DISP → REG`. Both paths share `REG` (the listener registry) and dispatch via the same `onEvents` method on each registered listener.
 
 ---
 
-## 3. Module layout
+## 3. SPI layout
 
-`oak-audit-spi` is a NEW module extracted from the current Path α additions to `oak-security-spi`. It holds the domain-neutral audit primitives. `oak-security-spi` keeps its security-specific event subclasses and now depends on `oak-audit-spi`.
+### 3.1 `oak-audit-spi`
 
-```mermaid
-flowchart TB
-    subgraph SPI["oak-audit-spi (NEW)"]
-        AE_INT[AuditEvent]
-        AEL_INT[AuditEventListener]
-        EMIT_INT[AuditEventEmitter]
-        AES[AuditEvents façade]
-    end
+`oak-audit-spi` is the domain-neutral audit SPI. It defines the event primitives (`AuditEvent`, `AuditEventListener`, `AuditEventEmitter`, the static `AuditEvents` façade, `AuditBufferLifecycle`) and the `AuditConfiguration` typed handle on the pipeline's runtime state. Package: `org.apache.jackrabbit.oak.spi.audit`.
 
-    subgraph SEC["oak-security-spi (existing)"]
-        ACS[AuditConfiguration]
-        SAT[SecurityAuditTypes]
-        SAE[SecurityAuditEvents helper]
-        SAD[SecurityAuditDomain]
-    end
-
-    subgraph CORE["oak-core (existing impl + small additions)"]
-        ACI[AuditConfigurationImpl]
-        BUF[AuditBuffer]
-        REG[WhiteboardAuditEventListenerRegistry]
-        SNAP[SnapshotAuditBufferHook]
-        DISP[DispatchAuditEventsHook]
-        EMIT_IMPL[AuditEventEmitterImpl]
-    end
-
-    subgraph AEM["AEM / Sling bundle (consumer)"]
-        CALLER[Caller @Reference]
-        EV_CLS[Custom AuditEvent subclass]
-        LISTENER[Custom AuditEventListener]
-    end
-
-    SEC --> SPI
-    CORE --> SEC
-    CORE --> SPI
-    AEM --> SPI
-
-    style SPI fill:#e0f0ff
-    style AEM fill:#fff4e0
-```
-
-| Module | Status | Role |
-|---|---|---|
-| `oak-audit-spi` | NEW | Domain-neutral SPI: `AuditEvent` (with static factory `of(domain, type, payload)`), `AuditEventListener`, `AuditEventEmitter`, `AuditEvents` static façade |
-| `oak-security-spi` | existing — depends on `oak-audit-spi` | Security domain constants (`SecurityAuditDomain`, `SecurityAuditTypes` with type-string + payload-key constants), `SecurityAuditEvents` helper class for ergonomic security-domain capture sites, `AuditConfiguration` security configuration interface (with `isActive()` pipeline-state probe) |
-| `oak-core` | existing — adds `AuditEventEmitterImpl` + `AuditConfigurationImpl` | Pipeline implementation (registry, buffer, hooks, emitter, configuration) |
-| AEM / Sling / 3rd-party | consumer | Maven dep on `oak-audit-spi` only |
-
-**Consumer compile classpath:** `oak-audit-spi`. Nothing else from Oak. No `oak-core`, no `oak-jcr`, no `oak-security-spi`.
-
-### 3.1 Per-domain helper convention
-
-Item 3 removed the per-event typed subclass hierarchy from `oak-security-spi` (the deleted classes were `SecurityAuditEvent`, `MemberAddedEvent`, `MemberRemovedEvent`, `MembersAddedBulkEvent`, `MembersRemovedBulkEvent`). The reviewer's "vocabulary leak" and "class proliferation" objections are now addressed by:
-
-- One public construction entry point on the domain-neutral SPI: `AuditEvent.of(domain, type, payload)`.
-- Per-domain helpers in the **owning module** (not in `oak-audit-spi`), exposing the bare `AuditEvent` interface — consumers cannot `instanceof`-check helper outputs, so the helper is purely a call-site ergonomic.
-
-In `oak-security-spi` the helper is `SecurityAuditEvents` (e.g. `.memberAdded(groupPath, memberPath)`, `.membersAddedBulk(...)`). The convention is informal in v1; future audit-event consumers in Oak's security stack (ACL, principal, token, login) MAY follow the same pattern, providing their own per-domain helper class in the relevant security subpackage. Codify the convention in `oak-audit-spi`'s package Javadoc when a second domain implements such a helper.
-
-### 3.2 Item 2 v2 — `AuditConfiguration` enrichment
-
-The "marker interface" complaint raised against Path α (`AuditConfiguration` shipped only `NAME` + `NOOP` + the implicit `extends SecurityConfiguration`) is addressed by adding one real semantic method:
+The `AuditConfiguration` interface:
 
 ```java
-boolean isActive();
-```
+package org.apache.jackrabbit.oak.spi.audit;
 
-`AuditConfigurationImpl.isActive()` delegates to `AuditEvents.isEnabled()` — single source of truth for the predicate (the body lives in `BufferSink.isEnabled()` exclusively). The `Noop` inner class returns `false`. The drift-prevention invariant is documented on both the interface method's Javadoc and the impl's Javadoc.
+import org.jetbrains.annotations.NotNull;
+import org.osgi.annotation.versioning.ProviderType;
 
-The v2 SPI delta is exactly one abstract method on `AuditConfiguration`. No `MutableRoot` changes, no `Oak.with(...)` additions, no `oak-store-spi` additions, no package renames. The v1-vetoed approach is preserved in `docs/history/design-item-2-v1-vetoed.md` for design history; full v2 spec in `docs/design-item-2.md`.
-
-### 3.2a Feature toggle name — deferred OAK rename
-
-`AuditConfigurationImpl.FEATURE_TOGGLE_NAME` is currently `"FT_AUDIT"`. The convention in `AGENTS.md` requires `FT_<DESCRIPTION>_OAK-<issue>` for upstream toggles. The rename to `"FT_AUDIT_OAK-<NNNNN>"` is **deferred to a future follow-up** — the upstream OAK JIRA ticket has not been filed yet, and the user (who is away) is the right person to file it. The constant deliberately **does not** appear on the public `AuditConfiguration` SPI interface in v2: putting the literal on the SPI would commit consumers to the exact value forever, making the OAK-suffix rename a breaking change rather than the additive shift it is today. When the ticket is filed, the constant updates to its OAK-suffixed value and can ALSO move to the SPI interface as a binary-additive change. The source Javadoc at `AuditConfigurationImpl:73-78` records this rationale inline so future maintainers don't move the constant prematurely.
-
-### 3.2b Pre-existing JMM observation — follow-up
-
-**RESOLVED in v3.** `AuditConfigurationImpl`'s `featureToggle`, `buffer`, and `registry` fields are still plain (non-volatile) instance fields, but the publication path is now formally analyzed and documented inline in the impl. The v3 rearchitecture removed `getCommitHooks(workspaceName)` (and with it the commit-thread read on these fields via the security pipeline), so reads now happen either (a) on the @Activate / @Deactivate thread (SCR-published, same-thread chain), (b) via the volatile `AuditEvents.sink` from capture sites (publication barrier provided by the sink itself), or (c) on the commit thread via `Observer.contentChanged`, after the `ServiceRegistration` publication barrier established by `BundleContext.registerService` in `@Activate`. All three paths satisfy the JMM happens-before contract. See the JMM-safety comment block on the field declarations in `AuditConfigurationImpl` for the canonical analysis (folded in per sage's v3 invariant pass).
-
-If a future change ever shares the singleton across pipelines OR introduces cross-thread mutation of these fields, the invariant breaks — they MUST then be made `volatile` (or properly immutable via constructor injection). The inline source note captures the trigger.
-
-Original v2 observation preserved below for design history:
-
-> `AuditConfigurationImpl`'s `featureToggle`, `buffer`, and `registry` fields are plain (non-volatile) instance fields. The `getCommitHooks(workspaceName)` method reads them on commit threads while the OSGi `@Activate` / `@Deactivate` paths write them on a different thread. The path works in practice because OSGi DS provides happens-before from `@Activate` to subsequent service uses, and the long publication chain (`SecurityProviderBuilder` → `ContentRepositoryImpl` → `ContentSessionImpl` → `MutableRoot.commit`) carries the visibility forward via `InternalSecurityProvider.auditConfiguration` being `volatile`.
-
----
-
-## 4. SPI surface
-
-### 4.1 `AuditEvent` — unchanged from Path α
-
-```java
+/**
+ * Audit pipeline configuration handle. Exposes pipeline-level state
+ * ({@link #isActive()}) so admin tooling, monitoring agents, and other
+ * Oak components can probe the pipeline without depending on its
+ * implementation class.
+ *
+ * <p><strong>Wiring.</strong> Audit is a top-level Oak concern — <em>not</em>
+ * a {@code SecurityConfiguration}. Implementations are registered on the
+ * {@link org.apache.jackrabbit.oak.spi.whiteboard.Whiteboard} (and, in OSGi
+ * deployments, as an OSGi service of this type). The pipeline subscribes to
+ * the root NodeStore's {@link org.apache.jackrabbit.oak.spi.commit.Observable}
+ * for commit notifications; it contributes no commit hooks.
+ *
+ * <p><strong>Cardinality:</strong> unary optional. Multiple implementations
+ * are not supported — the {@link AuditBufferLifecycle} is a singleton install
+ * and multiple observers on the same root NodeStore would each produce a
+ * duplicate dispatch. Multiplexing belongs at the listener layer
+ * ({@link AuditEventListener}), not at the configuration layer.
+ *
+ * <p>When no implementation is bound, callers either see no service
+ * (Whiteboard / OSGi lookups return empty) or the {@link #NOOP} constant
+ * if they want a guaranteed-non-null handle. {@code NOOP.isActive()}
+ * returns {@code false}.
+ */
 @ProviderType
-public interface AuditEvent {
-    @NotNull String getDomain();
-    @NotNull String getType();
-    long getTimestamp();
-    @NotNull Map<String, Object> getPayload();
-}
-```
-
-No `getOriginBundle()`. No `getCommitContext()`. Source-specific metadata lives in the payload Map.
-
-### 4.2 `AuditEventListener` — single method (Option C)
-
-```java
-@ConsumerType
-public interface AuditEventListener {
+public interface AuditConfiguration {
 
     /**
-     * Returns the domain this listener subscribes to. Listeners are
-     * domain-scoped: only events whose {@link AuditEvent#getDomain()} matches
-     * are delivered.
+     * Name of the audit configuration. Stable across releases — tooling
+     * may have coded against the constant.
      */
-    @NotNull
-    String getDomain();
+    String NAME = "org.apache.jackrabbit.oak.audit";
 
     /**
-     * Returns the dispatch rank. Higher rank invoked first. Default 0.
+     * Returns {@code true} when the audit pipeline is currently active —
+     * i.e., the audit feature toggle is enabled AND at least one
+     * {@code AuditEventListener} is registered on the Whiteboard. The
+     * two predicates AND together so a deployed-but-unused pipeline still
+     * reports {@code false}, matching the no-allocation semantics
+     * documented at {@link AuditEvents#isEnabled()}.
+     *
+     * <p>Equivalent in semantics to {@code AuditEvents.isEnabled()}, but
+     * reachable via the typed handle. Drift-prevention: both paths read
+     * through the volatile {@code AuditEvents.sink} (single source of
+     * truth). Any future divergence MUST be documented explicitly in
+     * both Javadocs.
      */
-    default int getRank() {
-        return 0;
+    boolean isActive();
+
+    /**
+     * NOOP default. Reports {@link #isActive()} as {@code false}.
+     */
+    AuditConfiguration NOOP = new Noop();
+
+    /**
+     * NOOP implementation. Package-private by design — consumers refer
+     * to the {@link #NOOP} constant.
+     */
+    final class Noop implements AuditConfiguration {
+
+        @Override
+        public boolean isActive() {
+            return false;
+        }
     }
-
-    /**
-     * Invoked when one or more events for this listener's domain are
-     * dispatched. Events arrive in capture order. Implementations must be
-     * non-blocking; expensive work belongs in an async wrapper.
-     *
-     * <p><strong>Trust model.</strong> Events delivered through this method
-     * may originate from either:
-     * <ul>
-     *   <li>Oak-internal capture sites tied to a successful {@code Root.commit()}.
-     *       Such events carry {@code commit.sessionId}, {@code commit.userId},
-     *       and {@code commit.timestamp} entries in their payload.</li>
-     *   <li>Any bundle calling {@link AuditEventEmitter#emit(AuditEvent)}.
-     *       The accuracy of such events is the emitting bundle's responsibility;
-     *       Oak does not verify them. They do not carry the {@code commit.*}
-     *       payload entries.</li>
-     * </ul>
-     * Consumers that need to distinguish should inspect payload keys.
-     *
-     * @param events non-empty list of events for this listener's domain
-     */
-    void onEvents(@NotNull List<AuditEvent> events);
 }
 ```
 
-**Single method.** No `NodeState`, no `CommitInfo` parameters. Commit-attached events carry `commit.*` payload keys; fire-and-forget events don't.
+### 3.2 `oak-security-spi` — security-domain constants
 
-### 4.3 `AuditEventEmitter` — NEW OSGi service
+`oak-security-spi/.../spi/security/audit/SecurityAuditDomain` holds the single domain string `"oak.security"` shared by all events Oak's security stack emits (user management, ACLs, principals, tokens, etc.). The `oak.` prefix namespaces the domain so listeners hosted in mixed environments (Sling, AEM, third-party bundles) can disambiguate Oak's security events from same-named domains defined by other layers.
 
-```java
-@ProviderType
-public interface AuditEventEmitter {
+Per-sub-domain type-string vocabulary lives alongside the SPI it describes. Today only user-membership events ship:
 
-    /**
-     * Dispatches the event synchronously on the calling thread to all
-     * listeners registered for the event's domain. Not tied to any commit;
-     * not buffered; not rolled back on failure.
-     *
-     * <p>Listeners are invoked under per-listener try/catch isolation: one
-     * listener throwing does not prevent others from running, and exceptions
-     * are logged but never propagate back to the caller.
-     *
-     * @param event the event to dispatch, non-null
-     */
-    void emit(@NotNull AuditEvent event);
+- `oak-security-spi/.../spi/security/user/UserAuditTypes` — type strings (`USER_MEMBER_ADDED`, `USER_MEMBERS_ADDED_BULK`, etc.) and payload keys (`PAYLOAD_GROUP_PATH`, `PAYLOAD_MEMBER_IDS`, etc.). Listener bundles compile-time-reference these to discriminate user events.
 
-    /**
-     * Returns true when at least one listener is registered for the given
-     * domain. Callers should gate event allocation with this method on hot
-     * paths to avoid unnecessary work when audit is off.
-     *
-     * @param domain the domain to check, non-null
-     */
-    boolean isEnabledFor(@NotNull String domain);
-}
-```
+Future ACL / principal / token events declare their own per-sub-domain `*AuditTypes` classes in the respective SPI sub-packages.
 
-Consumed via `@Reference`. One singleton per OSGi container, owned by `oak-core`.
+Producer-side factories (the helpers that capture sites call to build a typed event) are deliberately **not** part of the SPI. They live as package-private classes alongside their only callers — e.g., `oak-core/.../security/user/UserAuditEvents` next to `UserManagerImpl`. The asymmetric exposure (read-side vocabulary in SPI, write-side factories impl-private) is documented on `UserAuditTypes` as defense-in-depth; it raises the bar for casual forging of Oak-attested events but is not a hard boundary — any bundle can still call `AuditEvent.of(domain, type, payload)` directly. Listeners that need to distinguish Oak-attested commit-attached events from fire-and-forget emissions MUST check for the `commit.*` keys in the payload (see §0 trust contract).
 
-### 4.4 `AuditEvents` façade — extended
+### 3.3 Package-info versions
 
-```java
-public final class AuditEvents {
+- `oak-audit-spi/.../spi/audit/package-info.java` — `@Version("1.1.0")`. Binary-additive over the previous SPI shape.
+- `oak-security-spi/.../spi/security/audit/package-info.java` — `@Version("2.0.0")`. Reflects the breaking removal of the prior `AuditConfiguration` location (which moved into `oak-audit-spi`).
+- `oak-security-spi/.../spi/security/user/package-info.java` — `@Version("2.10.0")`. Minor-bump for the additive `UserAuditTypes` class.
 
-    public interface Sink {
-        boolean isEnabled();
-        boolean isEnabledFor(@NotNull String domain);
-
-        /** Existing — commit-attached buffering path. */
-        void record(@NotNull Root root, @NotNull AuditEvent event);
-
-        /** NEW — fire-and-forget dispatch path. */
-        void dispatch(@NotNull AuditEvent event);
-    }
-
-    private static volatile Sink sink = NOOP;
-
-    public static void install(Sink newSink) { sink = (newSink != null) ? newSink : NOOP; }
-
-    public static boolean isEnabled()                       { return sink.isEnabled(); }
-    public static boolean isEnabledFor(String domain)        { return sink.isEnabledFor(domain); }
-    public static void record(Root root, AuditEvent event)   { sink.record(root, event); }
-
-    /** NEW. */
-    public static void dispatch(AuditEvent event)            { sink.dispatch(event); }
-}
-```
+**`oak-security-spi/.../spi/security/audit/package-info.java`** — MAJOR bump required because `AuditConfiguration` is REMOVED from this package (it moves to `oak-audit-spi`). The bnd baseline check will flag the removal otherwise. Whatever the current `@Version` of the security-audit subpackage is (likely `1.0.0` or `1.1.0`), increment the major component. Post-freeze cleanup (see §3.2): the package was further trimmed — only `SecurityAuditDomain` and `package-info.java` remain in `spi/security/audit/`; `SecurityAuditTypes` moved to `spi/security/user/` (as `UserAuditTypes`) and `SecurityAuditEvents` was deleted (helpers moved to a package-private `UserAuditEvents` in `oak-core/.../security/user/`). MAJOR bump is still the correct call for both packages because of the `AuditConfiguration` removal plus the relocations.
 
 ---
 
-## 5. Commit-attached pipeline — preserved, payload decorated at drain time
+## 4. Implementation
 
-Path α's commit-attached pipeline is unchanged structurally. The only adaptation: at drain time, before `registry.dispatch(events)`, the `DispatchAuditEventsHook` DECORATES each event's payload with commit metadata.
+### 4.1 `AuditDrainObserver` — new class
 
-```java
-// in DispatchAuditEventsHook.processCommit, after validators pass:
-List<AuditEvent> events = drainBuffer(sessionId);
-List<AuditEvent> decorated = events.stream()
-        .map(e -> withCommitMetadata(e, commitInfo))
-        .collect(Collectors.toList());
-registry.dispatch(decorated);
-```
-
-The `withCommitMetadata` helper wraps the original event, returning a new `AuditEvent` whose `getPayload()` includes:
-
-| Key | Value | Source |
-|---|---|---|
-| `commit.sessionId` | `commitInfo.getSessionId()` | `CommitInfo` |
-| `commit.userId` | `commitInfo.getUserId()` | `CommitInfo` (`OAK_UNKNOWN` for system commits) |
-| `commit.timestamp` | `commitInfo.getDate()` | `CommitInfo` |
-
-Everything else in the original payload passes through unchanged. The decorator is internal to `oak-core`; consumers see only the public `AuditEvent` interface.
-
-**`NodeState after` is not surfaced in the payload.** Listeners that need to query post-commit state `@Reference NodeStore` directly.
-
-**`OAK_UNKNOWN` resolution:** listeners MUST NOT attempt to resolve `OAK_UNKNOWN` to a real user. It is a deliberate anonymity marker for system commits. This is captured in the `AuditEventListener.onEvents` Javadoc.
-
----
-
-## 6. Fire-and-forget pipeline — new
-
-```
-AEM bundle: audit.emit(event)
-  → AuditEventEmitterImpl.emit(event)                       (oak-core, OSGi singleton)
-  → AuditEvents.dispatch(event)                              (oak-audit-spi static façade)
-  → sink.dispatch(event)                                     (installed by AuditConfigurationImpl)
-  → registry.dispatch(List.of(event))                        (WhiteboardAuditEventListenerRegistry)
-  → for each listener with matching domain, ordered by rank:
-       listener.onEvents(List.of(event))                     (synchronous on calling thread)
-```
-
-**Properties:**
-- **No buffer.** The ThreadLocal `AuditBuffer` is bypassed entirely.
-- **No commit.** The event fires immediately. Subsequent JCR operations have no bearing on it.
-- **Synchronous on calling thread.** Listeners doing I/O must wrap themselves in an async dispatcher (their responsibility). The `AuditEventListener.onEvents` Javadoc states this.
-- **Per-listener try/catch isolation.** One listener throwing does not stop the others. Exceptions are logged and swallowed.
-- **No payload decoration.** Fire-and-forget events keep the payload the caller provided. They do NOT carry `commit.*` keys.
-
-### 6.1 `AuditEventEmitterImpl` skeleton
+Lives at `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/AuditDrainObserver.java`. Package question (kept in `security.audit` for minimum churn, or moved to a neutral `oak.audit`) is **open for team-lead decision** — see §13 below.
 
 ```java
-package org.apache.jackrabbit.oak.core.audit;
+package org.apache.jackrabbit.oak.security.audit;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
-import org.apache.jackrabbit.oak.spi.audit.AuditEventEmitter;
-import org.apache.jackrabbit.oak.spi.audit.AuditEvents;
+import org.apache.jackrabbit.oak.spi.audit.AuditEventListener;
+import org.apache.jackrabbit.oak.spi.commit.CommitInfo;
+import org.apache.jackrabbit.oak.spi.commit.Observer;
+import org.apache.jackrabbit.oak.spi.state.NodeState;
+import org.apache.jackrabbit.oak.spi.toggle.Feature;
 import org.jetbrains.annotations.NotNull;
-import org.osgi.service.component.annotations.Component;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-@Component(service = AuditEventEmitter.class)
-public class AuditEventEmitterImpl implements AuditEventEmitter {
+/**
+ * {@link Observer} that drains the {@link AuditBuffer} on commit success
+ * and dispatches captured events to all registered {@link AuditEventListener}s.
+ * <p>
+ * The observer fires synchronously on the same thread as the
+ * surrounding {@code MutableRoot.commit()} — by the contract of
+ * {@link org.apache.jackrabbit.oak.spi.commit.Observable#addObserver}
+ * the call is made from the commit dispatch path, before
+ * {@code NodeStore.merge(...)} returns. This preserves the
+ * {@code ThreadLocal} semantics that the {@link AuditBuffer} relies on.
+ * <p>
+ * <strong>External changes are ignored.</strong> When
+ * {@link CommitInfo#isExternal()} returns {@code true} (cluster sync from
+ * a peer node, or the initial replay invocation at {@code addObserver()}
+ * time with {@link CommitInfo#EMPTY_EXTERNAL}), the observer returns
+ * immediately. External commits did not originate any local
+ * {@code AuditEvents.record(...)} calls, so there is nothing in the
+ * per-session buffer to drain. Explicit short-circuit; cleaner than
+ * relying on the buffer to return empty.
+ * <p>
+ * <strong>Two-layer exception isolation:</strong>
+ * <ul>
+ *   <li><strong>Outer barrier</strong> wraps the ENTIRE method body. The
+ *   Observer chain has no per-observer isolation
+ *   ({@code CompositeObserver.java:46-53} — bare {@code for} loop with no
+ *   try/catch). Any throw out of this method propagates through
+ *   {@code DocumentNodeStore.java:1140-1144} (in a {@code finally} after
+ *   {@code setRoot}) or {@code LockBasedScheduler.java:303} (after
+ *   {@code head.set}), surfacing as a {@code RuntimeException} to the
+ *   merge caller despite a successful durable commit. Worse, on
+ *   DocumentNodeStore the inner catch at {@code DocumentNodeStore:1130-1139}
+ *   suppresses in-memory commit-apply failures, so an audit-induced throw
+ *   would mask a different kind of failure entirely. The outer Throwable
+ *   barrier guarantees audit never masquerades as a commit failure.</li>
+ *   <li><strong>Inner barrier</strong> per listener (in {@code dispatchOne}).
+ *   A misconfigured consumer bundle whose listener throws
+ *   {@link LinkageError}, {@link OutOfMemoryError}, or other
+ *   {@link Throwable} subtypes does not stop other listeners.</li>
+ * </ul>
+ *
+ * <p><strong>DO NOT wrap this Observer in {@code BackgroundObserver}.</strong>
+ * The async wrapper drops the {@code CommitInfo.sessionId} on queue overflow
+ * (it replaces the latest queued entry with
+ * {@code new ContentChange(root, CommitInfo.EMPTY_EXTERNAL)} —
+ * {@code BackgroundObserver.java:283-286}). The audit drain keys exclusively
+ * on {@code info.getSessionId()} to look up the per-thread buffer;
+ * losing session id on overflow → silent audit-event loss for
+ * high-rate writers. Synchronous dispatch is mandatory. See §9 invariant I4.
+ */
+final class AuditDrainObserver implements Observer {
 
-    @Override
-    public void emit(@NotNull AuditEvent event) {
-        AuditEvents.dispatch(event);
+    private static final Logger log = LoggerFactory.getLogger(AuditDrainObserver.class);
+
+    private final Feature featureToggle;
+    private final AuditBuffer buffer;
+    private final WhiteboardAuditEventListenerRegistry registry;
+
+    AuditDrainObserver(@NotNull Feature featureToggle,
+                       @NotNull AuditBuffer buffer,
+                       @NotNull WhiteboardAuditEventListenerRegistry registry) {
+        this.featureToggle = featureToggle;
+        this.buffer = buffer;
+        this.registry = registry;
     }
 
     @Override
-    public boolean isEnabledFor(@NotNull String domain) {
-        return AuditEvents.isEnabledFor(domain);
+    public void contentChanged(@NotNull NodeState root, @NotNull CommitInfo info) {
+        // OUTER Throwable barrier. CompositeObserver
+        // (oak-store-spi/.../spi/commit/CompositeObserver.java:46-53) does NOT
+        // isolate per-observer exceptions: a Throwable from this method
+        // cascades through the observer chain and would break peer observers
+        // such as JCR's observation dispatcher. We swallow defensively so the
+        // audit pipeline can never destabilise unrelated observer work. The
+        // per-listener barrier inside dispatchOne catches listener-induced
+        // failures; this outer catch protects against drain/decorator bugs.
+        try {
+            doContentChanged(info);
+        } catch (Throwable t) {
+            log.warn("AuditDrainObserver: unexpected error during drain/dispatch (session {}); " +
+                    "swallowing to preserve observer-chain isolation.",
+                    info.getSessionId(), t);
+        }
     }
-}
-```
 
-Roughly 15 lines. All work is in the static façade and the listener registry, which are part of `oak-core`'s existing wiring.
+    private void doContentChanged(@NotNull CommitInfo info) {
+        // External commits never produce local audit events (capture sites
+        // are local-only by construction). The bootstrap invocation at
+        // addObserver-time with CommitInfo.EMPTY_EXTERNAL also lands here.
+        if (info.isExternal()) {
+            return;
+        }
+        if (!featureToggle.isEnabled()) {
+            return;
+        }
+        String sessionId = info.getSessionId();
+        // The buffer is per-thread; this drain runs on the same thread that
+        // called Root.commit() (synchronous Observer contract via
+        // ChangeDispatcher for local commits). The sessionId returned by
+        // CommitInfo equals ContentSession.toString() — set at
+        // MutableRoot.java:262 — so it matches the buffer's keying.
+        List<AuditEvent> events = buffer.drain(sessionId);
+        if (events == null || events.isEmpty()) {
+            return;
+        }
+        List<AuditEventListener> listeners = registry.getListeners();
+        if (listeners.isEmpty()) {
+            return;
+        }
+        List<AuditEvent> decorated = CommitMetadataDecorator.decorate(events, info);
+        Map<String, List<AuditEvent>> byDomain = groupByDomain(decorated);
+        for (AuditEventListener listener : listeners) {
+            List<AuditEvent> forListener = byDomain.get(listener.getDomain());
+            if (forListener == null || forListener.isEmpty()) {
+                continue;
+            }
+            dispatchOne(listener, forListener);
+        }
+    }
 
----
+    private static @NotNull Map<String, List<AuditEvent>> groupByDomain(@NotNull List<AuditEvent> events) {
+        Map<String, List<AuditEvent>> byDomain = new HashMap<>(4);
+        for (AuditEvent event : events) {
+            byDomain.computeIfAbsent(event.getDomain(), k -> new ArrayList<>(events.size())).add(event);
+        }
+        return byDomain;
+    }
 
-## 7. End-to-end sequence
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant OakCap as Oak internal caller<br>(UserManagerImpl)
-    participant AemCap as AEM/Sling caller<br>(ContentFragmentAuditor)
-    participant AE as AuditEvents façade<br>(oak-audit-spi)
-    participant EMIT as AuditEventEmitterImpl<br>(oak-core, OSGi @Component)
-    participant AB as AuditBuffer<br>(ThreadLocal per session)
-    participant NS as NodeStore.merge
-    participant Val as Validators
-    participant Disp as DispatchAuditEventsHook
-    participant Reg as WhiteboardAuditEventListenerRegistry
-    participant L as Listener<br>(SiemForwarder)
-
-    Note over OakCap,L: Commit-attached path (Path α, payload-decorating drain)
-    OakCap->>AE: record(root, securityEvent)
-    AE->>AB: append(sessionId, event)
-    Note over AB: Buffered until commit drain
-    OakCap->>NS: Root.commit()
-    NS->>Val: validators run
-    alt validators pass
-        NS->>Disp: processCommit
-        Disp->>AB: drain(sessionId)
-        Disp->>Disp: decorate payload with<br>commit.sessionId, commit.userId, commit.timestamp
-        Disp->>Reg: dispatch(decoratedEvents)
-        Reg->>L: onEvents(decoratedEvents)
-    else validators fail
-        NS--xOakCap: CommitFailedException
-        Note over AB: Buffer cleared in finally; events discarded
-    end
-
-    Note over OakCap,L: Fire-and-forget path (NEW)
-    AemCap->>EMIT: emit(aemEvent)
-    EMIT->>AE: dispatch(aemEvent)
-    AE->>Reg: registry.dispatch(List.of(aemEvent))
-    Reg->>L: onEvents(List.of(aemEvent))
-
-    Note over OakCap,L: Same listener, single onEvents method. Source distinguishable via presence/absence of commit.* payload keys.
-```
-
----
-
-## 8. AEM / Sling caller skeletons
-
-### 8.1 Commit-anchored AEM event (content fragment)
-
-```java
-@Component
-public class ContentFragmentAuditor {
-
-    @Reference
-    private AuditEventEmitter audit;
-
-    public void onFragmentPublished(String path, String variation) {
-        if (audit.isEnabledFor("aem.content")) {
-            audit.emit(new ContentFragmentPublishedEvent(path, variation));
+    private static void dispatchOne(@NotNull AuditEventListener listener,
+                                    @NotNull List<AuditEvent> events) {
+        try {
+            listener.onEvents(events);
+        } catch (Throwable t) {
+            // Per-listener isolation: a misconfigured consumer bundle whose listener
+            // throws e.g. LinkageError must not crash the commit-dispatch path for
+            // unrelated work. JVM-level pathology (OutOfMemoryError) is caught here
+            // too but re-triggers on the next allocation and surfaces through normal
+            // channels. Do not narrow this catch to RuntimeException without
+            // re-reading the design discussion in §0 (executive summary).
+            log.warn("AuditEventListener {} threw {} for {} event(s) in domain '{}'; isolating from other listeners.",
+                    listener.getClass().getName(), t.getClass().getSimpleName(),
+                    events.size(), listener.getDomain(), t);
         }
     }
 }
-
-// Defined in the AEM bundle. Implements oak-audit-spi.AuditEvent — no other Oak dep.
-class ContentFragmentPublishedEvent implements AuditEvent {
-    private final String path;
-    private final String variation;
-    private final long timestamp = System.currentTimeMillis();
-
-    ContentFragmentPublishedEvent(String path, String variation) {
-        this.path = path;
-        this.variation = variation;
-    }
-
-    @Override public String getDomain()              { return "aem.content"; }
-    @Override public String getType()                { return "fragment.published"; }
-    @Override public long getTimestamp()             { return timestamp; }
-    @Override public Map<String, Object> getPayload() {
-        return Map.of("path", path, "variation", variation);
-    }
-}
 ```
 
-### 8.2 Non-commit AEM event (workflow lifecycle)
+**Notable choices:**
+
+- **No `CommitContext` involvement.** The observer drains the buffer directly. Events never enter `CommitContext` — which is a shared string-keyed channel observable to any `CommitHook` running in the same commit, so keeping audit events out of it eliminates a class of cross-bundle information disclosure.
+- **Two-layer `Throwable` catch.** The outer barrier (this method) and the inner barrier (per-listener in `dispatchOne`) catch every `Throwable` subtype including `Error`. A misconfigured consumer bundle cannot crash the dispatch loop or the surrounding commit.
+- **Same decorator call.** `CommitMetadataDecorator.decorate(events, info)` is invoked here; the decorator class body is unchanged. Sage's invariant #2 preserved.
+- **No `throws CommitFailedException`.** Observer's contract is `void contentChanged(NodeState, CommitInfo)` — no checked exceptions. Listener exceptions are swallowed via the per-listener Throwable catch (inner barrier); drain/decorator bugs are swallowed via the outer barrier in `contentChanged`. Both barriers exist because `CompositeObserver` does not isolate observers (shannon confirmed). We never throw.
+
+- **No `@Component` on AuditDrainObserver.** This class is a plain Java type, instantiated and registered by `AuditConfigurationImpl` (see §5.2). The OSGi-visible service is registered via `BundleContext.registerService(Observer.class.getName(), ...)`, matching the Lucene `LocalIndexObserver` idiom (`LuceneIndexProviderService.java:617-618`). Oak's `ObserverTracker` (in `oak-store-spi/.../spi/commit/ObserverTracker.java`, instantiated per NodeStoreService — `DocumentNodeStoreService.java:481`, `SegmentNodeStoreRegistrar.java:388`, `CompositeNodeStoreService.java:187`) picks up the `Observer` service and subscribes it to the root NodeStore.
+
+### 4.2 `AuditConfigurationImpl` — restructured
+
+Lives at `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/AuditConfigurationImpl.java`. Key properties:
+
+1. Does **not** extend `ConfigurationBase` and does **not** implement `SecurityConfiguration`.
+2. Registered as `@Component(service = AuditConfiguration.class)` only.
+3. **No `@Reference Observable observable;`** — instead, follows Oak's existing Observer-registration idiom (`LuceneIndexProviderService.java:617-618`): the OSGi `@Activate` registers the drain observer as an `Observer` service on the `BundleContext`, and Oak's `ObserverTracker` (instantiated per NodeStoreService — `DocumentNodeStoreService.java:481`, `SegmentNodeStoreRegistrar.java:388`, `CompositeNodeStoreService.java:187`) picks it up and subscribes it to the root NodeStore.
+4. Holds a `private ServiceRegistration<?> observerRegistration;` field so `@Deactivate` can unregister.
+5. Contributes no commit hooks — drain is observer-based.
+6. `BufferSink` (inner class) is the `Sink` for `AuditEvents` and backs the capture-time enqueue path.
+
+8. **OSGi `@Activate` (the new shape):**
 
 ```java
-@Component
-public class WorkflowAuditor {
-
-    @Reference
-    private AuditEventEmitter audit;
-
-    public void onStepCompleted(String workflowId, String stepId, String initiator) {
-        // No JCR commit, no Session. Just emit.
-        if (audit.isEnabledFor("aem.workflow")) {
-            audit.emit(new WorkflowStepCompletedEvent(workflowId, stepId, initiator));
-        }
-    }
+@Activate
+private void activate(@NotNull Configuration configuration,
+                      @NotNull BundleContext bundleContext,
+                      @NotNull Map<String, Object> properties) {
+    setParameters(ConfigurationParameters.of(properties));   // if we still extend something that needs it; else remove
+    Whiteboard whiteboard = new OsgiWhiteboard(bundleContext);
+    initialize(whiteboard);
+    // After initialize() the buffer + registry + toggle + sink + drainObserver are
+    // all live. Register the observer service LAST so any commit thread that races
+    // with activation either misses the observer entirely (no harm — events stay
+    // buffered for next commit) or sees a fully-wired pipeline.
+    observerRegistration = bundleContext.registerService(
+            Observer.class.getName(), getDrainObserver(), null);
 }
 ```
 
-### 8.3 Listener consuming both pipelines through one method
+8. **Embedded (non-OSGi) `initialize(Whiteboard)`:** the drain observer is constructed ONCE inside `initialize(...)`, cached as a field, and exposed via a singleton getter. A factory-style `getDrainObserver()` (returning a new instance per call) would have been a foot-gun because the `ThreadLocal` lives on `AuditBuffer`, not on the Observer; two Observer instances sharing the same buffer would create double-dispatch under any non-destructive drain refactor.
 
 ```java
-@Component(service = AuditEventListener.class)
-public class SiemForwarder implements AuditEventListener {
+// Field — alongside featureToggle / buffer / registry
+private AuditDrainObserver drainObserver;
 
-    @Override
-    public String getDomain() { return "aem.content"; }
+public void initialize(@NotNull Whiteboard whiteboard) {
+    featureToggle = Feature.newFeature(FEATURE_TOGGLE_NAME, whiteboard);
 
-    @Override
-    public void onEvents(List<AuditEvent> events) {
-        for (AuditEvent e : events) {
-            Map<String, Object> p = e.getPayload();
-            // Commit-attached events carry these keys; fire-and-forget don't.
-            String sessionId = (String) p.get("commit.sessionId");
-            String userId    = (String) p.get("commit.userId");
-            siem.forward(e, sessionId, userId);   // siem.forward handles null values
-        }
+    registry = new WhiteboardAuditEventListenerRegistry();
+    registry.start(whiteboard);
+
+    buffer = new AuditBuffer();
+    AuditBufferLifecycle.install(buffer);
+
+    AuditEvents.install(new BufferSink(featureToggle, registry, buffer));
+
+    // Construct ONCE. Cached for re-use by both OSGi @Activate (which
+    // publishes it as an Observer service) and embedded callers (which
+    // pass it to Oak.with(Observer)).
+    drainObserver = new AuditDrainObserver(featureToggle, buffer, registry);
+
+    log.info("Audit pipeline activated. Toggle '{}' = {}.",
+            FEATURE_TOGGLE_NAME, featureToggle.isEnabled());
+}
+
+/**
+ * Returns the singleton {@link Observer} for this pipeline. Embedded
+ * callers attach it to the root NodeStore explicitly via
+ * {@code ((Observable) store).addObserver(audit.getDrainObserver())} and
+ * hold the returned {@link Closeable} for tear-down. The
+ * {@code Oak.with(Observer)} auto-attach path at {@code Oak.java:300-302}
+ * only fires for Oak's DEFAULT whiteboard; embedded test setups that share
+ * a Whiteboard between audit and Oak (the common case) replace that default
+ * via {@code Oak.with(Whiteboard)} and lose the auto-attach. See §6 of this
+ * document for the full embedded pattern.
+ *
+ * <p><strong>Singleton by design.</strong> The drain Observer is constructed
+ * once in {@link #initialize(Whiteboard)} and reused; multi-attach
+ * (two Observer instances against the same root NodeStore) would create
+ * race-prone double-dispatch under any future drain refactor that drops the
+ * destructive-by-default semantic. Mirrors how {@link BufferSink} is
+ * installed once into {@link AuditEvents}.
+ *
+ * @throws IllegalStateException if called before {@link #initialize(Whiteboard)}
+ *                               or after {@link #dispose()}.
+ */
+public @NotNull Observer getDrainObserver() {
+    if (drainObserver == null) {
+        throw new IllegalStateException(
+                "AuditConfigurationImpl.initialize(...) must be called first");
     }
+    return drainObserver;
 }
 ```
 
-A second listener subscribing to `"security"` receives Oak's commit-attached security events through the same method; the `commit.*` keys are populated.
+The `getDrainObserver()` method exposes the singleton. OSGi `@Activate` passes it to `bundleContext.registerService(Observer.class.getName(), getDrainObserver(), null)` — `ObserverTracker` (per NodeStoreService) then auto-attaches it to the root NodeStore. Embedded callers attach explicitly via `((Observable) store).addObserver(getDrainObserver())` because Oak's `Oak.with(Observer)` auto-attach is bypassed once `Oak.with(Whiteboard)` replaces the default whiteboard (see §6). Both paths converge at the same `Observable.addObserver(...)` call against the same Observer instance.
+
+10. **OSGi `@Deactivate`:**
+
+```java
+@Deactivate
+private void deactivate() {
+    // Unregister the observer service FIRST. ObserverTracker, on noticing the
+    // service disappear, closes its subscription on the root NodeStore — so
+    // no further contentChanged calls reach our buffer / registry while we
+    // tear them down.
+    if (observerRegistration != null) {
+        try {
+            observerRegistration.unregister();
+        } catch (RuntimeException e) {
+            log.warn("Audit deactivate: observerRegistration.unregister() failed; continuing.", e);
+        } finally {
+            observerRegistration = null;
+        }
+    }
+    dispose();
+}
+```
+
+`dispose()` has two preconditions worth calling out: (a) `observerRegistration` MUST be `null` at entry — i.e. the OSGi service has been unregistered before internals are torn down. This converts misuse (calling `dispose()` directly after `@Activate` without going through `@Deactivate`) into a loud failure rather than a silent leak. (b) The cached `drainObserver` field is zeroed at the end, so a post-dispose `getDrainObserver()` throws `IllegalStateException` mirroring the pre-initialize behaviour. The observer-subscription unregister lives in `@Deactivate`'s wrapping logic.
+
+```java
+public void dispose() {
+    // NEW — precondition: caller MUST have unregistered the observer service
+    // first (the OSGi @Deactivate wrapper does this automatically). Calling
+    // dispose() while observerRegistration is still live would leave a
+    // dangling Observer subscription pointing at torn-down state — a silent
+    // leak that the outer Throwable barrier in §4.1 would mask. Fail loud
+    // instead.
+    Validate.checkState(observerRegistration == null,
+            "AuditConfigurationImpl.dispose() called while observer service is still registered; unregister first");
+
+    // ... close toggle / stop registry / install-null façades / clearAll buffer ...
+
+    drainObserver = null;   // NEW — singleton zeroed alongside the rest
+}
+```
+
+The precondition is a no-op for non-OSGi callers (they never assign `observerRegistration`, so the check passes trivially). For OSGi callers, the `@Deactivate` wrapper unregisters and nulls `observerRegistration` BEFORE calling `dispose()` (§5.3 step 0 → step 1), so the check also passes. Misuse — calling `dispose()` directly in OSGi without going through `@Deactivate` — is the case the check refuses.
+
+For non-OSGi callers, the Observer is attached explicitly via `((Observable) store).addObserver(audit.getDrainObserver())` (the `Oak.with(Observer)` path's auto-attach only fires for Oak's default whiteboard, which the common shared-whiteboard test setup replaces). The returned `Closeable` is the test/fixture's responsibility to close BEFORE calling `dispose()`. See §6 for the full embedded pattern.
+
+### 4.3 Files DELETED
+
+- `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/SnapshotAuditBufferHook.java`
+- `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/DispatchAuditEventsHook.java`
+- `oak-core/src/test/java/org/apache/jackrabbit/oak/security/audit/SnapshotAuditBufferHookTest.java` (if it exists; if not, no-op)
+- `oak-core/src/test/java/org/apache/jackrabbit/oak/security/audit/DispatchAuditEventsHookTest.java` (if it exists)
+- `oak-security-spi/src/main/java/org/apache/jackrabbit/oak/spi/security/audit/AuditConfiguration.java`
+- `oak-security-spi/src/test/java/org/apache/jackrabbit/oak/spi/security/audit/AuditConfigurationTest.java`
+
+### 4.4 Files MODIFIED
+
+- `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/AuditConfigurationImpl.java` — described in §4.2.
+- `oak-core/src/main/java/org/apache/jackrabbit/oak/security/internal/SecurityProviderBuilder.java` — remove `withAuditConfiguration` method and any `audit` field. `initialize(whiteboard)` paths that previously delegated audit setup to SecurityProviderBuilder are decoupled.
+- `oak-core/src/main/java/org/apache/jackrabbit/oak/security/internal/InternalSecurityProvider.java` — has no `auditConfiguration` field, no `setAuditConfiguration` setter, no audit entry in `getConfigurations()`. Audit is wired independently of the `SecurityProvider` graph.
+- `oak-core/src/main/java/org/apache/jackrabbit/oak/security/internal/SecurityProviderRegistration.java` — remove the `@Reference(name = "auditConfiguration", ...)` block.
+- `oak-run-commons/src/main/java/org/apache/jackrabbit/oak/run/MemoryNSWithAuditFixture.java` (or wherever `OakFixture.getMemoryNSWithAudit` lives) — switch from `SecurityProviderBuilder.withAuditConfiguration(...)` to `audit.initialize(whiteboard)` followed by `((Observable) store).addObserver(audit.getDrainObserver())` per §6, holding the returned `Closeable` for tear-down. Confirm path with turing (she added the fixture in `39605eacb1`).
+
+### 4.5 Files UNCHANGED (substance)
+
+- All of `oak-audit-spi/src/main/java/org/apache/jackrabbit/oak/spi/audit/*.java` except the NEW `AuditConfiguration.java`.
+- `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/CommitMetadataDecorator.java`.
+- `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/AuditBuffer.java`.
+- `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/AuditEventEmitterImpl.java`.
+- `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/WhiteboardAuditEventListenerRegistry.java`.
+- `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/NoOpAuditEventListener.java`.
+- `oak-core/src/main/java/org/apache/jackrabbit/oak/core/MutableRoot.java` — the 3 audit lifecycle callouts at lines 238/249/270 STAY. They cover paths the observer doesn't see (refresh, rebase, commit-fail before merge succeeds).
 
 ---
 
-## 9. Trust model — explicit statement
+## 5. OSGi wiring
 
-The fire-and-forget producer surface is OPEN. This is deliberate.
+### 5.1 Component declaration
 
-- **Any bundle that resolves `AuditEventEmitter` can emit any event for any domain**, including `"security"`. There is no compile-time check, no reserved-domain registry, no runtime gate.
-- **Listeners receive caller-asserted data.** An event arriving through `onEvents` reflects the emitting bundle's claim, not Oak-verified truth.
-- **Consumers must NOT treat the audit trail as authoritative without correlation.** A SIEM that ingests Oak's audit stream and treats every event as Oak-attested is operating against the documented contract.
+```java
+@Component(service = AuditConfiguration.class)
+@Designate(ocd = AuditConfigurationImpl.Configuration.class)
+public class AuditConfigurationImpl implements AuditConfiguration {
 
-### 9.1 Why this trade-off
+    // Internal pipeline state — see §4.2.
+    private Feature featureToggle;
+    private AuditBuffer buffer;
+    private WhiteboardAuditEventListenerRegistry registry;
 
-The team explored a stricter design (an internal "Proposal C") with compile-time reserved-domain enforcement, typed `AuditEvent` subclasses, and runtime checks. Proposal C protects against bundle-level forgery at the cost of producer flexibility — particularly: only commit-attached emission, only typed events, no opaque payloads.
+    // Observer service registration — holds the OSGi handle so @Deactivate
+    // can unregister and let ObserverTracker close its subscription.
+    private ServiceRegistration<?> observerRegistration;
 
-The user prioritized flexibility: enable any higher-stack bundle to emit, on its own schedule, for any domain. The trust trade-off is accepted at this level.
+    // ... @Activate / @Deactivate / initialize / getDrainObserver / dispose per §4.2
+}
+```
 
-### 9.2 Mitigation guidance for downstream consumers
+There is **NO** `@Reference Observable` or `@Reference NodeStore`. The wiring follows Oak's existing Observer-registration idiom (`LuceneIndexProviderService.java:617-618`): the component registers an `Observer` service on the `BundleContext`, and Oak's `ObserverTracker` (in `oak-store-spi/.../spi/commit/ObserverTracker.java`, instantiated per NodeStoreService — `DocumentNodeStoreService.java:481`, `SegmentNodeStoreRegistrar.java:388`, `CompositeNodeStoreService.java:187`) tracks `Observer` services and registers them on the root NodeStore via `Observable.addObserver(...)`.
 
-| Need | Approach |
+**Why this idiom (not `@Reference Observable`):**
+- It's the actual Oak precedent (Lucene's `LocalIndexObserver`, the JCR observation dispatcher, and `Oak.java:300-302` for the embedded equivalent).
+- No direct coupling between AuditConfigurationImpl and NodeStore.
+- ObserverTracker handles the `Observable` cast + selection of the correct root NodeStore — we don't reinvent the wiring.
+- Composite-NodeStore selection is solved by ObserverTracker (which receives the same NodeStore the rest of `oak-jcr` uses); we don't have to write OSGi service-filter logic.
+
+### 5.2 Activation sequence
+
+```
+SCR activates AuditConfigurationImpl
+  → @Activate calls private activate(bundleContext, ...)
+  → activate calls initialize(OsgiWhiteboard(bundleContext))
+  → initialize does:
+      1. featureToggle = Feature.newFeature(...)
+      2. registry.start(whiteboard)
+      3. AuditBufferLifecycle.install(buffer)
+      4. AuditEvents.install(bufferSink)
+  → activate then:
+      5. observerRegistration = bundleContext.registerService(
+             Observer.class.getName(),
+             new AuditDrainObserver(featureToggle, buffer, registry),
+             null)
+  → ObserverTracker (started by the active NodeStoreService — e.g. DocumentNodeStoreService:481) notices the new Observer
+    service and subscribes it to the root NodeStore via Observable.addObserver
+  → addObserver immediately invokes contentChanged(root, CommitInfo.EMPTY_EXTERNAL)
+  → AuditDrainObserver: isExternal() == true → returns (no-op)
+```
+
+Step 5 is LAST so any concurrent commit thread that races with activation either misses the observer (step 5 hasn't completed registration; observer not yet subscribed by ObserverTracker; events stay buffered until next commit drain) or sees a fully-wired pipeline (steps 1-4 done before step 5).
+
+### 5.3 Deactivation sequence
+
+```
+SCR deactivates AuditConfigurationImpl
+  → @Deactivate calls private deactivate()
+  → deactivate does:
+      0. observerRegistration.unregister()
+         [ObserverTracker notices Observer service disappear → closes its
+          subscription on the root NodeStore → no further contentChanged
+          calls reach our AuditDrainObserver]
+      → deactivate then calls dispose():
+      1. featureToggle.close()
+      2. registry.stop()
+      3. AuditEvents.install(null)
+      4. AuditBufferLifecycle.install(null)
+      5. buffer.clearAll()
+```
+
+Step 0 is FIRST so that no further `contentChanged(...)` calls reach the buffer/registry while we're tearing them down. ObserverTracker.removedService closes the subscription returned by `Observable.addObserver` immediately, so a commit thread that starts AFTER step 0 will never see the observer. A commit thread that's mid-way through `contentChanged` when step 0 runs will continue with the about-to-be-torn-down state — but each individual `contentChanged` call is short and completes before step 1 begins (and even if it didn't, the outer Throwable catch at §4.1 ensures any tear-down-induced NPE is swallowed without affecting peer observers).
+
+The outer `Throwable` catch in `contentChanged` makes this defensive: even if `dispose()` zeroes a field while a `contentChanged` is mid-flight, the resulting NPE is swallowed without affecting peer observers in the chain.
+
+**Precedent for the "detach first, internals second" ordering:** `oak-jcr/.../observation/ChangeProcessor.java:289-295` follows the same pattern — `filteringObserver.close()` (detach) precedes `executor.stop()` (internals tear-down). The audit pipeline mirrors this canonical Oak shape.
+
+---
+
+## 6. Embedded (non-OSGi) wiring
+
+Embedded callers (tests, `OakFixture.getMemoryNSWithAudit`, custom Oak embeds) wire the pipeline explicitly via `((Observable) store).addObserver(...)`:
+
+```java
+// Embedded test / fixture setup
+MemoryNodeStore store = new MemoryNodeStore();              // implements Observable
+DefaultWhiteboard whiteboard = new DefaultWhiteboard();
+
+AuditConfigurationImpl audit = new AuditConfigurationImpl();
+audit.initialize(whiteboard);                                // wires toggle/registry/buffer/sink
+
+// Explicit observer attachment. Embedded callers that share a Whiteboard
+// instance between audit and Oak (which is the common case — we want listener
+// registrations on the same whiteboard the audit registry tracks) MUST attach
+// the observer to the NodeStore directly. The `Oak.with(Observer)` path's
+// auto-attach (Oak.java:300-302) only fires for Oak's DEFAULT whiteboard;
+// `Oak.with(Whiteboard)` at Oak.java:562-563 replaces the default with a
+// plain DefaultWhiteboard that has no auto-attach. So the safe path is
+// always direct addObserver. See "Why the explicit addObserver" below.
+Closeable observerHandle = ((Observable) store).addObserver(audit.getDrainObserver());
+
+ContentRepository repo = new Oak(store)
+        .with(securityProvider)
+        .with(whiteboard)
+        .createContentRepository();
+
+// Register listeners on the whiteboard
+whiteboard.register(AuditEventListener.class, new MyListener(), Map.of());
+
+// ... drive commits via repo ...
+
+// tear-down — close in reverse
+observerHandle.close();   // detach observer first (mirrors §5.3 dispose-order)
+repo.close();
+audit.dispose();
+```
+
+### Why the explicit addObserver (not `Oak.with(Observer)`)
+
+Oak's DEFAULT whiteboard is an anonymous override at `Oak.java:276-302` whose `register(Observer.class, ...)` method has a side-effect that calls `((Observable) store).addObserver(observer)` at line 300-302. That auto-attach is what would let `Oak.with(Observer)` "just work" — but only for the default whiteboard.
+
+The moment an embedder calls `Oak.with(Whiteboard)` (Oak.java:562-563), the default whiteboard is replaced with whatever the embedder passed — typically a plain `DefaultWhiteboard` with no auto-attach side effect. From that point, `Oak.with(Observer)` at Oak.java:598 still registers the Observer as a service on the (replaced) whiteboard, but nothing tracks that registration to call `Observable.addObserver`. The drain never fires.
+
+Sharing a whiteboard between audit and Oak is the COMMON case for embedded tests/fixtures (we want `AuditEventListener` registrations and the audit listener tracker on the same whiteboard). So in practice, `Oak.with(Observer)` is the wrong path for embedded wiring — direct `((Observable) store).addObserver(...)` is the right path.
+
+### OSGi production is unaffected
+
+The OSGi flow (`bundleContext.registerService(Observer.class.getName(), drainObserver, null)`) does NOT depend on Oak.java:300-302's auto-attach. It publishes to the OSGi service registry, which the per-NodeStoreService `ObserverTracker` (`DocumentNodeStoreService.java:481`, `SegmentNodeStoreRegistrar.java:388`, `CompositeNodeStoreService.java:187`) tracks independently. The OSGi path was always going to work; only the embedded path required the explicit addObserver.
+
+### Relationship with `SecurityProviderBuilder`
+
+`SecurityProviderBuilder` exposes setters for the six `SecurityConfiguration` participants (Authentication, Authorization, User, Privilege, Principal, Token). It does **not** expose any audit-related setter — audit is owned by `AuditConfigurationImpl` and wired separately, as described above.
+
+---
+
+## 7. MutableRoot lifecycle callouts
+
+The three callouts at `MutableRoot.java:238` (`rebase`), `:249` (`refresh`), `:270` (`commit` finally block) STAY. Confirmation:
+
+- **`rebase()` / `refresh()`** → `AuditBufferLifecycle.onRefresh(sessionId)`. These paths discard pending transient changes — any audit events captured for the session that haven't yet been merged must be dropped. The observer is NOT invoked for a `refresh`/`rebase` (no `merge` happened), so the lifecycle callout is the only thing that drains the buffer.
+- **`commit()` finally → `if (!merged)`** → `AuditBufferLifecycle.onCommitFailed(sessionId)`. If `store.merge(...)` threw, the observer was never invoked (or the merge failure prevented it from reaching contentChanged dispatch). The lifecycle callout drains the buffer to prevent leaking events from a failed commit into a subsequent successful one on the same session.
+
+These three callouts cover EXACTLY the cases the observer doesn't see. With the observer in place for the successful-commit path, the responsibility split is:
+
+| Case | Who drains the buffer? |
 |---|---|
-| Distinguish Oak-attested vs caller-asserted | Check payload keys: `commit.sessionId`, `commit.userId`, `commit.timestamp` are present iff the event came from Oak's commit-attached pipeline. |
-| Filter out a specific bundle's events | Consumer maintains an allowlist of trusted domains. AEM bundle emits domain `aem.content`; SIEM rule "only trust events with domain starting with `aem.` from bundles X, Y, Z" is the consumer's responsibility. |
-| Compliance audit (Oak-verified mutations only) | Consumer subscribes to `security` domain and filters for events with `commit.*` keys populated. |
+| `Root.commit()` succeeds (merge returns normally) | `AuditDrainObserver.contentChanged` (observer fires synchronously) |
+| `Root.commit()` fails (merge throws) | `MutableRoot.commit` finally block → `AuditBufferLifecycle.onCommitFailed` |
+| `Root.refresh()` or `Root.rebase()` | `MutableRoot.refresh/rebase` → `AuditBufferLifecycle.onRefresh` |
+| OSGi `@Deactivate` while session is mid-flight | `AuditConfigurationImpl.dispose` step 5 → `buffer.clearAll()` (current-thread only; residual leak bounded by worker-pool × in-flight sessions) |
 
-This is consumer-side discipline. It is NOT enforced by the SPI.
-
----
-
-## 10. Migration from the earlier in-tree design
-
-An earlier in-tree skeleton used `AuditEventListener.onCommit(NodeState, CommitInfo, List<AuditEvent>)` with security-event types living in `oak-security-spi`. The migration to this design:
-
-1. **Move types** from `oak-security-spi` to a new `oak-audit-spi` module (domain-neutral event primitives):
-   - `AuditEvent`
-   - `AuditEventListener`
-   - `AuditEvents`
-   - `AuditBufferLifecycle`
-
-   `AuditConfiguration` is intentionally **NOT** moved — it stays in `oak-security-spi` because it `extends SecurityConfiguration` (pipeline ownership is security-bound in v1; see item 2 v2).
-2. **Add to `oak-audit-spi`**:
-   - `AuditEventEmitter` OSGi service interface
-3. **Modify `AuditEventListener`**:
-   - Replace `void onCommit(NodeState, CommitInfo, List<AuditEvent>)` with `void onEvents(List<AuditEvent>)`
-   - Update Javadoc with the trust-model section (§4.2 above)
-4. **Modify `AuditEvents.Sink`**:
-   - Add `void dispatch(AuditEvent event)` method
-5. **Modify `AuditEvents` façade**:
-   - Add `static void dispatch(AuditEvent event)` method
-6. **Modify `DispatchAuditEventsHook`** (oak-core):
-   - At drain time, decorate each event's payload with `commit.sessionId`, `commit.userId`, `commit.timestamp` from `CommitInfo` before calling `registry.dispatch(...)`
-7. **Add `AuditEventEmitterImpl`** in `oak-core` as `@Component(service = AuditEventEmitter.class)` (skeleton in §6.1).
-8. **Keep / add in `oak-security-spi`** (now depending on `oak-audit-spi`):
-   - `SecurityAuditDomain` — domain identifier constant for `"security"`.
-   - `SecurityAuditTypes` — type-string and payload-key constants (per item 3; supersedes the deleted per-event typed subclasses).
-   - `SecurityAuditEvents` — ergonomic helper class providing per-event factory methods that delegate to `AuditEvent.of(...)`.
-   - `AuditConfiguration` — security configuration interface, enriched with `isActive()` per item 2 v2.
-
-**Item 3 deletion (post-Path α):** the per-event typed subclasses (`SecurityAuditEvent`, `MemberAddedEvent`, `MemberRemovedEvent`, `MembersAddedBulkEvent`, `MembersRemovedBulkEvent`) were removed; their semantics are now encoded as `domain + type` strings via `SecurityAuditTypes`, with capture-site ergonomics provided by `SecurityAuditEvents`. See `docs/design-item-3.md`.
-
-**Item 2 v2 enrichment (post-Path α):** `AuditConfiguration` gains a `boolean isActive()` method, addressing the reviewer's "marker interface" complaint while preserving the v1 security-bound pipeline wiring. See `docs/design-item-2.md`.
-
-The `MutableRoot` lifecycle hooks for the commit-attached buffer (refresh, rebase, commit-failure) are unchanged. The `WhiteboardAuditEventListenerRegistry` gains the fire-and-forget dispatch path but its filtering/sorting logic is unchanged.
+No new MutableRoot callouts. No new lifecycle states. Confirmed.
 
 ---
 
-## 11. Test strategy outline
+## 8. Migration commits (oak-upgrade etc.)
 
-Detailed plan to be authored after spec approval. Scope:
+`oak-upgrade` and similar migration tools call `NodeStore.merge(...)` directly, bypassing `MutableRoot`. Migration constructs its own commit-hook chain and doesn't go through the `AuditEvents.record(...)` capture path.
 
-| Area | Tests |
+**Out-of-OSGi migration** (the common case): `RepositoryUpgrade.java:412` and `RepositorySidegrade.java:437` never construct `AuditConfigurationImpl`. No instance → no Observer registered → migration commits fire no observer, buffer drain never runs.
+
+**In-OSGi migration** (less common, e.g., running oak-run inside a live container with audit deployed):
+- The observer IS subscribed to the root NodeStore. If `oak-upgrade` calls `nodeStore.merge(...)`, the observer fires.
+- `buffer.drain(info.getSessionId())` runs. The buffer is empty for that session id (no capture path was invoked).
+- Observer returns early (events list is null/empty).
+
+**Sage's robustness assumption.** This depends on a precondition: **capture sites are reached only from MutableRoot-driven JCR operations.** If a future migration tool calls `AuditEvents.record(root, event)` directly on a non-MutableRoot `Root`, ghost events could leak. Documented in `AuditEvents.record` Javadoc: "Caller must ensure `root` is the `MutableRoot` of an active JCR session; non-JCR commits MUST NOT call this method." Grep `AuditEvents\.record(` confirms the only current Oak-internal caller is `UserManagerImpl` (always MutableRoot-driven). Safe today.
+
+If a future requirement says "migration mutations should be audited", that's a separate capture-site change — the migration tool would need to call `AuditEvents.record(...)` from inside a `MutableRoot`-equivalent context. It's not a pipeline-design concern.
+
+To enforce intended behavior: AuditPipelineIT gains a "migration-path no-op" assertion that drives a direct `nodeStore.merge(...)` without going through MutableRoot, asserts that listeners receive no events.
+
+---
+
+## 9. Threading + ordering invariants
+
+The design hinges on three invariants:
+
+| Invariant | Source | Status |
+|---|---|---|
+| **I1: Observer fires synchronously on the commit thread for local commits.** | ChangeDispatcher Javadoc lines 53-55: "Changes are reported synchronously and clients need to ensure to no block any length of time". | **CONFIRMED by shannon (#10).** Memory/Segment/Document/Composite all route through `ChangeDispatcher.contentChanged` synchronously on the merge thread. |
+| **I2: Observer fires AFTER durable commit (or not at all if merge throws).** | Observer Javadoc + NodeStore.merge contract. | **CONFIRMED by shannon (#10).** Every successful `NodeStore.merge` fires observers; failed merges do not. |
+| **I3: External commits short-circuit at observer entry (defense in depth).** | The `if (info.isExternal()) return;` at observer entry is the AUTHORITATIVE gate. By construction the buffer is empty for external commits (no local capture sites fired), so the gate is redundant in production — but the explicit short-circuit covers FOUR distinct cases with one predicate: (a) the synthetic `addObserver` bootstrap invocation (`ChangeDispatcher.java:65`); (b) cluster replication (`DocumentNodeStore.java:2544`); (c) segment external head movement (`LockBasedScheduler.java:239-247`); (d) COW/Composite/Branch transitive via ChangeDispatcher. A future capture site that mistakenly captures during a session whose CommitInfo ends up external would still be filtered. | **CONFIRMED by shannon (#10) and sage (#12).** |
+| **I4: Session-id matches buffer key.** | `CommitInfo.sessionId == ContentSession.toString()` at `MutableRoot.java:262`. The buffer is keyed by `ContentSession.toString()` (see `AuditConfigurationImpl.BufferSink.record` line 298: `buffer.record(root.getContentSession().toString(), event)`). | **CONFIRMED by shannon (#10).** Cite-site verified. |
+| **I5: CompositeObserver does NOT isolate per-observer exceptions.** | `oak-store-spi/.../spi/commit/CompositeObserver.java:46-53` — bare loop calling `observer.contentChanged(root, info)` with no try/catch. A throwing observer cascades to break the observer chain. | **CONFIRMED by shannon (#10).** Triggers the outer Throwable barrier in §4.1's `contentChanged`. |
+| **I6: No ordering guarantee among observers.** | CompositeObserver uses a `Set` (IdentityHashSet); iteration order is undefined. | **CONFIRMED by shannon (#10).** We don't depend on order; audit dispatches to listeners within its own observer call, and that ordering is determined by `AuditEventListener.getRank()` (registry sorts). |
+| **I7: AuditDrainObserver MUST NOT be wrapped in `BackgroundObserver`.** | `BackgroundObserver.java:283-286` — on queue overflow, the implementation replaces the latest queued `ContentChange` with `new ContentChange(root, CommitInfo.EMPTY_EXTERNAL)`. The audit drain keys exclusively on `CommitInfo.getSessionId()` to find the per-thread buffer; losing session id on overflow → silent audit-event loss under load. Plus: ThreadLocal buffer can ONLY be drained on the thread that captured. | **MANDATORY.** Enforced by NOT registering a BackgroundObserver — the synchronous-on-merge-thread dispatch is the canonical path. Class-level Javadoc on `AuditDrainObserver` carries the inline warning so future maintainers don't async-wrap for throughput. |
+| **I8: Outer Throwable barrier in `AuditDrainObserver.contentChanged`.** | NodeStore impls (`DocumentNodeStore.java:1140-1144` finally-after-setRoot, `LockBasedScheduler.java:303` after head.set, `MemoryNodeStore.java:100-102` inline loop) all dispatch observers AFTER the commit becomes durable. A throw out of our `contentChanged` surfaces as a fake commit-failure RuntimeException to the merge caller despite successful persistence. On DocumentNodeStore, the inner catch at `:1130-1139` suppresses in-memory failures, so an audit-induced throw could MASK a different kind of failure entirely. | **MANDATORY.** The outer `try { doContentChanged(info); } catch (Throwable t) { log.warn(...); }` in §4.1 is the only line of defense — `CompositeObserver.java:46-53` is a bare loop with no isolation. Do NOT narrow to RuntimeException. |
+
+All eight invariants confirmed. Design is locked on this foundation.
+
+---
+
+## 10. Test rewiring
+
+| Test | Change |
 |---|---|
-| Static façade | `dispatch(event)` routes to installed Sink; NOOP behavior when no Sink |
-| `AuditEventEmitterImpl` | OSGi activation registers service; `emit` routes to façade; `isEnabledFor` short-circuits |
-| Listener registry — fire-and-forget | Single listener invoked; multiple listeners invoked in rank order; non-matching domain not invoked; per-listener try/catch isolation; null/empty events handled |
-| Listener registry — commit-attached | Existing Path α tests adapted to `onEvents` signature |
-| Payload decoration | Drain-time decoration adds `commit.sessionId`, `commit.userId`, `commit.timestamp`; preserves original payload entries; works for system commits (`OAK_UNKNOWN` userId) |
-| Mixed pipeline | One listener subscribes to `security` and receives both commit-attached events (with `commit.*` keys) and fire-and-forget events from another bundle (without those keys); content of each batch is correct |
-| Migration regression | Capture-site tests adapted post item 3 (typed-event removal); `UserManagerImplAuditTest` and `AuditWiringIT` verify that `SecurityAuditEvents.memberAdded(...)`, `.memberRemoved(...)`, `.membersAddedBulk(...)`, `.membersRemovedBulk(...)` flow through the pipeline end-to-end with `domain == SecurityAuditDomain.NAME` and `type == SecurityAuditTypes.USER_MEMBER_ADDED` (etc.) |
-| Coverage | `oak-audit-spi` **100% line / 100% branch** (revised UP from 0.99 / 1.0 in item 3; the new code is small enough that 100% is trivial). `oak-security-spi` stays at its standing 100% / 100% gate. `oak-core` audit additions covered as part of the existing `oak-core` test surface (`>80%` per AGENTS.md). |
+| `AuditPipelineIT` | Rewire from "two hooks fire" to "observer fires on commit success". Add a "migration-path no-op" assertion (direct `NodeStore.merge` produces no listener invocations). Add a "commit failure → no dispatch + buffer cleared" assertion. Add a "refresh/rebase → no dispatch + buffer cleared" assertion (these tests likely already exist; verify). |
+| `AuditWiringIT` | Verify the full UserManagerImpl → buffer → observer → listener flow. The CapturedEvent → CommitInfo metadata equality check (introduced in `c65a3999b5`) is unchanged. |
+| `MemoryNSWithAuditFixtureTest` (turing's `39605eacb1`) | Switch from `SecurityProviderBuilder.withAuditConfiguration(...)` to `audit.initialize(whiteboard)` followed by `((Observable) store).addObserver(audit.getDrainObserver())` per §6, with the returned `Closeable` held by the fixture for tear-down. |
+| `SecurityProviderBuilderTest` | Drop the `withAuditConfiguration` test cases (method is removed). |
+| `SecurityProviderRegistrationTest` | The expected `getConfigurations()` count is 6 (Authentication, Authorization, User, Privilege, Principal, Token). Audit is NOT in this list — it's published as `AuditConfiguration`, not as a `SecurityConfiguration`. |
+| `AuditConfigurationImplTest` | New tests: (a) `@Activate` registers the `Observer` service via `bundleContext.registerService(Observer.class.getName(), ...)`; (b) `@Deactivate` unregisters it; (c) `getDrainObserver()` returns a non-null Observer post-`initialize`; (d) `getDrainObserver()` returns the SAME instance on repeat calls (singleton invariant — guards against accidental factory revert); (e) `getDrainObserver()` throws `IllegalStateException` pre-`initialize`; (f) `getDrainObserver()` throws `IllegalStateException` post-`dispose`; (g) `dispose()` throws `IllegalStateException` when called with `observerRegistration` still non-null (defense-in-depth check — simulate via OSGi-misuse setup that calls `dispose()` without first running `@Deactivate`). |
+| `AuditDrainObserverTest` (NEW) | Direct unit tests on the AuditDrainObserver class: (a) `isExternal()` short-circuit returns no-op; (b) toggle-off short-circuit; (c) empty-buffer no-op; (d) groupByDomain correctness; (e) per-listener `dispatchOne` Throwable isolation; (f) **OUTER Throwable barrier**: mock `buffer.drain` or a poisoned `AuditEvent` to throw, verify `contentChanged` returns normally and logs WARN; (g) multi-listener-multi-domain dispatch; (h) OAK_UNKNOWN sessionId no-op (optional, per shannon's defense-in-depth gate). |
+| `AuditConfigurationTest` (oak-security-spi) | **MOVED, not deleted**, to `oak-audit-spi/src/test/java/org/apache/jackrabbit/oak/spi/audit/AuditConfigurationTest.java`. Preserves institutional knowledge embedded in existing assertions (NAME constant, NOOP.isActive() = false, NOOP non-null). Per sage's invariant #4 caveat. |
+| OSGi-deactivation race test (NEW) | Verify that `observerRegistration.unregister()` runs FIRST in `@Deactivate` and that no `contentChanged` invocation happens after it returns (per alex's §5.3 review). Mock `ServiceRegistration` and a `MemoryNodeStore`-Observable; commit on a separate thread mid-deactivate, assert observer is detached before `dispose()` proceeds. |
+
+Coverage gates:
+- `oak-audit-spi`: 100% line / 100% branch (preserves design.md §11). The NEW `AuditConfiguration.Noop.isActive()` body needs one line of test coverage.
+- `oak-core` audit subpackage: covered by named tests per AGENTS.md's >80% rule. The new `AuditDrainObserver` should be fully covered.
+- `oak-security-spi`: 100% line / 100% branch UNCHANGED. We're REMOVING the AuditConfiguration interface from this module — no new gate concerns. The remaining audit-domain file in `spi/security/audit/` — `SecurityAuditDomain` — keeps its existing coverage. (Post-freeze cleanup: `SecurityAuditEvents` was deleted; `SecurityAuditTypes` was renamed to `UserAuditTypes` and moved to `spi/security/user/`, where it is covered alongside the rest of the user SPI. See §3.2.)
 
 ---
 
-## 12. Deferred items
+## 11. Design properties
 
-| Item | Trigger to revisit |
-|---|---|
-| `LoginModuleMonitor.loginSucceeded` extension + internal `MonitorAuditBridge` | Login audit becomes a concrete requirement |
-| Outbound forwarding (OSGi EventAdmin, AEM AuditLog, Sling Jobs) | When a deployment needs cross-bundle pub/sub on the audit stream; listeners can fan out themselves in the interim |
-| Reserved domains / spoofing prevention | If the trust trade-off in §9 proves problematic in practice. Would require a separate hardening revision (compile-time check, runtime gate). |
-| Async listener wrapper (analog to `BackgroundObserver`) | Reference impl deferred; listeners are responsible for non-blocking behavior in v1. |
-| Backpressure / rate limiting on fire-and-forget | Not in v1. Consumers can self-regulate if needed. |
+- **Audit is a top-level Oak concern, not a `SecurityConfiguration`.** Pipeline ownership lives in `AuditConfigurationImpl` (`oak-core`), published as an OSGi service of type `AuditConfiguration` (in `oak-audit-spi`). `SecurityProvider.getConfiguration(AuditConfiguration.class)` is **not** a valid lookup path; consumers `@Reference AuditConfiguration` directly or resolve via the `Whiteboard`.
 
----
+- **Events never enter `CommitContext`.** `CommitContext` is a shared string-keyed channel observable to any `CommitHook` running in the same commit. Keeping audit events out of it eliminates a class of cross-bundle information disclosure.
 
-## 13. Process note for future SPI iterations
+- **Dispatch fires AFTER durable commit.** The `AuditDrainObserver` runs in the post-merge dispatch chain via `ChangeDispatcher`. A successful dispatch implies the corresponding write durably persisted; a failed durable commit never produces an audit event.
 
-An earlier design cycle for this work round-tripped through several revisions on whether `AuditEvent.getOriginBundle()` belonged in v1 — eventually dropped. Process lesson recorded here for future SPI iterations: dependent work (tests, security review, downstream consumers) should not commit against an in-flight SPI until the design is frozen.
+- **Observer-chain isolation is explicit.** Both the OUTER `Throwable` barrier in `AuditDrainObserver.contentChanged` and the INNER per-listener `Throwable` barrier are documented contracts pinned by tests. Audit cannot masquerade as a commit failure; one misbehaving listener cannot stop the others.
+
+- **Composite-NodeStore double-dispatch is implicitly deduped.** When `CompositeNodeStore` is the root, the audit Observer can be subscribed via both the composite's own `ObserverTracker` and (potentially) the global store's tracker. Two `contentChanged` invocations per merge — the first drains the destructive `ThreadLocal`, the second finds an empty buffer and no-ops via the `events == null || events.isEmpty()` short-circuit at §4.1. This is pre-existing Oak observer-dispatch behaviour shared with `NonDefaultMountWriteReportingObserver` (`oak-store-composite/.../impl/NonDefaultMountWriteReportingObserver.java:63`); no audit-specific cost beyond what the same dispatch path incurs for any other observer.
+
+- **Migration commits produce no audit events.** `RepositoryUpgrade.java:412` / `RepositorySidegrade.java:437` never construct an `AuditConfigurationImpl`, so no Observer is registered and no events are captured. If a future requirement says "migration mutations should be audited", that's a separate capture-site change (the migration tool would need to call `AuditEvents.record(...)` from inside a `MutableRoot`-equivalent context).
 
 ---
 
-## 14. Summary
+## 12. Trade-offs
 
-| Decision | This design |
-|---|---|
-| Producer surface | OPEN — any bundle can emit any event for any domain |
-| Commit boundary on producer side | None — fire-and-forget; commit-attached path preserved for Oak-internal use |
-| Listener method | SINGLE: `onEvents(List<AuditEvent>)` |
-| Event construction | Static factory `AuditEvent.of(domain, type, payload)`; no typed subclasses on the SPI (item 3) |
-| Per-domain ergonomics | Helper classes in owning module — e.g. `SecurityAuditEvents` in `oak-security-spi` (item 3) |
-| Pipeline ownership in v1 | **Security-bound** — `AuditConfiguration extends SecurityConfiguration`, wired via `SecurityProviderBuilder.withAuditConfiguration(...)` (item 2 v2; replaces the vetoed option-a "top-level Oak service" design) |
-| `AuditConfiguration` interface | Enriched with `boolean isActive()` (item 2 v2); addresses the "marker interface" reviewer complaint while keeping the v1 wiring intact |
-| `NodeState` / `CommitInfo` on listener | None — commit metadata embedded in event payload at drain time |
-| Module split | NEW `oak-audit-spi` (event primitives are domain-neutral); `oak-security-spi` and `oak-core` depend on it; consumers depend on `oak-audit-spi` only |
-| Trust model | Caller-asserted — listeners receive what the emitting bundle says happened |
-| Coverage gate | `oak-audit-spi` 100% / 100% (revised up in item 3); `oak-security-spi` 100% / 100%; `oak-core` >80% (general rule) |
-| Outbound forwarding | Deferred |
-| Login audit | Deferred (LoginModuleMonitor extension is a future option) |
-| `FT_AUDIT` → `FT_AUDIT_OAK-<NNNNN>` rename | Deferred — pending upstream OAK ticket allocation by the user; constant stays at `AuditConfigurationImpl`, not on SPI, until the OAK number exists. See §3.2a. |
-| `volatile` on impl `featureToggle`/`buffer`/`registry` | Deferred — pre-existing JMM observation, out of scope for item 2 v2. See §3.2b. |
+- **Audit state is not reachable via `SecurityProvider`.** Consumers must `@Reference AuditConfiguration` directly or resolve via the `Whiteboard`. Justified by the fact that audit is genuinely orthogonal to authentication/authorization/principals/users; coupling it to `SecurityConfiguration` was a category error.
 
----
+- **Migration commits fire the observer but produce no events.** Cost: one `info.isExternal()` check plus one `buffer.drain` (which hits an empty `ThreadLocal` map) per migration commit. Sub-microsecond. Acceptable in exchange for not having a separate "audit-bypass" wiring path for migration tools.
 
-End of spec. Implementation plan to follow via the `writing-plans` skill upon user approval.
+- **`AuditDrainObserver` must not be wrapped in `BackgroundObserver`.** `BackgroundObserver` drops `CommitInfo.sessionId` on queue overflow, which would silently lose audit events under load. The contract is documented on the class and enforced by the OSGi wiring (the observer is registered directly, not via `BackgroundObserver`).

@@ -1,8 +1,7 @@
 # Audit pipeline — design at a glance
 
 A short, plain-text view of the audit pipeline for PR descriptions and
-terminal `cat`. For the full spec see
-[`design-v3-observer-drain.md`](design-v3-observer-drain.md); for the
+terminal `cat`. For the full spec see [`design.md`](design.md); for the
 user-facing guide see
 [`oak-doc/src/site/markdown/security/audit.md`](../../oak-doc/src/site/markdown/security/audit.md).
 
@@ -122,8 +121,7 @@ Fire-and-forget path (any OSGi bundle)
 
 ## Where to learn more
 
-- [`design-v3-observer-drain.md`](design-v3-observer-drain.md) — canonical design spec (SPI shape, OSGi/embedded wiring, threading invariants, test rewiring).
-- [`design.md`](design.md) — earlier design preserved for archaeology; §0 status note cross-references the current architecture.
+- [`design.md`](design.md) — full design spec (SPI shape, OSGi/embedded wiring, threading invariants, test patterns).
 - [`oak-doc/src/site/markdown/security/audit.md`](../../oak-doc/src/site/markdown/security/audit.md) — user-facing Oak documentation (listener contract, payload conventions, trust model).
 - [`performance/README.md`](performance/README.md) — benchmark results and reproduction recipes.
-- [`pr-description-v3.md`](pr-description-v3.md) — PR body draft.
+- [`pr-description.md`](pr-description.md) — PR body draft.
