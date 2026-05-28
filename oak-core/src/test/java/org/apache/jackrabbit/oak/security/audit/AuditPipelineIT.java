@@ -362,6 +362,294 @@ public class AuditPipelineIT {
         }
     }
 
+    //------------------------------< gate-transition discard tests >---
+    // These tests pin the invariant that the {@code MutableRoot}
+    // lifecycle callouts (refresh / rebase / commit-failed) MUST fire
+    // even when {@code AuditEvents.isEnabled()} is FALSE at the time
+    // the callout runs — otherwise a session whose buffer was populated
+    // with the gate ON, then sees the gate flip OFF before the
+    // lifecycle callout, then ON again before the next commit, leaks
+    // stale events that get dispatched against the LATER commit's
+    // metadata. {@code AuditEvents.isEnabled()} factors as
+    // {@code featureToggle.isEnabled() && registry.hasAnyListener()}
+    // (see {@code AuditConfigurationImpl.BufferSink.isEnabled}) so the
+    // gate flips OFF via two functionally identical sources:
+    //   1. Toggle flicker — {@code FT_AUDIT} flipped off at runtime.
+    //   2. Listener churn — the only registered listener deregisters.
+    // Both sources × three lifecycle callouts → six regression tests.
+
+    /**
+     * Toggle flips OFF between capture and refresh: the lifecycle
+     * callout MUST still fire and drain the buffer. Pins
+     * {@code MutableRoot.refresh()} ALWAYS calling
+     * {@code AuditBufferLifecycle.onRefresh(sessionId)} — without the
+     * gate that an earlier iteration added on
+     * {@code AuditEvents.isEnabled()}.
+     */
+    @Test
+    public void refreshDiscardsStagedEventsAcrossToggleFlicker() throws Exception {
+        try (ContentSession session = login()) {
+            // Capture E1 with gate=ON.
+            Root r1 = session.getLatestRoot();
+            AuditEvents.record(
+                    r1, eventFor(DOMAIN, "staged-by-r1",
+                            Map.of("trace.id", "E1-must-not-leak-via-toggle")));
+
+            // Flip gate OFF via toggle.
+            setToggle(false);
+
+            // Refresh: the callout must drain the buffer despite the
+            // gate being off. Without this guarantee, E1 survives.
+            r1.refresh();
+
+            // Flip gate ON for the subsequent commit + dispatch.
+            setToggle(true);
+
+            // Capture E2 and commit on the SAME session.
+            Root r2 = session.getLatestRoot();
+            AuditEvents.record(
+                    r2, eventFor(DOMAIN, "delivered-by-r2",
+                            Map.of("trace.id", "E2-current")));
+            r2.getTree("/").setProperty("scratch", "v");
+            r2.commit();
+
+            // Strict: exactly one event, and it must be E2. If the
+            // lifecycle drain was skipped, received would carry both
+            // E1 (decorated with r2's commit metadata — the integrity
+            // violation) and E2.
+            assertEquals("only E2 must be delivered; E1 must NOT survive the toggle-flicker",
+                    1, received.size());
+            AuditEvent d = received.get(0);
+            assertEquals("delivered-by-r2", d.getType());
+            assertEquals("E2-current", d.getPayload().get("trace.id"));
+        }
+    }
+
+    /**
+     * Rebase variant of {@link #refreshDiscardsStagedEventsAcrossToggleFlicker}.
+     * Pins {@code MutableRoot.rebase()}'s always-fire callout under the
+     * same toggle-flicker pattern.
+     */
+    @Test
+    public void rebaseDiscardsStagedEventsAcrossToggleFlicker() throws Exception {
+        try (ContentSession session = login()) {
+            Root r1 = session.getLatestRoot();
+            AuditEvents.record(
+                    r1, eventFor(DOMAIN, "staged-by-r1",
+                            Map.of("trace.id", "E1-must-not-leak-via-toggle-rebase")));
+
+            setToggle(false);
+            r1.rebase();
+            setToggle(true);
+
+            Root r2 = session.getLatestRoot();
+            AuditEvents.record(
+                    r2, eventFor(DOMAIN, "delivered-by-r2",
+                            Map.of("trace.id", "E2-current")));
+            r2.getTree("/").setProperty("scratch", "v");
+            r2.commit();
+
+            assertEquals("only E2 must be delivered; E1 must NOT survive the toggle-flicker around rebase",
+                    1, received.size());
+            assertEquals("E2-current",
+                    received.get(0).getPayload().get("trace.id"));
+        }
+    }
+
+    /**
+     * Commit-failure variant of {@link #refreshDiscardsStagedEventsAcrossToggleFlicker}.
+     * Pins the {@code finally if (!merged) onCommitFailed(...)} branch
+     * in {@code MutableRoot.commit()} firing even when the gate is off.
+     * Uses a separate Oak instance with the same throwing validator as
+     * {@link #commitFailureDiscardsStagedEvents()} for a deterministic
+     * commit failure.
+     */
+    @Test
+    public void commitFailureDiscardsStagedEventsAcrossToggleFlicker() throws Exception {
+        MemoryNodeStore store2 = new MemoryNodeStore(InitialContentHelper.INITIAL_CONTENT);
+        Closeable observer2 = store2.addObserver(auditConfig.getDrainObserver());
+        ContentRepository repo2 = new Oak(store2)
+                .with(securityProvider)
+                .with(whiteboard)
+                .with(new ThrowingValidatorProvider("trigger-failure"))
+                .createContentRepository();
+        try (ContentSession session = repo2.login(adminCredentials(), null)) {
+            // Capture E1 with gate=ON.
+            Root r1 = session.getLatestRoot();
+            AuditEvents.record(
+                    r1, eventFor(DOMAIN, "staged-by-failed-r1",
+                            Map.of("trace.id", "E1-must-not-leak-via-toggle-failure")));
+
+            // Flip gate OFF, then trigger a deterministic commit failure.
+            // The failing commit must still drain the buffer via the
+            // finally-block callout — that's the invariant under test.
+            setToggle(false);
+            r1.getTree("/").setProperty("trigger-failure", "boom");
+            try {
+                r1.commit();
+                fail("Expected CommitFailedException from injected validator");
+            } catch (CommitFailedException expected) {
+                // expected
+            }
+
+            // Flip gate ON for the subsequent successful commit + dispatch.
+            setToggle(true);
+
+            Root r2 = session.getLatestRoot();
+            AuditEvents.record(
+                    r2, eventFor(DOMAIN, "delivered-by-r2",
+                            Map.of("trace.id", "E2-current")));
+            r2.getTree("/").setProperty("scratch", "v");
+            r2.commit();
+
+            assertEquals("only E2 must be delivered; E1 must NOT survive the toggle-flicker around commit-failure",
+                    1, received.size());
+            assertEquals("E2-current",
+                    received.get(0).getPayload().get("trace.id"));
+        } finally {
+            observer2.close();
+            if (repo2 instanceof Closeable) {
+                ((Closeable) repo2).close();
+            }
+        }
+    }
+
+    /**
+     * Listener-churn variant of {@link #refreshDiscardsStagedEventsAcrossToggleFlicker}.
+     * The sole registered listener deregisters between capture and
+     * refresh, flipping {@code AuditEvents.isEnabled()} via the
+     * {@code registry.hasAnyListener()} factor. A fresh listener
+     * re-registers (writing to the same {@code received} collection)
+     * before the next commit. Verifies the gate-OFF source doesn't
+     * matter — only that the callout always fires.
+     */
+    @Test
+    public void refreshDiscardsStagedEventsAcrossListenerChurn() throws Exception {
+        try (ContentSession session = login()) {
+            Root r1 = session.getLatestRoot();
+            AuditEvents.record(
+                    r1, eventFor(DOMAIN, "staged-by-r1",
+                            Map.of("trace.id", "E1-must-not-leak-via-listener-churn")));
+
+            // Flip gate OFF via listener deregistration.
+            listenerRegistration.unregister();
+
+            r1.refresh();
+
+            // Re-register a fresh listener writing to the same `received`
+            // collection — the test only cares whether the leaked event
+            // is observable downstream, not which listener instance sees it.
+            listenerRegistration = whiteboard.register(AuditEventListener.class,
+                    new AuditEventListener() {
+                        @Override public @NotNull String getDomain() { return DOMAIN; }
+                        @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                            received.addAll(events);
+                        }
+                    }, Map.of());
+
+            Root r2 = session.getLatestRoot();
+            AuditEvents.record(
+                    r2, eventFor(DOMAIN, "delivered-by-r2",
+                            Map.of("trace.id", "E2-current")));
+            r2.getTree("/").setProperty("scratch", "v");
+            r2.commit();
+
+            assertEquals("only E2 must be delivered; E1 must NOT survive the listener-churn around refresh",
+                    1, received.size());
+            assertEquals("E2-current",
+                    received.get(0).getPayload().get("trace.id"));
+        }
+    }
+
+    /**
+     * Listener-churn variant for {@code rebase}.
+     */
+    @Test
+    public void rebaseDiscardsStagedEventsAcrossListenerChurn() throws Exception {
+        try (ContentSession session = login()) {
+            Root r1 = session.getLatestRoot();
+            AuditEvents.record(
+                    r1, eventFor(DOMAIN, "staged-by-r1",
+                            Map.of("trace.id", "E1-must-not-leak-via-listener-churn-rebase")));
+
+            listenerRegistration.unregister();
+            r1.rebase();
+            listenerRegistration = whiteboard.register(AuditEventListener.class,
+                    new AuditEventListener() {
+                        @Override public @NotNull String getDomain() { return DOMAIN; }
+                        @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                            received.addAll(events);
+                        }
+                    }, Map.of());
+
+            Root r2 = session.getLatestRoot();
+            AuditEvents.record(
+                    r2, eventFor(DOMAIN, "delivered-by-r2",
+                            Map.of("trace.id", "E2-current")));
+            r2.getTree("/").setProperty("scratch", "v");
+            r2.commit();
+
+            assertEquals("only E2 must be delivered; E1 must NOT survive the listener-churn around rebase",
+                    1, received.size());
+            assertEquals("E2-current",
+                    received.get(0).getPayload().get("trace.id"));
+        }
+    }
+
+    /**
+     * Listener-churn variant for commit-failure. Same separate-Oak
+     * pattern as {@link #commitFailureDiscardsStagedEventsAcrossToggleFlicker}.
+     */
+    @Test
+    public void commitFailureDiscardsStagedEventsAcrossListenerChurn() throws Exception {
+        MemoryNodeStore store2 = new MemoryNodeStore(InitialContentHelper.INITIAL_CONTENT);
+        Closeable observer2 = store2.addObserver(auditConfig.getDrainObserver());
+        ContentRepository repo2 = new Oak(store2)
+                .with(securityProvider)
+                .with(whiteboard)
+                .with(new ThrowingValidatorProvider("trigger-failure"))
+                .createContentRepository();
+        try (ContentSession session = repo2.login(adminCredentials(), null)) {
+            Root r1 = session.getLatestRoot();
+            AuditEvents.record(
+                    r1, eventFor(DOMAIN, "staged-by-failed-r1",
+                            Map.of("trace.id", "E1-must-not-leak-via-listener-churn-failure")));
+
+            listenerRegistration.unregister();
+            r1.getTree("/").setProperty("trigger-failure", "boom");
+            try {
+                r1.commit();
+                fail("Expected CommitFailedException from injected validator");
+            } catch (CommitFailedException expected) {
+                // expected
+            }
+            listenerRegistration = whiteboard.register(AuditEventListener.class,
+                    new AuditEventListener() {
+                        @Override public @NotNull String getDomain() { return DOMAIN; }
+                        @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                            received.addAll(events);
+                        }
+                    }, Map.of());
+
+            Root r2 = session.getLatestRoot();
+            AuditEvents.record(
+                    r2, eventFor(DOMAIN, "delivered-by-r2",
+                            Map.of("trace.id", "E2-current")));
+            r2.getTree("/").setProperty("scratch", "v");
+            r2.commit();
+
+            assertEquals("only E2 must be delivered; E1 must NOT survive the listener-churn around commit-failure",
+                    1, received.size());
+            assertEquals("E2-current",
+                    received.get(0).getPayload().get("trace.id"));
+        } finally {
+            observer2.close();
+            if (repo2 instanceof Closeable) {
+                ((Closeable) repo2).close();
+            }
+        }
+    }
+
     //----------------------------------------< toggle, grouping, isolation >---
 
     /**
