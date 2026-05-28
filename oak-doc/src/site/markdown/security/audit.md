@@ -409,6 +409,22 @@ Recommended consumer-side discipline:
 | Restrict trusted producers. | Maintain a consumer-side allowlist of trusted domain prefixes and reject unknown domains. |
 | Compliance audit (Oak-verified writes only). | Subscribe to `"oak.security"` and filter for events carrying the `commit.*` keys. |
 
+<a name="related_documentation"></a>
+### Related documentation
+
+Implementer-facing material lives alongside this guide:
+
+- [`audit-design.md`](audit-design.md) — full design spec covering the
+  SPI shape, OSGi and embedded wiring, threading invariants, and the
+  test patterns that pin them.
+- [`audit-design-overview.md`](audit-design-overview.md) — one-page
+  diagrammatic view of the pipeline for PR descriptions and terminal
+  `cat`.
+- [`audit-performance.md`](audit-performance.md) — benchmark results,
+  upper-bound overhead figures, and reproduction recipes. Also covers
+  the `-Doak.audit.enabled=true` JVM-property opt-in used by the
+  `Oak-Memory` / `Oak-MemoryNS` benchmark fixtures.
+
 <!-- references -->
 [AuditEvent]: /oak/docs/apidocs/org/apache/jackrabbit/oak/spi/audit/AuditEvent.html
 [AuditEventListener]: /oak/docs/apidocs/org/apache/jackrabbit/oak/spi/audit/AuditEventListener.html

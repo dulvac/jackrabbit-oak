@@ -81,6 +81,18 @@ import org.slf4j.LoggerFactory;
  * Plus: the {@link AuditBuffer} is a {@code ThreadLocal} populated on the
  * commit thread, so it can ONLY be drained on that same thread. Synchronous
  * dispatch is mandatory.
+ *
+ * <p><strong>TODO (OAK-NNNNN): toggle-flicker leak.</strong> The
+ * {@code featureToggle.isEnabled()} short-circuit in {@link #doContentChanged}
+ * returns without draining the per-session buffer when the toggle is off
+ * at observer-fire time. If the toggle is ON at capture, OFF when a later
+ * successful commit on the same session fires the observer, then ON again
+ * for a subsequent commit, the stale event survives the toggle-OFF drain
+ * window and leaks through the next drain with the later commit's
+ * {@code commit.*} metadata. Fix is to always call
+ * {@code buffer.drain(sessionId)} (the destructive cleanup) and gate ONLY
+ * the listener {@code dispatchOne} loop. Out of scope for the audit-spi
+ * PR; tracking ticket to be filed post-merge.
  */
 final class AuditDrainObserver implements Observer {
 

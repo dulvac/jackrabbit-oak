@@ -169,5 +169,11 @@ for ppi in 100 1000; do
 done
 ```
 
-Raw stdout from the run that produced the numbers in this document is
-in `head-observer-drain-d4725d1a4c.txt`.
+## Related documentation
+
+- [`audit.md`](audit.md) — user-facing Oak audit SPI guide
+  (event model, both producer paths, trust model, listener contract).
+- [`audit-design.md`](audit-design.md) — full design spec
+  (SPI shape, OSGi/embedded wiring, threading invariants, test patterns).
+- [`audit-design-overview.md`](audit-design-overview.md) — one-page
+  design view for PR descriptions and terminal `cat`.

@@ -46,6 +46,7 @@ import org.apache.jackrabbit.oak.plugins.index.diffindex.UUIDDiffIndexProviderWr
 import org.apache.jackrabbit.oak.query.ExecutionContext;
 import org.apache.jackrabbit.oak.query.QueryEngineImpl;
 import org.apache.jackrabbit.oak.query.QueryEngineSettings;
+import org.apache.jackrabbit.oak.spi.audit.AuditBufferLifecycle;
 import org.apache.jackrabbit.oak.spi.commit.CommitContext;
 import org.apache.jackrabbit.oak.spi.commit.CommitHook;
 import org.apache.jackrabbit.oak.spi.commit.CommitInfo;
@@ -58,8 +59,6 @@ import org.apache.jackrabbit.oak.spi.commit.PostValidationHook;
 import org.apache.jackrabbit.oak.spi.commit.ResetCommitAttributeHook;
 import org.apache.jackrabbit.oak.spi.commit.SimpleCommitContext;
 import org.apache.jackrabbit.oak.spi.commit.ValidatorProvider;
-import org.apache.jackrabbit.oak.spi.audit.AuditBufferLifecycle;
-import org.apache.jackrabbit.oak.spi.audit.AuditEvents;
 import org.apache.jackrabbit.oak.spi.query.QueryIndexProvider;
 import org.apache.jackrabbit.oak.spi.security.SecurityConfiguration;
 import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
@@ -236,9 +235,7 @@ class MutableRoot implements Root, PermissionAware {
     @Override
     public void rebase() {
         checkLive();
-        if (AuditEvents.isEnabled()) {
-            AuditBufferLifecycle.onRefresh(getContentSession().toString());
-        }
+        AuditBufferLifecycle.onRefresh(getContentSession().toString());
         store.rebase(builder);
         secureBuilder.baseChanged();
         if (permissionProvider.hasValue()) {
@@ -249,9 +246,7 @@ class MutableRoot implements Root, PermissionAware {
     @Override
     public final void refresh() {
         checkLive();
-        if (AuditEvents.isEnabled()) {
-            AuditBufferLifecycle.onRefresh(getContentSession().toString());
-        }
+        AuditBufferLifecycle.onRefresh(getContentSession().toString());
         store.reset(builder);
         secureBuilder.baseChanged();
         modCount = 0;
@@ -266,18 +261,14 @@ class MutableRoot implements Root, PermissionAware {
         ContentSession session = getContentSession();
         CommitInfo commitInfo = new CommitInfo(
                 session.toString(), session.getAuthInfo().getUserID(), newInfoWithCommitContext(info));
-        if (AuditEvents.isEnabled()) {
-            boolean merged = false;
-            try {
-                store.merge(builder, getCommitHook(), commitInfo);
-                merged = true;
-            } finally {
-                if (!merged) {
-                    AuditBufferLifecycle.onCommitFailed(commitInfo.getSessionId());
-                }
-            }
-        } else {
+        boolean merged = false;
+        try {
             store.merge(builder, getCommitHook(), commitInfo);
+            merged = true;
+        } finally {
+            if (!merged) {
+                AuditBufferLifecycle.onCommitFailed(commitInfo.getSessionId());
+            }
         }
         secureBuilder.baseChanged();
         modCount = 0;

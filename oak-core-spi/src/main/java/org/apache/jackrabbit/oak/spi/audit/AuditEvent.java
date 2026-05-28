@@ -148,8 +148,9 @@ public interface AuditEvent {
      * </ul>
      * Pass user identifiers, paths, timestamps, and other non-sensitive
      * scalars only. <strong>Oak does not redact or filter the payload at
-     * dispatch.</strong> See §9 of the audit-spi {@code design.md} for the
-     * producer-side responsibility under the open trust model.
+     * dispatch.</strong> See {@code oak-doc/src/site/markdown/security/audit-design.md}
+     * (§0 trust contract) for the producer-side responsibility under the
+     * open trust model.
      */
     @NotNull
     static AuditEvent of(@NotNull String domain,

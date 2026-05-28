@@ -194,6 +194,15 @@ public class AuditConfigurationImpl implements AuditConfiguration {
      * registry tracker, and silently overwrites the static
      * {@link AuditEvents} / {@link AuditBufferLifecycle} sinks. To rewire,
      * call {@link #dispose()} first.
+     * <p>
+     * <strong>Activation ordering rationale.</strong>
+     * {@link AuditBufferLifecycle#install AuditBufferLifecycle.install(buffer)}
+     * runs before
+     * {@link AuditEvents#install AuditEvents.install(BufferSink)} so that any
+     * concurrent capture arriving in the install window goes through the
+     * NOOP sink (no buffer write) rather than through a live {@code BufferSink}
+     * with an orphaned lifecycle handle. The inverse ordering would minimize
+     * lifecycle bypass but maximize silent capture loss; we prefer the former.
      *
      * @param whiteboard the whiteboard to register the {@code Feature}
      *                   toggle and {@code AuditEventListener} tracker on;

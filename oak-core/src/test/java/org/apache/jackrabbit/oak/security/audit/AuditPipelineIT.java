@@ -338,7 +338,7 @@ public class AuditPipelineIT {
     /**
      * After {@code root.rebase()} the staged events for the session must
      * be discarded. Same SPI listener ({@code onRefresh}) drives both
-     * refresh and rebase per the audit-spi v1 contract.
+     * refresh and rebase per the audit-spi contract.
      */
     @Test
     public void rebaseDiscardsStagedEvents() throws Exception {

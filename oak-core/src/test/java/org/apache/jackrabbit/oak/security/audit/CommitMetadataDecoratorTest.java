@@ -104,12 +104,12 @@ public class CommitMetadataDecoratorTest {
     //--------------------------------------------< overwrite invariant tests >---
     // Security-critical regression guards. The "commit.* keys are present
     // iff the event came from Oak's commit-attached pipeline" trust-model
-    // property in audit-spi spec §9.2 rests on the decorator
-    // UNCONDITIONALLY overwriting any caller-supplied commit.* key. A
-    // future refactor that swaps .put() for .putIfAbsent() / contains-check
-    // would silently let bundles spoof commit identity in audit logs.
-    // Each test pins one independent property a single-line regression
-    // could break.
+    // property (see audit-design.md §0 trust contract / §3 commit.* signal)
+    // rests on the decorator UNCONDITIONALLY overwriting any caller-supplied
+    // commit.* key. A future refactor that swaps .put() for .putIfAbsent() /
+    // contains-check would silently let bundles spoof commit identity in
+    // audit logs. Each test pins one independent property a single-line
+    // regression could break.
 
     @Test
     public void decoratorOverwritesCallerProvidedSessionId() {
