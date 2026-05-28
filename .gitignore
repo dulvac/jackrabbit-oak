@@ -16,8 +16,4 @@ oak-shaded-guava/dependency-reduced-pom.xml
 
 # AI tooling: kept locally for development, not part of the codebase.
 .claude/
-AGENTS.md
-CLAUDE.md
 .mcp.json
-
-wiki/
