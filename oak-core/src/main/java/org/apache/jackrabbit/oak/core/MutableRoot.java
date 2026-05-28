@@ -59,6 +59,7 @@ import org.apache.jackrabbit.oak.spi.commit.ResetCommitAttributeHook;
 import org.apache.jackrabbit.oak.spi.commit.SimpleCommitContext;
 import org.apache.jackrabbit.oak.spi.commit.ValidatorProvider;
 import org.apache.jackrabbit.oak.spi.audit.AuditBufferLifecycle;
+import org.apache.jackrabbit.oak.spi.audit.AuditEvents;
 import org.apache.jackrabbit.oak.spi.query.QueryIndexProvider;
 import org.apache.jackrabbit.oak.spi.security.SecurityConfiguration;
 import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
@@ -235,7 +236,9 @@ class MutableRoot implements Root, PermissionAware {
     @Override
     public void rebase() {
         checkLive();
-        AuditBufferLifecycle.onRefresh(getContentSession().toString());
+        if (AuditEvents.isEnabled()) {
+            AuditBufferLifecycle.onRefresh(getContentSession().toString());
+        }
         store.rebase(builder);
         secureBuilder.baseChanged();
         if (permissionProvider.hasValue()) {
@@ -246,7 +249,9 @@ class MutableRoot implements Root, PermissionAware {
     @Override
     public final void refresh() {
         checkLive();
-        AuditBufferLifecycle.onRefresh(getContentSession().toString());
+        if (AuditEvents.isEnabled()) {
+            AuditBufferLifecycle.onRefresh(getContentSession().toString());
+        }
         store.reset(builder);
         secureBuilder.baseChanged();
         modCount = 0;
@@ -261,14 +266,18 @@ class MutableRoot implements Root, PermissionAware {
         ContentSession session = getContentSession();
         CommitInfo commitInfo = new CommitInfo(
                 session.toString(), session.getAuthInfo().getUserID(), newInfoWithCommitContext(info));
-        boolean merged = false;
-        try {
-            store.merge(builder, getCommitHook(), commitInfo);
-            merged = true;
-        } finally {
-            if (!merged) {
-                AuditBufferLifecycle.onCommitFailed(commitInfo.getSessionId());
+        if (AuditEvents.isEnabled()) {
+            boolean merged = false;
+            try {
+                store.merge(builder, getCommitHook(), commitInfo);
+                merged = true;
+            } finally {
+                if (!merged) {
+                    AuditBufferLifecycle.onCommitFailed(commitInfo.getSessionId());
+                }
             }
+        } else {
+            store.merge(builder, getCommitHook(), commitInfo);
         }
         secureBuilder.baseChanged();
         modCount = 0;

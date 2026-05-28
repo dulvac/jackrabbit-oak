@@ -370,7 +370,9 @@ public class UserManagerImpl implements UserManager {
      * @throws RepositoryException If an error occurs.
      */
     void onGroupUpdate(@NotNull Group group, boolean isRemove, @NotNull Authorizable member) throws RepositoryException {
-        recordSingleMembershipAuditEvent(group, isRemove, member);
+        if (AuditEvents.isEnabled()) {
+            recordSingleMembershipAuditEvent(group, isRemove, member);
+        }
         for (GroupAction action : filterGroupActions()) {
             if (isRemove) {
                 action.onMemberRemoved(group, member, root, namePathMapper);
@@ -393,7 +395,9 @@ public class UserManagerImpl implements UserManager {
      * @throws RepositoryException If an error occurs.
      */
     void onGroupUpdate(@NotNull Group group, boolean isRemove, boolean isContentId, @NotNull Set<String> memberIds, @NotNull Set<String> failedIds) throws RepositoryException {
-        recordBulkMembershipAuditEvent(group, isRemove, isContentId, memberIds, failedIds);
+        if (AuditEvents.isEnabled()) {
+            recordBulkMembershipAuditEvent(group, isRemove, isContentId, memberIds, failedIds);
+        }
         for (GroupAction action : filterGroupActions()) {
             if (isRemove) {
                 action.onMembersRemoved(group, memberIds, failedIds, root, namePathMapper);
@@ -413,9 +417,6 @@ public class UserManagerImpl implements UserManager {
      * does not invoke {@code onGroupUpdate} for the failure path.
      */
     private void recordSingleMembershipAuditEvent(@NotNull Group group, boolean isRemove, @NotNull Authorizable member) {
-        if (!AuditEvents.isEnabled()) {
-            return;
-        }
         try {
             String groupPath = group.getPath();
             String memberPath = member.getPath();
@@ -438,7 +439,7 @@ public class UserManagerImpl implements UserManager {
      * completeness — listeners can distinguish "happened" vs "rejected".
      */
     private void recordBulkMembershipAuditEvent(@NotNull Group group, boolean isRemove, boolean isContentId, @NotNull Set<String> memberIds, @NotNull Set<String> failedIds) {
-        if (memberIds.isEmpty() || !AuditEvents.isEnabled()) {
+        if (memberIds.isEmpty()) {
             return;
         }
         try {

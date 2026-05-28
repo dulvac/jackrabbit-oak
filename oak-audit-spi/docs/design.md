@@ -684,10 +684,14 @@ The OSGi flow (`bundleContext.registerService(Observer.class.getName(), drainObs
 
 ## 7. MutableRoot lifecycle callouts
 
-The three callouts at `MutableRoot.java:238` (`rebase`), `:249` (`refresh`), `:270` (`commit` finally block) STAY. Confirmation:
+`MutableRoot` has three audit lifecycle callouts:
 
 - **`rebase()` / `refresh()`** → `AuditBufferLifecycle.onRefresh(sessionId)`. These paths discard pending transient changes — any audit events captured for the session that haven't yet been merged must be dropped. The observer is NOT invoked for a `refresh`/`rebase` (no `merge` happened), so the lifecycle callout is the only thing that drains the buffer.
 - **`commit()` finally → `if (!merged)`** → `AuditBufferLifecycle.onCommitFailed(sessionId)`. If `store.merge(...)` threw, the observer was never invoked (or the merge failure prevented it from reaching contentChanged dispatch). The lifecycle callout drains the buffer to prevent leaking events from a failed commit into a subsequent successful one on the same session.
+
+**All three callouts are gated by `AuditEvents.isEnabled()`.** When no `AuditConfigurationImpl` is installed (or `FT_AUDIT` is off, or no listener is registered), the gate returns `false` and the new wiring is skipped entirely — `MutableRoot.rebase` / `refresh` / `commit` execute byte-for-byte identical to the unwired baseline. When the gate returns `true`, `rebase` / `refresh` issue the `onRefresh` callout and `commit` runs inside a `try { ... } finally { if (!merged) onCommitFailed(...); }` so a failed merge still drains the buffer. The gate is one volatile read through the `AuditEvents.sink` field — no allocation, no method dispatch into the audit module.
+
+> **Race window.** If a listener registers between a capture-site `record()` and the surrounding `MutableRoot.commit()`, `AuditEvents.isEnabled()` may have been `false` at capture time and `true` at commit time. The capture-site short-circuit means no event was buffered, so the lifecycle gate at commit time has nothing to drain — net effect: events for this commit are dropped. The reverse (enabled→disabled across the commit) drops the buffer's contents on the next gated lifecycle callout, also net zero leak. Listener-registration churn during write traffic is bounded in practice; this is documented for completeness, not a recurring concern.
 
 These three callouts cover EXACTLY the cases the observer doesn't see. With the observer in place for the successful-commit path, the responsibility split is:
 
