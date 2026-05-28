@@ -20,6 +20,12 @@ buffering + drain + dispatch on every commit).
   audit).
 - Runtime: 30s per benchmark, 5s warmup. Each benchmark in its own JVM
   (isolation from prior-benchmark heap state).
+- The audit-ON pipeline can also be turned on for the *non-audit* fixture
+  family (`Oak-Memory`, `Oak-MemoryNS`) by setting the
+  `-Doak.audit.enabled=true` JVM property at startup. The dedicated
+  `Oak-MemoryNS-Audit` fixture is always audit-ON regardless of the
+  property — keep that fixture for the audit-OFF-vs-ON head-to-head where
+  both fixtures need to coexist in one JVM.
 
 ## Macro slice (oak-benchmarks)
 

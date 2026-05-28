@@ -99,6 +99,28 @@ public abstract class OakFixture {
     public static final String OAK_COMPOSITE_MEMORY_STORE = "Oak-Composite-Memory-Store";
     public static final String OAK_COMPOSITE_MONGO_STORE = "Oak-Composite-Mongo-Store";
 
+    /**
+     * System property that, when set to {@code true}, enables the audit
+     * pipeline on the in-memory fixtures produced by {@link #getMemory(long)},
+     * {@link #getMemoryNS(long)}, and {@link #getMemory(String, long)}.
+     * Defaults to {@code false} (audit-OFF) — the existing behaviour for
+     * every consumer that doesn't explicitly opt in.
+     * <p>
+     * When the property is set, the fixture wires an
+     * {@link AuditConfigurationImpl} on a fresh {@link DefaultWhiteboard},
+     * flips the {@code FT_AUDIT} feature toggle ON, registers a no-op
+     * {@link AuditEventListener} for the {@code oak.security} domain so
+     * Oak's security capture sites actually allocate / buffer / dispatch,
+     * and attaches the drain observer to every {@link MemoryNodeStore}
+     * the fixture builds. Tear-down detaches the observers and disposes
+     * the pipeline.
+     * <p>
+     * {@link #getMemoryNSWithAudit(long)} always returns an audit-enabled
+     * fixture regardless of this property — that's the entry point used
+     * by benchmark comparisons that need both an audit-OFF and an
+     * audit-ON fixture in the same JVM.
+     */
+    public static final String AUDIT_ENABLED_PROPERTY = "oak.audit.enabled";
 
     private final String name;
     protected final String unique;
@@ -131,58 +153,31 @@ public abstract class OakFixture {
         return getMemory(OAK_MEMORY_NS, cacheSize);
     }
 
-    public static OakFixture getMemory(String name, final long cacheSize) {
-        return new OakFixture(name) {
-
-            @Override
-            public Oak getOak(int clusterId) throws Exception {
-                Oak oak;
-                oak = newOak(new MemoryNodeStore());
-                return oak;
-            }
-
-            @Override
-            public Oak[] setUpCluster(int n, StatisticsProvider statsProvider) throws Exception {
-                Oak[] cluster = new Oak[n];
-                for (int i = 0; i < cluster.length; i++) {
-                    Oak oak;
-                    oak = newOak(new MemoryNodeStore());
-                    cluster[i] = oak;
-                }
-                return cluster;
-            }
-
-            @Override
-            public void tearDownCluster() {
-                // nothing to do
-            }
-        };
+    /**
+     * In-memory fixture. When the {@link #AUDIT_ENABLED_PROPERTY
+     * oak.audit.enabled} system property is set to {@code true} the audit
+     * pipeline is wired (see {@link #AUDIT_ENABLED_PROPERTY} for details);
+     * otherwise the fixture is audit-OFF and identical to the historical
+     * shape. Callers don't need to switch methods to opt into audit — just
+     * set the property at JVM startup.
+     */
+    public static OakFixture getMemory(String name, long cacheSize) {
+        return getMemory(name, cacheSize, Boolean.getBoolean(AUDIT_ENABLED_PROPERTY));
     }
 
     /**
-     * In-memory fixture with the audit pipeline wired and the
-     * {@code FT_AUDIT} feature toggle enabled. Companion to
-     * {@link #getMemoryNS(long)} for measuring the audit-ON cost shape
-     * (per-commit hook chain + capture-site allocation + buffer drain +
-     * listener dispatch).
-     * <p>
-     * One {@link AuditConfigurationImpl} is shared across all cluster
-     * elements: the audit pipeline uses JVM-static sinks
-     * ({@code AuditEvents.install}, {@code AuditBufferLifecycle.install})
-     * which would clobber each other under repeated init.
-     * <p>
-     * A NOOP {@link AuditEventListener} is registered for the
-     * {@link SecurityAuditDomain#NAME oak.security} domain so that
-     * {@code AuditEvents.isEnabledFor("oak.security")} returns {@code true}
-     * and the capture sites in
-     * {@code org.apache.jackrabbit.oak.security.user.UserManagerImpl}
-     * (member add/remove) actually allocate, buffer and dispatch
-     * events. Without a domain-matching listener, capture sites
-     * short-circuit before allocation and the benchmark degenerates
-     * into the audit-OFF measurement.
+     * Always-audit-enabled in-memory fixture. Use this when you need both
+     * an audit-OFF fixture (from {@link #getMemoryNS(long)}) and an
+     * audit-ON fixture in the same JVM — the typical shape for benchmark
+     * comparisons like {@code benchmark Test Oak-MemoryNS Oak-MemoryNS-Audit}.
+     * Ignores the {@link #AUDIT_ENABLED_PROPERTY} property.
      */
-    public static OakFixture getMemoryNSWithAudit(final long cacheSize) {
-        return new OakFixture(OAK_MEMORY_NS_AUDIT) {
+    public static OakFixture getMemoryNSWithAudit(long cacheSize) {
+        return getMemory(OAK_MEMORY_NS_AUDIT, cacheSize, true);
+    }
+
+    private static OakFixture getMemory(String name, final long cacheSize, final boolean withAudit) {
+        return new OakFixture(name) {
 
             private Whiteboard whiteboard;
             private SecurityProvider securityProvider;
@@ -190,7 +185,7 @@ public abstract class OakFixture {
             private final List<Closeable> drainObserverSubscriptions = new ArrayList<>();
 
             private synchronized void initAuditPipelineIfNeeded() {
-                if (auditConfig != null) {
+                if (!withAudit || auditConfig != null) {
                     return;
                 }
                 whiteboard = new DefaultWhiteboard();
@@ -220,18 +215,20 @@ public abstract class OakFixture {
                         Map.of());
             }
 
-            private synchronized Oak buildOakWithAudit() {
+            private synchronized Oak buildOak() {
                 MemoryNodeStore store = new MemoryNodeStore();
-                drainObserverSubscriptions.add(store.addObserver(auditConfig.getDrainObserver()));
-                return newOak(store)
-                        .with(securityProvider)
-                        .with(whiteboard);
+                Oak oak = newOak(store);
+                if (withAudit) {
+                    drainObserverSubscriptions.add(store.addObserver(auditConfig.getDrainObserver()));
+                    oak = oak.with(securityProvider).with(whiteboard);
+                }
+                return oak;
             }
 
             @Override
             public Oak getOak(int clusterId) {
                 initAuditPipelineIfNeeded();
-                return buildOakWithAudit();
+                return buildOak();
             }
 
             @Override
@@ -239,13 +236,16 @@ public abstract class OakFixture {
                 initAuditPipelineIfNeeded();
                 Oak[] cluster = new Oak[n];
                 for (int i = 0; i < cluster.length; i++) {
-                    cluster[i] = buildOakWithAudit();
+                    cluster[i] = buildOak();
                 }
                 return cluster;
             }
 
             @Override
             public void tearDownCluster() {
+                if (!withAudit) {
+                    return;
+                }
                 // Close observer subscriptions first so the drain observer
                 // detaches from each MemoryNodeStore before dispose() tears
                 // down the pipeline sinks behind it.
