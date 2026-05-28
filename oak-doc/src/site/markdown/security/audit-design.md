@@ -1,14 +1,14 @@
 # Audit pipeline design
 
 This document specifies the design of Oak's audit pipeline:
-- the SPI surface in `oak-audit-spi` and the security-domain extensions in `oak-security-spi`,
+- the SPI surface in `oak-core-spi` and the security-domain extensions in `oak-security-spi`,
 - the pipeline implementation in `oak-core`,
 - OSGi wiring,
 - embedded (non-OSGi) wiring,
 - threading and ordering invariants,
 - the test patterns that pin the contracts.
 
-For a one-page overview suitable for terminal `cat` and PR descriptions, see [`design-overview.md`](design-overview.md). For the user-facing guide (consumers of the SPI), see [`oak-doc/src/site/markdown/security/audit.md`](../../oak-doc/src/site/markdown/security/audit.md).
+For a one-page overview suitable for terminal `cat` and PR descriptions, see [`audit-design-overview.md`](audit-design-overview.md). For the user-facing guide (consumers of the SPI), see [`audit.md`](audit.md).
 
 ---
 
@@ -56,7 +56,7 @@ flowchart LR
         AEM_CAP["AEM / Sling / 3rd-party<br>any bundle, any time"]
     end
 
-    subgraph FACADE["oak-audit-spi · AuditEvents (static)"]
+    subgraph FACADE["oak-core-spi · AuditEvents (static)"]
         REC["record(root, event)"]
         DISP["dispatch(event)"]
     end
@@ -103,9 +103,9 @@ The commit-attached path flows `OAK_CAP → REC → BUF → VAL → DURABLE → 
 
 ## 3. SPI layout
 
-### 3.1 `oak-audit-spi`
+### 3.1 `oak-core-spi`
 
-`oak-audit-spi` is the domain-neutral audit SPI. It defines the event primitives (`AuditEvent`, `AuditEventListener`, `AuditEventEmitter`, the static `AuditEvents` façade, `AuditBufferLifecycle`) and the `AuditConfiguration` typed handle on the pipeline's runtime state. Package: `org.apache.jackrabbit.oak.spi.audit`.
+`oak-core-spi` is the domain-neutral audit SPI. It defines the event primitives (`AuditEvent`, `AuditEventListener`, `AuditEventEmitter`, the static `AuditEvents` façade, `AuditBufferLifecycle`) and the `AuditConfiguration` typed handle on the pipeline's runtime state. Package: `org.apache.jackrabbit.oak.spi.audit`.
 
 The `AuditConfiguration` interface:
 
@@ -197,11 +197,9 @@ Producer-side factories (the helpers that capture sites call to build a typed ev
 
 ### 3.3 Package-info versions
 
-- `oak-audit-spi/.../spi/audit/package-info.java` — `@Version("1.1.0")`. Binary-additive over the previous SPI shape.
-- `oak-security-spi/.../spi/security/audit/package-info.java` — `@Version("2.0.0")`. Reflects the breaking removal of the prior `AuditConfiguration` location (which moved into `oak-audit-spi`).
+- `oak-core-spi/.../spi/audit/package-info.java` — `@Version("1.0.0")`. Fresh package within `oak-core-spi`.
+- `oak-security-spi/.../spi/security/audit/package-info.java` — `@Version("2.0.0")`. Now contains only `SecurityAuditDomain` and `package-info.java`.
 - `oak-security-spi/.../spi/security/user/package-info.java` — `@Version("2.10.0")`. Minor-bump for the additive `UserAuditTypes` class.
-
-**`oak-security-spi/.../spi/security/audit/package-info.java`** — MAJOR bump required because `AuditConfiguration` is REMOVED from this package (it moves to `oak-audit-spi`). The bnd baseline check will flag the removal otherwise. Whatever the current `@Version` of the security-audit subpackage is (likely `1.0.0` or `1.1.0`), increment the major component. Post-freeze cleanup (see §3.2): the package was further trimmed — only `SecurityAuditDomain` and `package-info.java` remain in `spi/security/audit/`; `SecurityAuditTypes` moved to `spi/security/user/` (as `UserAuditTypes`) and `SecurityAuditEvents` was deleted (helpers moved to a package-private `UserAuditEvents` in `oak-core/.../security/user/`). MAJOR bump is still the correct call for both packages because of the `AuditConfiguration` removal plus the relocations.
 
 ---
 
@@ -536,7 +534,7 @@ For non-OSGi callers, the Observer is attached explicitly via `((Observable) sto
 
 ### 4.5 Files UNCHANGED (substance)
 
-- All of `oak-audit-spi/src/main/java/org/apache/jackrabbit/oak/spi/audit/*.java` except the NEW `AuditConfiguration.java`.
+- All of `oak-core-spi/src/main/java/org/apache/jackrabbit/oak/spi/audit/*.java` except the NEW `AuditConfiguration.java`.
 - `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/CommitMetadataDecorator.java`.
 - `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/AuditBuffer.java`.
 - `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/AuditEventEmitterImpl.java`.
@@ -755,11 +753,11 @@ All eight invariants confirmed. Design is locked on this foundation.
 | `SecurityProviderRegistrationTest` | The expected `getConfigurations()` count is 6 (Authentication, Authorization, User, Privilege, Principal, Token). Audit is NOT in this list — it's published as `AuditConfiguration`, not as a `SecurityConfiguration`. |
 | `AuditConfigurationImplTest` | New tests: (a) `@Activate` registers the `Observer` service via `bundleContext.registerService(Observer.class.getName(), ...)`; (b) `@Deactivate` unregisters it; (c) `getDrainObserver()` returns a non-null Observer post-`initialize`; (d) `getDrainObserver()` returns the SAME instance on repeat calls (singleton invariant — guards against accidental factory revert); (e) `getDrainObserver()` throws `IllegalStateException` pre-`initialize`; (f) `getDrainObserver()` throws `IllegalStateException` post-`dispose`; (g) `dispose()` throws `IllegalStateException` when called with `observerRegistration` still non-null (defense-in-depth check — simulate via OSGi-misuse setup that calls `dispose()` without first running `@Deactivate`). |
 | `AuditDrainObserverTest` (NEW) | Direct unit tests on the AuditDrainObserver class: (a) `isExternal()` short-circuit returns no-op; (b) toggle-off short-circuit; (c) empty-buffer no-op; (d) groupByDomain correctness; (e) per-listener `dispatchOne` Throwable isolation; (f) **OUTER Throwable barrier**: mock `buffer.drain` or a poisoned `AuditEvent` to throw, verify `contentChanged` returns normally and logs WARN; (g) multi-listener-multi-domain dispatch; (h) OAK_UNKNOWN sessionId no-op (optional, per shannon's defense-in-depth gate). |
-| `AuditConfigurationTest` (oak-security-spi) | **MOVED, not deleted**, to `oak-audit-spi/src/test/java/org/apache/jackrabbit/oak/spi/audit/AuditConfigurationTest.java`. Preserves institutional knowledge embedded in existing assertions (NAME constant, NOOP.isActive() = false, NOOP non-null). Per sage's invariant #4 caveat. |
+| `AuditConfigurationTest` (oak-security-spi) | **MOVED, not deleted**, to `oak-core-spi/src/test/java/org/apache/jackrabbit/oak/spi/audit/AuditConfigurationTest.java`. Preserves institutional knowledge embedded in existing assertions (NAME constant, NOOP.isActive() = false, NOOP non-null). Per sage's invariant #4 caveat. |
 | OSGi-deactivation race test (NEW) | Verify that `observerRegistration.unregister()` runs FIRST in `@Deactivate` and that no `contentChanged` invocation happens after it returns (per alex's §5.3 review). Mock `ServiceRegistration` and a `MemoryNodeStore`-Observable; commit on a separate thread mid-deactivate, assert observer is detached before `dispose()` proceeds. |
 
 Coverage gates:
-- `oak-audit-spi`: 100% line / 100% branch (preserves design.md §11). The NEW `AuditConfiguration.Noop.isActive()` body needs one line of test coverage.
+- `oak-core-spi`: 100% line / 100% branch (preserves design.md §11). The NEW `AuditConfiguration.Noop.isActive()` body needs one line of test coverage.
 - `oak-core` audit subpackage: covered by named tests per AGENTS.md's >80% rule. The new `AuditDrainObserver` should be fully covered.
 - `oak-security-spi`: 100% line / 100% branch UNCHANGED. We're REMOVING the AuditConfiguration interface from this module — no new gate concerns. The remaining audit-domain file in `spi/security/audit/` — `SecurityAuditDomain` — keeps its existing coverage. (Post-freeze cleanup: `SecurityAuditEvents` was deleted; `SecurityAuditTypes` was renamed to `UserAuditTypes` and moved to `spi/security/user/`, where it is covered alongside the rest of the user SPI. See §3.2.)
 
@@ -767,7 +765,7 @@ Coverage gates:
 
 ## 11. Design properties
 
-- **Audit is a top-level Oak concern, not a `SecurityConfiguration`.** Pipeline ownership lives in `AuditConfigurationImpl` (`oak-core`), published as an OSGi service of type `AuditConfiguration` (in `oak-audit-spi`). `SecurityProvider.getConfiguration(AuditConfiguration.class)` is **not** a valid lookup path; consumers `@Reference AuditConfiguration` directly or resolve via the `Whiteboard`.
+- **Audit is a top-level Oak concern, not a `SecurityConfiguration`.** Pipeline ownership lives in `AuditConfigurationImpl` (`oak-core`), published as an OSGi service of type `AuditConfiguration` (in `oak-core-spi`). `SecurityProvider.getConfiguration(AuditConfiguration.class)` is **not** a valid lookup path; consumers `@Reference AuditConfiguration` directly or resolve via the `Whiteboard`.
 
 - **Events never enter `CommitContext`.** `CommitContext` is a shared string-keyed channel observable to any `CommitHook` running in the same commit. Keeping audit events out of it eliminates a class of cross-bundle information disclosure.
 

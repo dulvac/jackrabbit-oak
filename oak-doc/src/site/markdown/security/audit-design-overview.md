@@ -1,9 +1,8 @@
 # Audit pipeline — design at a glance
 
 A short, plain-text view of the audit pipeline for PR descriptions and
-terminal `cat`. For the full spec see [`design.md`](design.md); for the
-user-facing guide see
-[`oak-doc/src/site/markdown/security/audit.md`](../../oak-doc/src/site/markdown/security/audit.md).
+terminal `cat`. For the full spec see [`audit-design.md`](audit-design.md);
+for the user-facing guide see [`audit.md`](audit.md).
 
 ## Summary
 
@@ -43,7 +42,7 @@ Commit-attached path (Oak-internal capture sites)
   UserAuditEvents.memberAdded(groupPath, memberPath)    [oak-core, package-private]
       |
       v
-  AuditEvents.record(root, event)                       [oak-audit-spi static facade]
+  AuditEvents.record(root, event)                       [oak-core-spi static facade]
       |
       v
   BufferSink.record(root, event)                        [oak-core, installed Sink;
@@ -83,7 +82,7 @@ Fire-and-forget path (any OSGi bundle)
   AuditEventEmitterImpl.emit(event)                     [oak-core, OSGi @Component]
       |
       v
-  AuditEvents.dispatch(event)                           [oak-audit-spi static facade]
+  AuditEvents.dispatch(event)                           [oak-core-spi static facade]
       |
       v
   BufferSink.dispatch(event)                            [oak-core, installed Sink]
@@ -101,13 +100,13 @@ Fire-and-forget path (any OSGi bundle)
 
 | Component | Module | Role |
 |---|---|---|
-| `AuditEvent` | `oak-audit-spi` | Generic event interface — domain, type, timestamp, payload. |
-| `AuditEventListener` | `oak-audit-spi` | Consumer SPI — `onEvents(List<AuditEvent>)`, scoped to a single domain (`getDomain()`), ordered by `getRank()`. |
-| `AuditEventEmitter` | `oak-audit-spi` | OSGi service surface for fire-and-forget emission from any bundle. |
-| `AuditEvents` | `oak-audit-spi` | Static facade — `record(root, event)` / `dispatch(event)`. Routes to the installed `Sink`. |
-| `AuditEvents.Sink` | `oak-audit-spi` | SPI for the pipeline implementation. Wired by `AuditConfigurationImpl` to a `BufferSink`. |
-| `AuditBufferLifecycle` | `oak-audit-spi` | `MutableRoot` lifecycle callouts — drain on refresh/rebase/commit-fail. |
-| `AuditConfiguration` | `oak-audit-spi` | Typed handle on the pipeline's runtime state (`isActive()`, `NAME`, `NOOP`). NOT a `SecurityConfiguration`. |
+| `AuditEvent` | `oak-core-spi` | Generic event interface — domain, type, timestamp, payload. |
+| `AuditEventListener` | `oak-core-spi` | Consumer SPI — `onEvents(List<AuditEvent>)`, scoped to a single domain (`getDomain()`), ordered by `getRank()`. |
+| `AuditEventEmitter` | `oak-core-spi` | OSGi service surface for fire-and-forget emission from any bundle. |
+| `AuditEvents` | `oak-core-spi` | Static facade — `record(root, event)` / `dispatch(event)`. Routes to the installed `Sink`. |
+| `AuditEvents.Sink` | `oak-core-spi` | SPI for the pipeline implementation. Wired by `AuditConfigurationImpl` to a `BufferSink`. |
+| `AuditBufferLifecycle` | `oak-core-spi` | `MutableRoot` lifecycle callouts — drain on refresh/rebase/commit-fail. |
+| `AuditConfiguration` | `oak-core-spi` | Typed handle on the pipeline's runtime state (`isActive()`, `NAME`, `NOOP`). NOT a `SecurityConfiguration`. |
 | `SecurityAuditDomain` | `oak-security-spi` (`spi/security/audit/`) | Security-domain constant — `NAME = "oak.security"`. |
 | `UserAuditTypes` | `oak-security-spi` (`spi/security/user/`) | Per-sub-domain type-string + payload-key constants for user-membership events. |
 | `UserAuditEvents` | `oak-core` (`security/user/`, package-private) | Producer-side factory used by `UserManagerImpl` capture sites. |
@@ -121,7 +120,6 @@ Fire-and-forget path (any OSGi bundle)
 
 ## Where to learn more
 
-- [`design.md`](design.md) — full design spec (SPI shape, OSGi/embedded wiring, threading invariants, test patterns).
-- [`oak-doc/src/site/markdown/security/audit.md`](../../oak-doc/src/site/markdown/security/audit.md) — user-facing Oak documentation (listener contract, payload conventions, trust model).
-- [`performance/README.md`](performance/README.md) — benchmark results and reproduction recipes.
-- [`pr-description.md`](pr-description.md) — PR body draft.
+- [`audit-design.md`](audit-design.md) — full design spec (SPI shape, OSGi/embedded wiring, threading invariants, test patterns).
+- [`audit.md`](audit.md) — user-facing Oak documentation (listener contract, payload conventions, trust model).
+- [`audit-performance.md`](audit-performance.md) — benchmark results and reproduction recipes.

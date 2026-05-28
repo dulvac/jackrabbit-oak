@@ -49,11 +49,11 @@ and bundle-emitted custom events through one entry point.
 
 | Module | Role |
 |---|---|
-| `oak-audit-spi`     | Domain-neutral SPI: [AuditEvent], [AuditEventListener], [AuditEventEmitter], `AuditEvents` static façade, and [AuditConfiguration] (typed handle on the pipeline's runtime state). |
-| `oak-security-spi`  | Security-domain constants: `SecurityAuditDomain.NAME` (the `"oak.security"` domain string) and per-sub-domain type-string classes (e.g., `UserAuditTypes` in the `spi.security.user` package). Depends on `oak-audit-spi`. `AuditConfiguration` lives in `oak-audit-spi`, not here — audit is not a `SecurityConfiguration`. |
+| `oak-core-spi`     | Domain-neutral SPI: [AuditEvent], [AuditEventListener], [AuditEventEmitter], `AuditEvents` static façade, and [AuditConfiguration] (typed handle on the pipeline's runtime state). |
+| `oak-security-spi`  | Security-domain constants: `SecurityAuditDomain.NAME` (the `"oak.security"` domain string) and per-sub-domain type-string classes (e.g., `UserAuditTypes` in the `spi.security.user` package). Depends on `oak-core-spi`. `AuditConfiguration` lives in `oak-core-spi`, not here — audit is not a `SecurityConfiguration`. |
 | `oak-core`          | Pipeline implementation: listener registry, commit-attached buffer, `AuditDrainObserver` (a `NodeStore` `Observer` that drains the buffer on commit success), `AuditEventEmitterImpl`, `AuditConfigurationImpl`. Producer-side factories (e.g., `UserAuditEvents` for membership capture sites) are package-private to their owning sub-package. |
 
-Consumer bundles depend on `oak-audit-spi` only. No transitive dependency on
+Consumer bundles depend on `oak-core-spi` only. No transitive dependency on
 `oak-core`, `oak-jcr`, or `oak-security-spi` is required to implement a
 listener or emit events.
 
