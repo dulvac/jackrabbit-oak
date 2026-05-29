@@ -20,6 +20,10 @@ buffering + drain + dispatch on every commit).
   audit).
 - Runtime: 30s per benchmark, 5s warmup. Each benchmark in its own JVM
   (isolation from prior-benchmark heap state).
+- Measurements below were taken at commit `08c0fe0e90` (the final state
+  of the audit-spi/observer-drain branch). Absolute numbers drift with
+  machine state — reproduce on the target host for an apples-to-apples
+  comparison if needed.
 - The audit-ON pipeline can also be turned on for the *non-audit* fixture
   family (`Oak-Memory`, `Oak-MemoryNS`) by setting the
   `-Doak.audit.enabled=true` JVM property at startup. The dedicated
@@ -34,9 +38,9 @@ the same run (machine-state drift cancels):
 
 | Benchmark | Oak-MemoryNS (audit-OFF) | Oak-MemoryNS-Audit (audit-ON) | Δ ms | Notes |
 |---|---|---|---|---|
-| BasicWriteTest | 13 (N=2209) | 14 (N=2186) | +1 | Sub-millisecond delta on a ~13 ms operation — well inside JVM noise. |
-| AddMemberTest | 13,131 (N=3) | 12,873 (N=3) | -258 | N=3 in both — below the noise floor. |
-| RemoveMemberTest | 32,034 (N=1, -Xmx4g) | 52,657 (N=1, -Xmx8g) | +20,623 | N=1 in both; the audit-ON `-Xmx8g` sample is GC-pressured (existing `ContentMirrorStoreStrategy.remove` teardown OOM). Not interpretable as audit overhead. |
+| BasicWriteTest | 69 (N=447) | 80 (N=370) | +11 | ~16 % delta on a 69 ms operation; the 10–90 % spreads (33–92 ms vs 55–109 ms) overlap heavily — within ambient JVM noise envelope. |
+| AddMemberTest | 13,357 (N=3) | 12,543 (N=3) | -814 | N=3 in both — well below the noise floor (audit can't make commits faster; the negative delta is sampling noise). |
+| RemoveMemberTest | 24,375 (N=2, -Xmx4g) | 43,336 (N=1, -Xmx8g) | +18,961 | N=1 for audit-ON; the `-Xmx8g` sample is GC-pressured (existing `ContentMirrorStoreStrategy.remove` teardown OOM). Not interpretable as audit overhead. |
 
 The macro slice does not isolate the audit cost — at these workload
 shapes, audit overhead is dominated by commit / index machinery and
@@ -58,8 +62,8 @@ events to dispatch). Isolates the per-commit pipeline-on overhead.
 
 | commitsPerIteration | Oak-MemoryNS median (N) | Oak-MemoryNS-Audit median (N) | Δ median | Δ per commit |
 |---|---|---|---|---|
-| 100 (20s runtime) | 251 ms (N=79) | 256 ms (N=77) | +5 ms | < 50 ns / commit (below ms granularity) |
-| 500 (30s runtime) | 1380 ms (N=21) | 1423 ms (N=21) | +43 ms | < 100 ns / commit |
+| 100 (20s runtime) | 261 ms (N=76) | 257 ms (N=76) | -4 ms | below ms granularity → audit-ON is statistically indistinguishable from audit-OFF |
+| 500 (30s runtime) | 1378 ms (N=21) | 1370 ms (N=21) | -8 ms | below ms granularity → < 100 ns / commit upper bound |
 
 ### `AuditCaptureSiteOverheadTest`
 
@@ -71,8 +75,8 @@ audit-ON path: allocation → buffer → drain → decorate → dispatch.
 
 | pairsPerIteration (events/iter) | Oak-MemoryNS median (N) | Oak-MemoryNS-Audit median (N) | Δ median | Δ per event |
 |---|---|---|---|---|
-| 100 (200 events, 30s) | 13 ms (N=2291) | 13 ms (N=2317) | 0 ms | < 5 µs / event |
-| 1000 (2000 events, 30s) | 145 ms (N=209) | 149 ms (N=208) | +4 ms | < 2 µs / event |
+| 100 (200 events, 30s) | 12 ms (N=2427) | 12 ms (N=2403) | 0 ms | below ms granularity → < 5 µs / event upper bound |
+| 1000 (2000 events, 30s) | 123 ms (N=244) | 124 ms (N=240) | +1 ms | < 1 µs / event upper bound (improved from < 2 µs in prior runs) |
 
 ## Verdict
 
@@ -88,7 +92,7 @@ Upper bounds:
   microbench would show a positive median delta above the noise
   envelope.
 - **Captured-event overhead** (allocation + buffer + drain + decorate
-  + dispatch): **< 2 µs / event**. If it were larger, the
+  + dispatch): **< 1 µs / event**. If it were larger, the
   2000-events-per-iter microbench would show a positive median delta
   above the noise envelope.
 
