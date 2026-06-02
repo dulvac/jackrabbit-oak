@@ -47,12 +47,6 @@ import org.osgi.annotation.versioning.ProviderType;
 public interface AuditConfiguration {
 
     /**
-     * Name of the audit configuration. Stable across releases — tooling
-     * may have coded against the constant.
-     */
-    String NAME = "org.apache.jackrabbit.oak.audit";
-
-    /**
      * Returns {@code true} when the audit pipeline is currently active —
      * i.e., the audit feature toggle is enabled AND at least one
      * {@link AuditEventListener} is registered on the Whiteboard. The

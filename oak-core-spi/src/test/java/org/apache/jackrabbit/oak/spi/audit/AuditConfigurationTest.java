@@ -18,16 +18,10 @@ package org.apache.jackrabbit.oak.spi.audit;
 
 import org.junit.Test;
 
-import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 
 public class AuditConfigurationTest {
-
-    @Test
-    public void nameConstantIsStable() {
-        assertEquals("org.apache.jackrabbit.oak.audit", AuditConfiguration.NAME);
-    }
 
     @Test
     public void noopSingletonIsNotNull() {
