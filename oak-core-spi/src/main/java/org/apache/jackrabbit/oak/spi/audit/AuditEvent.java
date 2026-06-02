@@ -96,14 +96,20 @@ public interface AuditEvent {
      * {@code commit.timestamp} when the buffer is drained on commit
      * success. Fire-and-forget events do not carry these entries.
      * <p>
-     * <strong>Trust contract.</strong> Oak <em>unconditionally overrides</em>
-     * any caller-supplied values for the {@code commit.sessionId},
-     * {@code commit.userId}, and {@code commit.timestamp} keys with the
-     * values from {@code CommitInfo} on the commit-attached path. Listeners
-     * may therefore treat the <em>presence</em> of {@code commit.*} keys as
-     * an Oak-attested commit (the caller cannot forge these values). The
-     * absence of these keys signals a fire-and-forget emission whose
-     * payload reflects the emitting bundle's claim only.
+     * <strong>Trust contract.</strong> On the commit-attached path Oak
+     * <em>unconditionally overrides</em> exactly three payload keys with the
+     * values from {@code CommitInfo}: {@code commit.sessionId},
+     * {@code commit.userId}, and {@code commit.timestamp}. These three keys
+     * — and only these three — are Oak-attested: a caller cannot forge them,
+     * so a listener may trust their values on a commit-attached event. Any
+     * other {@code commit.*} key is <strong>not</strong> protected: it is
+     * forwarded verbatim from the caller-supplied payload and must be treated
+     * as untrusted. Listeners MUST therefore anchor trust on the specific
+     * {@code commit.sessionId} / {@code commit.userId} / {@code commit.timestamp}
+     * entries, never on the {@code commit.} prefix in general. Fire-and-forget
+     * events carry none of the three Oak-attested keys (the drain decorator
+     * runs only on the commit-attached path); their entire payload reflects
+     * the emitting bundle's claim only.
      *
      * @return non-null, immutable payload map.
      */

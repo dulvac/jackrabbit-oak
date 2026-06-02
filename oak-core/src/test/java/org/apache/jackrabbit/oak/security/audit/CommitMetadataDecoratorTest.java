@@ -167,6 +167,54 @@ public class CommitMetadataDecoratorTest {
     }
 
     /**
+     * Trust-contract regression (inverse form): when a single caller-supplied
+     * payload spoofs ALL THREE Oak-attested keys at once
+     * ({@code commit.sessionId}, {@code commit.userId}, {@code commit.timestamp}),
+     * the decorator overwrites every one of them with the {@code CommitInfo}
+     * values. Pins the security property documented on
+     * {@link org.apache.jackrabbit.oak.spi.audit.AuditEvent#getPayload()}:
+     * exactly these three keys are Oak-attested and cannot be forged by the
+     * caller. Complements the per-key overwrite tests above by proving all
+     * three are protected within one event — a partial-overwrite regression
+     * that fixed only some keys would slip past single-key tests.
+     */
+    @Test
+    public void decoratorOverwritesAllThreeOakAttestedKeysSimultaneously() {
+        AuditEvent in = original("oak.security", "x", Map.of(
+                CommitMetadataDecorator.KEY_SESSION_ID, "spoofed-session",
+                CommitMetadataDecorator.KEY_USER_ID, "spoofed-user",
+                CommitMetadataDecorator.KEY_TIMESTAMP, 1L));
+        CommitInfo info = new CommitInfo("real-session", "real-user", Map.of(), false);
+        Map<String, Object> p = CommitMetadataDecorator.decorate(List.of(in), info).get(0).getPayload();
+
+        assertEquals("real-session", p.get(CommitMetadataDecorator.KEY_SESSION_ID));
+        assertEquals("real-user", p.get(CommitMetadataDecorator.KEY_USER_ID));
+        assertEquals(info.getDate(), p.get(CommitMetadataDecorator.KEY_TIMESTAMP));
+        assertNotEquals("spoofed-session", p.get(CommitMetadataDecorator.KEY_SESSION_ID));
+        assertNotEquals("spoofed-user", p.get(CommitMetadataDecorator.KEY_USER_ID));
+        assertNotEquals(1L, p.get(CommitMetadataDecorator.KEY_TIMESTAMP));
+    }
+
+    /**
+     * Pins the negative half of the trust contract: a {@code commit.*} key
+     * that is NOT one of the three Oak-attested keys is forwarded verbatim
+     * from the caller (it is untrusted). A listener must not treat the
+     * {@code commit.} prefix as a blanket attestation — only the three named
+     * keys are protected. See
+     * {@link org.apache.jackrabbit.oak.spi.audit.AuditEvent#getPayload()}.
+     */
+    @Test
+    public void decoratorDoesNotProtectOtherCommitPrefixedKeys() {
+        AuditEvent in = original("oak.security", "x", Map.of("commit.custom", "caller-supplied"));
+        CommitInfo info = new CommitInfo("s", "u", Map.of(), false);
+        Map<String, Object> p = CommitMetadataDecorator.decorate(List.of(in), info).get(0).getPayload();
+        // The three Oak-attested keys are added/overwritten...
+        assertEquals("s", p.get(CommitMetadataDecorator.KEY_SESSION_ID));
+        // ...but an arbitrary commit.* key is left exactly as the caller set it.
+        assertEquals("caller-supplied", p.get("commit.custom"));
+    }
+
+    /**
      * Symmetric to the overwrite tests: when the input payload omits the
      * commit.* keys entirely, the decorator ADDS them. A regression that
      * turned {@code .put()} into {@code if (containsKey) .put()} would
