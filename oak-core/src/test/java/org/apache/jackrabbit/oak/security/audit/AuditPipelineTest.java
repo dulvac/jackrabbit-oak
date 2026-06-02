@@ -91,7 +91,7 @@ import static org.junit.Assert.fail;
  * No test mirror of {@code BufferSink} or observer wiring exists in this
  * class; a bug in either pipeline will surface here.
  */
-public class AuditPipelineIT {
+public class AuditPipelineTest {
 
     private static final String DOMAIN = "test.domain";
     private static final String OTHER_DOMAIN = "other.domain";
@@ -144,7 +144,7 @@ public class AuditPipelineIT {
         // Bare-metal embedded wiring: attach the drain observer directly to the
         // Observable. We can't use Oak.with(Observer) here because the test
         // replaces Oak's default whiteboard via .with(whiteboard), which bypasses
-        // the auto-attach at Oak.java:300-302. See AuditPipelineIT class Javadoc.
+        // the auto-attach at Oak.java:300-302. See AuditPipelineTest class Javadoc.
         drainObserverSubscription = store.addObserver(auditConfig.getDrainObserver());
 
         repository = new Oak(store)
@@ -336,17 +336,25 @@ public class AuditPipelineIT {
     }
 
     /**
-     * After {@code root.rebase()} the staged events for the session must
-     * be discarded. Same SPI listener ({@code onRefresh}) drives both
-     * refresh and rebase per the audit-spi contract.
+     * After {@code root.rebase()} the staged events for the session must be
+     * PRESERVED — rebase keeps the session's transient changes (they are
+     * replayed on the new base), so the audit events captured alongside them
+     * must survive too and be dispatched on the eventual commit.
+     * <p>
+     * <strong>Intentional behavior change (review CONCERN):</strong> a prior
+     * iteration drained the buffer on rebase via {@code onRefresh}; that
+     * dropped audit events for changes that survived the rebase. The drain
+     * was removed from {@code MutableRoot.rebase()}. Contrast with
+     * {@link #refreshDiscardsStagedEvents()} — refresh discards transient
+     * changes and so still drains.
      */
     @Test
-    public void rebaseDiscardsStagedEvents() throws Exception {
+    public void rebasePreservesStagedEvents() throws Exception {
         try (ContentSession session = login()) {
             Root r1 = session.getLatestRoot();
             AuditEvents.record(
-                    r1, eventFor(DOMAIN, "discarded",
-                            Map.of("trace.id", "E1-discarded-by-rebase")));
+                    r1, eventFor(DOMAIN, "preserved",
+                            Map.of("trace.id", "E1-survives-rebase")));
             r1.rebase();
 
             Root r2 = session.getLatestRoot();
@@ -356,27 +364,36 @@ public class AuditPipelineIT {
             r2.getTree("/").setProperty("scratch", "v");
             r2.commit();
 
-            assertEquals("only E2 must be delivered", 1, received.size());
-            assertEquals("E2-after-rebase",
+            // Both events delivered, in capture order — E1 survived the rebase.
+            assertEquals("rebase must PRESERVE staged events; E1 and E2 both delivered",
+                    2, received.size());
+            assertEquals("E1-survives-rebase",
                     received.get(0).getPayload().get("trace.id"));
+            assertEquals("E2-after-rebase",
+                    received.get(1).getPayload().get("trace.id"));
         }
     }
 
-    //------------------------------< gate-transition discard tests >---
-    // These tests pin the invariant that the {@code MutableRoot}
-    // lifecycle callouts (refresh / rebase / commit-failed) MUST fire
-    // even when {@code AuditEvents.isEnabled()} is FALSE at the time
-    // the callout runs — otherwise a session whose buffer was populated
-    // with the gate ON, then sees the gate flip OFF before the
-    // lifecycle callout, then ON again before the next commit, leaks
-    // stale events that get dispatched against the LATER commit's
-    // metadata. {@code AuditEvents.isEnabled()} factors as
-    // {@code featureToggle.isEnabled() && registry.hasAnyListener()}
-    // (see {@code AuditConfigurationImpl.BufferSink.isEnabled}) so the
-    // gate flips OFF via two functionally identical sources:
+    //------------------------------< gate-transition tests >---
+    // These tests pin how the {@code MutableRoot} lifecycle callouts behave
+    // across a gate transition: the audit gate flips OFF between capture and
+    // the lifecycle event, then ON again before the next commit. The gate
+    // factors as {@code featureToggle.isEnabled() && registry.hasAnyListener()}
+    // (see {@code AuditConfigurationImpl.BufferSink.isEnabled}) so it can flip
+    // OFF via two functionally identical sources:
     //   1. Toggle flicker — {@code FT_AUDIT} flipped off at runtime.
     //   2. Listener churn — the only registered listener deregisters.
-    // Both sources × three lifecycle callouts → six regression tests.
+    //
+    // refresh() and commit-failure MUST drain even when the gate is OFF at
+    // callout time — otherwise a stale event survives the gate-OFF window and
+    // is later dispatched against a LATER commit's metadata (misattribution).
+    // Those callouts are therefore UNCONDITIONAL in MutableRoot. → 4 tests.
+    //
+    // rebase() is different: it PRESERVES the session's transient changes, so
+    // it intentionally does NOT drain (the audit events captured alongside
+    // those surviving changes must survive too). The 2 rebase variants below
+    // therefore assert PRESERVATION across the same gate transitions. → 2 tests.
+    // (Six gate-transition regression tests total.)
 
     /**
      * Toggle flips OFF between capture and refresh: the lifecycle
@@ -426,17 +443,19 @@ public class AuditPipelineIT {
     }
 
     /**
-     * Rebase variant of {@link #refreshDiscardsStagedEventsAcrossToggleFlicker}.
-     * Pins {@code MutableRoot.rebase()}'s always-fire callout under the
-     * same toggle-flicker pattern.
+     * Rebase variant of {@link #refreshDiscardsStagedEventsAcrossToggleFlicker}
+     * — but INVERTED: rebase PRESERVES staged events (it does not drain). The
+     * event captured before the rebase survives the toggle flicker and the
+     * rebase, and is delivered (alongside the post-rebase event) on the
+     * eventual commit, each keeping its own payload.
      */
     @Test
-    public void rebaseDiscardsStagedEventsAcrossToggleFlicker() throws Exception {
+    public void rebasePreservesStagedEventsAcrossToggleFlicker() throws Exception {
         try (ContentSession session = login()) {
             Root r1 = session.getLatestRoot();
             AuditEvents.record(
                     r1, eventFor(DOMAIN, "staged-by-r1",
-                            Map.of("trace.id", "E1-must-not-leak-via-toggle-rebase")));
+                            Map.of("trace.id", "E1-survives-rebase-toggle")));
 
             setToggle(false);
             r1.rebase();
@@ -449,10 +468,12 @@ public class AuditPipelineIT {
             r2.getTree("/").setProperty("scratch", "v");
             r2.commit();
 
-            assertEquals("only E2 must be delivered; E1 must NOT survive the toggle-flicker around rebase",
-                    1, received.size());
-            assertEquals("E2-current",
+            assertEquals("rebase preserves E1 across the toggle flicker; E1 and E2 both delivered",
+                    2, received.size());
+            assertEquals("E1-survives-rebase-toggle",
                     received.get(0).getPayload().get("trace.id"));
+            assertEquals("E2-current",
+                    received.get(1).getPayload().get("trace.id"));
         }
     }
 
@@ -562,15 +583,18 @@ public class AuditPipelineIT {
     }
 
     /**
-     * Listener-churn variant for {@code rebase}.
+     * Listener-churn variant for {@code rebase} — INVERTED like
+     * {@link #rebasePreservesStagedEventsAcrossToggleFlicker}: rebase
+     * preserves E1 across the listener churn; both E1 and E2 are delivered
+     * to the re-registered listener on commit.
      */
     @Test
-    public void rebaseDiscardsStagedEventsAcrossListenerChurn() throws Exception {
+    public void rebasePreservesStagedEventsAcrossListenerChurn() throws Exception {
         try (ContentSession session = login()) {
             Root r1 = session.getLatestRoot();
             AuditEvents.record(
                     r1, eventFor(DOMAIN, "staged-by-r1",
-                            Map.of("trace.id", "E1-must-not-leak-via-listener-churn-rebase")));
+                            Map.of("trace.id", "E1-survives-rebase-churn")));
 
             listenerRegistration.unregister();
             r1.rebase();
@@ -589,10 +613,12 @@ public class AuditPipelineIT {
             r2.getTree("/").setProperty("scratch", "v");
             r2.commit();
 
-            assertEquals("only E2 must be delivered; E1 must NOT survive the listener-churn around rebase",
-                    1, received.size());
-            assertEquals("E2-current",
+            assertEquals("rebase preserves E1 across the listener churn; E1 and E2 both delivered",
+                    2, received.size());
+            assertEquals("E1-survives-rebase-churn",
                     received.get(0).getPayload().get("trace.id"));
+            assertEquals("E2-current",
+                    received.get(1).getPayload().get("trace.id"));
         }
     }
 

@@ -27,8 +27,10 @@ import org.jetbrains.annotations.Nullable;
  *     <li>{@link #onCommitFailed(String)} — the surrounding
  *     {@code Root.commit()} threw before audit could dispatch.</li>
  *     <li>{@link #onRefresh(String)} — the session called
- *     {@code Root.refresh()} or {@code Root.rebase()}, discarding pending
- *     transient changes.</li>
+ *     {@code Root.refresh()}, discarding pending transient changes. Note:
+ *     {@code Root.rebase()} does NOT trigger this callback — rebase
+ *     preserves transient changes (they are replayed on the new base), so
+ *     the audit events staged alongside them must survive too.</li>
  * </ul>
  * When no audit module is deployed, the installed listener is a NOOP and
  * each call costs a single volatile read plus a virtual method dispatch.
@@ -56,9 +58,14 @@ public final class AuditBufferLifecycle {
         void onCommitFailed(@NotNull String sessionId);
 
         /**
-         * Invoked when {@code Root.refresh()} or {@code Root.rebase()}
-         * is called. The implementation must drop any events staged for
-         * the given session.
+         * Invoked when {@code Root.refresh()} is called, discarding the
+         * session's pending transient changes. The implementation must drop
+         * any events staged for the given session.
+         * <p>
+         * <strong>Not</strong> invoked by {@code Root.rebase()}: rebase
+         * preserves transient changes, so the audit events staged alongside
+         * them must survive the rebase and be dispatched on the eventual
+         * commit.
          *
          * @param sessionId the session id, non-null.
          */

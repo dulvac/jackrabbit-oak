@@ -235,7 +235,13 @@ class MutableRoot implements Root, PermissionAware {
     @Override
     public void rebase() {
         checkLive();
-        AuditBufferLifecycle.onRefresh(getContentSession().toString());
+        // Intentionally does NOT drain the audit buffer: rebase() preserves
+        // the session's transient changes (they are replayed on the new
+        // base), so the audit events captured alongside those surviving
+        // changes must survive too. Draining here would drop audit events
+        // for changes that are still pending and will be committed. Contrast
+        // with refresh(), which discards transient changes and therefore
+        // also drains the buffer.
         store.rebase(builder);
         secureBuilder.baseChanged();
         if (permissionProvider.hasValue()) {
