@@ -60,7 +60,7 @@ import static org.junit.Assert.assertTrue;
 /**
  * End-to-end integration test for the AUDIT-SPI production wiring path.
  * <p>
- * Unlike {@link AuditPipelineIT} which records events directly via
+ * Unlike {@link AuditPipelineTest} which records events directly via
  * {@code AuditEvents.record}, this test exercises the path that real Oak
  * consumers traverse:
  * <ol>
@@ -73,7 +73,7 @@ import static org.junit.Assert.assertTrue;
  * Asserts the entire chain: capture-site → buffer → observer drain →
  * decorator → listener.
  */
-public class AuditWiringIT {
+public class AuditWiringTest {
 
     private Whiteboard whiteboard;
     private AuditConfigurationImpl auditConfig;
