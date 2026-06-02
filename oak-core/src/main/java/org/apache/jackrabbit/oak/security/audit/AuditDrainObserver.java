@@ -17,6 +17,7 @@
 package org.apache.jackrabbit.oak.security.audit;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -82,17 +83,16 @@ import org.slf4j.LoggerFactory;
  * commit thread, so it can ONLY be drained on that same thread. Synchronous
  * dispatch is mandatory.
  *
- * <p><strong>TODO (OAK-NNNNN): toggle-flicker leak.</strong> The
- * {@code featureToggle.isEnabled()} short-circuit in {@link #doContentChanged}
- * returns without draining the per-session buffer when the toggle is off
- * at observer-fire time. If the toggle is ON at capture, OFF when a later
+ * <p><strong>Drain is unconditional; only dispatch is gated.</strong> The
+ * per-session buffer is drained for every local commit, even when the
+ * feature toggle is OFF at observer-fire time. The toggle (and the
+ * empty-buffer check) gate only the listener dispatch. This prevents a
+ * toggle-flicker leak: if the toggle is ON at capture, OFF when a later
  * successful commit on the same session fires the observer, then ON again
- * for a subsequent commit, the stale event survives the toggle-OFF drain
- * window and leaks through the next drain with the later commit's
- * {@code commit.*} metadata. Fix is to always call
- * {@code buffer.drain(sessionId)} (the destructive cleanup) and gate ONLY
- * the listener {@code dispatchOne} loop. Out of scope for the audit-spi
- * PR; tracking ticket to be filed post-merge.
+ * for a subsequent commit, an early return BEFORE the drain would leave the
+ * stale event in the buffer to be dispatched against the later commit's
+ * {@code commit.*} metadata (misattribution). Draining first, then gating
+ * dispatch, discards the staged event cleanly during the toggle-OFF window.
  */
 final class AuditDrainObserver implements Observer {
 
@@ -138,17 +138,20 @@ final class AuditDrainObserver implements Observer {
         if (info.isExternal()) {
             return;
         }
-        if (!featureToggle.isEnabled()) {
-            return;
-        }
         String sessionId = info.getSessionId();
         // The buffer is per-thread; this drain runs on the same thread that
         // called Root.commit() (synchronous Observer contract via
         // ChangeDispatcher for local commits). The sessionId returned by
         // CommitInfo equals ContentSession.toString() — set at
         // MutableRoot.java:262 — so it matches the buffer's keying.
+        //
+        // Drain UNCONDITIONALLY (before the toggle check) so a mid-flight
+        // toggle flip cannot strand a captured event in the buffer to be
+        // misattributed to a later commit — see the toggle-flicker note in
+        // the class Javadoc. The early return below then discards the drained
+        // events when there is nothing to dispatch OR the toggle is now off.
         List<AuditEvent> events = buffer.drain(sessionId);
-        if (events == null || events.isEmpty()) {
+        if (events == null || events.isEmpty() || !featureToggle.isEnabled()) {
             return;
         }
         List<AuditEventListener> listeners = registry.getListeners();
@@ -162,7 +165,9 @@ final class AuditDrainObserver implements Observer {
             if (forListener == null || forListener.isEmpty()) {
                 continue;
             }
-            dispatchOne(listener, forListener);
+            // Hand each listener an immutable view so one misbehaving listener
+            // cannot mutate the per-domain list seen by its peers.
+            dispatchOne(listener, Collections.unmodifiableList(forListener));
         }
     }
 

@@ -19,6 +19,7 @@ package org.apache.jackrabbit.oak.security.audit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.jackrabbit.oak.commons.junit.LogCustomizer;
 import org.apache.jackrabbit.oak.plugins.memory.EmptyNodeState;
@@ -130,12 +131,19 @@ public class AuditDrainObserverTest {
     }
 
     /**
-     * Toggle-off short-circuit: with the feature toggle disabled the
-     * observer returns before draining. Pins the second early-return
-     * branch in {@code doContentChanged}.
+     * Toggle-off behavior (CORRECTED — intentional, explicitly-requested
+     * change): the observer now drains the buffer UNCONDITIONALLY and gates
+     * only the dispatch on the toggle. With the toggle disabled it drains
+     * (so the staged event is discarded) but invokes no listener.
+     * <p>
+     * This is the fix for the toggle-flicker leak (see
+     * {@link #toggleFlipMidFlightDoesNotLeakStaleEvent} and the class
+     * Javadoc). Previously the observer returned BEFORE the drain, leaving
+     * the event staged to be misattributed to a later commit. The buffer is
+     * therefore now empty (drained), not retained.
      */
     @Test
-    public void toggleDisabledShortCircuitsBeforeDrain() {
+    public void toggleDisabledDrainsButDoesNotDispatch() {
         // Toggle defaults to disabled — explicit setToggle(false) for clarity.
         setToggle(false);
         CapturingListener listener = registerCapturingListener(DOMAIN_A);
@@ -145,7 +153,7 @@ public class AuditDrainObserverTest {
 
         assertTrue("toggle-off must not invoke listeners",
                 listener.received.isEmpty());
-        assertNotNull("buffer must retain events when pipeline is toggled off",
+        assertNull("toggle-off must STILL drain the buffer (no toggle-flicker leak)",
                 buffer.peek(SESSION_ID));
     }
 
@@ -458,6 +466,82 @@ public class AuditDrainObserverTest {
         // Buffer drained — events no longer staged for this session.
         assertNull("buffer must be drained on successful dispatch",
                 buffer.peek(SESSION_ID));
+    }
+
+    //------------------------------------< immutable dispatch list >---
+
+    /**
+     * Each listener must receive an IMMUTABLE view of its per-domain event
+     * list: an attempt to structurally mutate the supplied list throws
+     * {@link UnsupportedOperationException}. Guards the
+     * {@code Collections.unmodifiableList(...)} wrapping in
+     * {@code doContentChanged} so one misbehaving listener cannot corrupt
+     * the list another listener (on the same domain) will see.
+     */
+    @Test
+    public void listenerReceivesImmutableEventList() {
+        setToggle(true);
+        AtomicReference<Throwable> caught = new AtomicReference<>();
+        AuditEventListener mutating = new AuditEventListener() {
+            @Override public @NotNull String getDomain() { return DOMAIN_A; }
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                try {
+                    events.add(AuditEvent.of(DOMAIN_A, "injected"));
+                } catch (Throwable t) {
+                    caught.set(t);
+                }
+            }
+        };
+        whiteboard.register(AuditEventListener.class, mutating, Map.of());
+
+        buffer.record(SESSION_ID, AuditEvent.of(DOMAIN_A, "type-1"));
+        observer.contentChanged(ROOT, localCommit());
+
+        assertNotNull("listener's mutation attempt must have been rejected", caught.get());
+        assertTrue("mutation must throw UnsupportedOperationException; was: " + caught.get(),
+                caught.get() instanceof UnsupportedOperationException);
+    }
+
+    //------------------------------------< toggle-flicker (corrected) >---
+
+    /**
+     * Toggle-flicker corrected behavior (intentional, explicitly-requested
+     * change): an event captured with the toggle ON, then drained by a commit
+     * whose observer fires with the toggle OFF, is DISCARDED
+     * (drained-without-dispatch) and does NOT leak into a subsequent commit.
+     * The subsequent commit (toggle back ON) delivers only its OWN event —
+     * no misattribution of the stale event to the later commit's metadata.
+     * <p>
+     * Before the fix the observer returned BEFORE draining on toggle-off, so
+     * E1 survived in the buffer and was dispatched on the next commit
+     * decorated with E2's {@code commit.*} metadata. The unconditional drain
+     * now discards E1 during the toggle-OFF window. This directly pins the
+     * behavior change retuned in the {@code AuditPipelineTest} rebase tests.
+     */
+    @Test
+    public void toggleFlipMidFlightDoesNotLeakStaleEvent() {
+        CapturingListener listener = registerCapturingListener(DOMAIN_A);
+
+        // Commit #1: capture E1 with toggle ON, observer fires with toggle OFF.
+        setToggle(true);
+        buffer.record(SESSION_ID, AuditEvent.of(DOMAIN_A, "E1", Map.of("trace.id", "E1")));
+        setToggle(false);
+        observer.contentChanged(ROOT, localCommit());
+
+        assertTrue("toggle-off observer-fire must not dispatch", listener.received.isEmpty());
+        assertNull("E1 must be drained (not stranded) during the toggle-off window",
+                buffer.peek(SESSION_ID));
+
+        // Commit #2: toggle back ON, capture E2, observer fires. Only E2.
+        setToggle(true);
+        buffer.record(SESSION_ID, AuditEvent.of(DOMAIN_A, "E2", Map.of("trace.id", "E2")));
+        observer.contentChanged(ROOT, localCommit());
+
+        assertEquals("exactly one event must be delivered on commit #2",
+                1, listener.received.size());
+        assertEquals("delivered event must be E2, not the stale E1",
+                "E2", listener.received.get(0).getType());
+        assertEquals("E2", listener.received.get(0).getPayload().get("trace.id"));
     }
 
     //----------------------------------------------------------< fixtures >---
