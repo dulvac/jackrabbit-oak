@@ -29,6 +29,7 @@ import org.apache.jackrabbit.api.security.user.Group;
 import org.apache.jackrabbit.api.security.user.User;
 import org.apache.jackrabbit.oak.AbstractSecurityTest;
 import org.apache.jackrabbit.oak.api.Root;
+import org.apache.jackrabbit.oak.commons.junit.LogCustomizer;
 import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
 import org.apache.jackrabbit.oak.spi.audit.AuditEvents;
 import org.apache.jackrabbit.oak.spi.security.audit.SecurityAuditDomain;
@@ -38,6 +39,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.mockito.Mockito;
+import org.slf4j.event.Level;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -47,11 +49,11 @@ import static org.junit.Assert.assertTrue;
  * {@link UserManagerImpl#onGroupUpdate}.
  * <p>
  * End-to-end audit dispatch (commit-attached drain + listener invocation)
- * is exercised by {@code AuditWiringIT}/{@code AuditPipelineIT} which build
+ * is exercised by {@code AuditWiringTest}/{@code AuditPipelineTest} which build
  * a SecurityProvider with audit hooks wired into the commit chain. Those
- * tests are integration-tests and their coverage data lands in a separate
- * jacoco-it.exec — they don't satisfy the unit-test coverage gate that
- * applies to {@code org.apache.jackrabbit.oak.security.user}.
+ * tests live in {@code org.apache.jackrabbit.oak.security.audit}, so they do
+ * not satisfy the unit-test coverage gate that applies to
+ * {@code org.apache.jackrabbit.oak.security.user}.
  * <p>
  * This test installs a stub {@link AuditEvents.Sink} so the capture sites
  * exercise their on-path branches (toggle-on, isRemove true/false, single
@@ -225,6 +227,33 @@ public class UserManagerImplAuditTest extends AbstractSecurityTest {
             assertEquals("RepositoryException must not produce an audit event",
                     0, recordedEvents.size());
         } finally {
+            group.remove();
+            root.commit();
+        }
+    }
+
+    @Test
+    public void repeatedPathResolutionFailureWarnsOnceThenSuppresses() throws Exception {
+        // Two failures on the SAME UserManagerImpl: the first logs a WARN
+        // (audit-completeness signal); the second is suppressed to DEBUG. Pins
+        // the rate-limit branch in UserManagerImpl.warnAuditPathResolutionFailed.
+        // Both still swallow the event — capture never fails the group update.
+        UserManagerImpl userMgr = (UserManagerImpl) getUserManager(root);
+        Group group = userMgr.createGroup("auditTestGroupRepeat");
+        Authorizable failing = Mockito.mock(Authorizable.class);
+        Mockito.when(failing.getPath()).thenThrow(new RepositoryException("boom"));
+        LogCustomizer logCustomizer = LogCustomizer.forLogger(UserManagerImpl.class)
+                .enable(Level.WARN).create();
+        logCustomizer.starting();
+        try {
+            userMgr.onGroupUpdate(group, false, failing);
+            userMgr.onGroupUpdate(group, false, failing);
+            assertEquals("path-resolution failure must produce no audit events",
+                    0, recordedEvents.size());
+            assertEquals("exactly one WARN — the second occurrence is suppressed to DEBUG",
+                    1, logCustomizer.getLogs().size());
+        } finally {
+            logCustomizer.finished();
             group.remove();
             root.commit();
         }
