@@ -96,20 +96,29 @@ public interface AuditEvent {
      * {@code commit.timestamp} when the buffer is drained on commit
      * success. Fire-and-forget events do not carry these entries.
      * <p>
-     * <strong>Trust contract.</strong> On the commit-attached path Oak
-     * <em>unconditionally overrides</em> exactly three payload keys with the
-     * values from {@code CommitInfo}: {@code commit.sessionId},
-     * {@code commit.userId}, and {@code commit.timestamp}. These three keys
-     * — and only these three — are Oak-attested: a caller cannot forge them,
-     * so a listener may trust their values on a commit-attached event. Any
-     * other {@code commit.*} key is <strong>not</strong> protected: it is
-     * forwarded verbatim from the caller-supplied payload and must be treated
-     * as untrusted. Listeners MUST therefore anchor trust on the specific
-     * {@code commit.sessionId} / {@code commit.userId} / {@code commit.timestamp}
-     * entries, never on the {@code commit.} prefix in general. Fire-and-forget
-     * events carry none of the three Oak-attested keys (the drain decorator
-     * runs only on the commit-attached path); their entire payload reflects
-     * the emitting bundle's claim only.
+     * <strong>Trust contract.</strong> On the <em>commit-attached</em> path
+     * Oak <em>unconditionally overrides</em> exactly three payload keys with
+     * the values from {@code CommitInfo}: {@code commit.sessionId},
+     * {@code commit.userId} and {@code commit.timestamp} (via
+     * {@code CommitMetadataDecorator}); on that path those three cannot be
+     * forged by the caller. Every other {@code commit.*} key is forwarded
+     * verbatim from the caller-supplied payload — even on the commit path —
+     * and is untrusted; anchor trust on the three specific keys, never on the
+     * {@code commit.} prefix in general.
+     * <p>
+     * The <em>fire-and-forget</em> path
+     * ({@link AuditEventEmitter#emit(AuditEvent)} / {@code AuditEvents.dispatch})
+     * attests <strong>nothing</strong>: it forwards the caller payload
+     * undecorated, so a caller MAY itself populate {@code commit.sessionId} /
+     * {@code commit.userId} / {@code commit.timestamp} and Oak will neither
+     * overwrite nor strip them. A listener therefore <strong>cannot</strong>
+     * tell an Oak-attested commit-attached event from a fire-and-forget event
+     * that merely carries those keys by inspecting the payload alone — under
+     * Oak's open trust model the payload is never redacted or filtered at
+     * dispatch. Listeners that require attested commit identity must
+     * distinguish the delivery path out of band (e.g. a listener wired only to
+     * the commit-attached drain), not from the presence of {@code commit.*}
+     * keys.
      *
      * @return non-null, immutable payload map.
      */
