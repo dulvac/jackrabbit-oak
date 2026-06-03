@@ -143,12 +143,6 @@ import org.osgi.annotation.versioning.ProviderType;
 public interface AuditConfiguration {
 
     /**
-     * Name of the audit configuration. Stable across releases — tooling
-     * may have coded against the constant.
-     */
-    String NAME = "org.apache.jackrabbit.oak.audit";
-
-    /**
      * Returns {@code true} when the audit pipeline is currently active —
      * i.e., the audit feature toggle is enabled AND at least one
      * {@code AuditEventListener} is registered on the Whiteboard. The
@@ -539,8 +533,7 @@ For non-OSGi callers, the Observer is attached explicitly via `((Observable) sto
 - `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/AuditBuffer.java`.
 - `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/AuditEventEmitterImpl.java`.
 - `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/WhiteboardAuditEventListenerRegistry.java`.
-- `oak-core/src/main/java/org/apache/jackrabbit/oak/security/audit/NoOpAuditEventListener.java`.
-- `oak-core/src/main/java/org/apache/jackrabbit/oak/core/MutableRoot.java` — the 3 audit lifecycle callouts at lines 238/249/270 STAY. They cover paths the observer doesn't see (refresh, rebase, commit-fail before merge succeeds).
+- `oak-core/src/main/java/org/apache/jackrabbit/oak/core/MutableRoot.java` — the audit lifecycle callouts in `refresh()` and the `commit()` failure path STAY (they cover paths the observer doesn't see). The `rebase()` callout was REMOVED: rebase preserves transient changes, so the audit events staged alongside them must survive too and be dispatched on the eventual commit (rebase review fix).
 
 ---
 
