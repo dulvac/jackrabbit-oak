@@ -94,7 +94,8 @@ public interface AuditEvent {
      * For commit-attached events, Oak's drain path adds entries with the
      * keys {@code commit.sessionId}, {@code commit.userId}, and
      * {@code commit.timestamp} when the buffer is drained on commit
-     * success. Fire-and-forget events do not carry these entries.
+     * success. Oak does not <em>add</em> these entries on the fire-and-forget
+     * path (see the trust contract below).
      * <p>
      * <strong>Trust contract.</strong> On the <em>commit-attached</em> path
      * Oak <em>unconditionally overrides</em> exactly three payload keys with
