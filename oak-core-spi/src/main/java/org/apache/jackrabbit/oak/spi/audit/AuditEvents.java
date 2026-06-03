@@ -43,9 +43,9 @@ public final class AuditEvents {
         boolean isEnabled();
 
         /**
-         * Returns {@code true} when at least one listener is registered
-         * for the given domain. Used to avoid event allocation when no
-         * consumer cares about the domain.
+         * Returns {@code true} when the feature toggle is enabled AND at
+         * least one listener is registered for the given domain. Used to
+         * avoid event allocation when no consumer cares about the domain.
          */
         boolean isEnabledFor(@NotNull String domain);
 

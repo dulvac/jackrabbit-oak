@@ -99,6 +99,14 @@ final class AuditBuffer implements AuditBufferLifecycle.Listener {
             tl.set(bySession);
         }
         SessionBuffer sb = bySession.computeIfAbsent(sessionId, k -> new SessionBuffer());
+        // Soft per-session cap. Overflow drops the LATEST events with a
+        // WARN-once (no per-event log spam). Deferred follow-up: surface the
+        // truncation IN-BAND (e.g. an audit.system meta-domain overflow event
+        // carrying a dropped count) so a consumer sees the gap, not just a log
+        // line. Threat is narrow — an attacker would need write access AND a
+        // single transaction emitting >MAX_EVENTS_PER_SESSION audit events to
+        // push a later (sensitive) event past the cap; bounded and self-healing
+        // (the slot re-arms on the next drain/refresh).
         if (sb.events.size() >= MAX_EVENTS_PER_SESSION) {
             if (!sb.overflowWarned) {
                 sb.overflowWarned = true;

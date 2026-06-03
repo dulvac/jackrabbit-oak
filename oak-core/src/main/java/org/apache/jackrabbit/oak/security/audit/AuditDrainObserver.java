@@ -142,8 +142,8 @@ final class AuditDrainObserver implements Observer {
         // The buffer is per-thread; this drain runs on the same thread that
         // called Root.commit() (synchronous Observer contract via
         // ChangeDispatcher for local commits). The sessionId returned by
-        // CommitInfo equals ContentSession.toString() — set at
-        // MutableRoot.java:262 — so it matches the buffer's keying.
+        // CommitInfo equals ContentSession.toString() — set in
+        // MutableRoot.commit() — so it matches the buffer's keying.
         //
         // Drain UNCONDITIONALLY (before the toggle check) so a mid-flight
         // toggle flip cannot strand a captured event in the buffer to be
