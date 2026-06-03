@@ -454,6 +454,13 @@ public class AuditConfigurationImpl implements AuditConfiguration {
 
         @Override
         public void dispatch(@NotNull AuditEvent event) {
+            // Fire-and-forget path: the caller payload is forwarded UNDECORATED
+            // (no commit.* attestation). Optional hardening follow-up: strip
+            // commit.sessionId/userId/timestamp here so their presence becomes a
+            // reliable "Oak-attested commit" signal. Deferred — it only guards
+            // accidental misattribution (a malicious in-JVM caller bypasses it
+            // anyway), and Oak's open trust model does not filter payloads at
+            // dispatch. See the AuditEvent.getPayload() trust contract.
             if (!toggle.isEnabled()) {
                 return;
             }

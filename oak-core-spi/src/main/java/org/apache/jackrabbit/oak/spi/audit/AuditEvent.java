@@ -115,10 +115,12 @@ public interface AuditEvent {
      * tell an Oak-attested commit-attached event from a fire-and-forget event
      * that merely carries those keys by inspecting the payload alone — under
      * Oak's open trust model the payload is never redacted or filtered at
-     * dispatch. Listeners that require attested commit identity must
-     * distinguish the delivery path out of band (e.g. a listener wired only to
-     * the commit-attached drain), not from the presence of {@code commit.*}
-     * keys.
+     * dispatch. The presence of {@code commit.*} keys is therefore
+     * <strong>not</strong> a trustworthy attestation signal: the listener SPI
+     * delivers both the commit-attached and fire-and-forget paths through the
+     * same {@code AuditEventListener.onEvents} with no path indicator, so trust
+     * in commit identity must be established by constraining which bundles may
+     * emit (a deployment-level control), not inferred from the payload.
      *
      * @return non-null, immutable payload map.
      */
