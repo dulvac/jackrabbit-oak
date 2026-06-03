@@ -215,6 +215,38 @@ public class UserManagerImplAuditTest extends AbstractSecurityTest {
     }
 
     @Test
+    public void domainPreciseGateSkipsCaptureWhenNoSecurityListener() throws Exception {
+        // A4 regression guard: isEnabled()==true (a listener exists for SOME
+        // domain) but isEnabledFor("oak.security")==false (none for the security
+        // domain). The capture guard is domain-precise (isEnabledFor), so it must
+        // skip entirely — no event built, no path resolution, no record().
+        // Reverting the guard to the coarse isEnabled() would capture here, so
+        // this test fails on such a regression.
+        AuditEvents.install(new AuditEvents.Sink() {
+            @Override public boolean isEnabled() { return true; }
+            @Override public boolean isEnabledFor(@NotNull String domain) { return false; }
+            @Override public void record(@NotNull Root r, @NotNull AuditEvent event) {
+                recordedEvents.add(event);
+            }
+            @Override public void dispatch(@NotNull AuditEvent event) { /* unused */ }
+        });
+        UserManagerImpl userMgr = (UserManagerImpl) getUserManager(root);
+        User user = getTestUser();
+        Group group = userMgr.createGroup("auditTestGroupDomainGate");
+        try {
+            userMgr.onGroupUpdate(group, false, user);
+            userMgr.onGroupUpdate(group, false, false,
+                    new HashSet<>(Collections.singleton("memberId")),
+                    Collections.emptySet());
+            assertEquals("domain-precise gate must skip capture when no security-domain listener",
+                    0, recordedEvents.size());
+        } finally {
+            group.remove();
+            root.commit();
+        }
+    }
+
+    @Test
     public void singleMemberPathResolutionFailureSwallowsEvent() throws Exception {
         // Force RepositoryException from member.getPath() to exercise the catch
         // branch in recordSingleMembershipAuditEvent. record() must never be called.
