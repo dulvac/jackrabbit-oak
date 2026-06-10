@@ -17,22 +17,36 @@
 package org.apache.jackrabbit.oak.security.audit;
 
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.jackrabbit.oak.commons.junit.LogCustomizer;
 import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
 import org.apache.jackrabbit.oak.spi.commit.CommitInfo;
 import org.jetbrains.annotations.NotNull;
+import org.junit.Before;
 import org.junit.Test;
+import org.slf4j.event.Level;
 
 import static java.util.Arrays.asList;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 public class CommitMetadataDecoratorTest {
+
+    @Before
+    public void resetStripWarnLatch() {
+        // The strip WARN is once-per-JVM; reset so each test observes a
+        // deterministic latch state regardless of suite ordering.
+        CommitMetadataDecorator.STRIP_WARNED.set(false);
+    }
 
     private static AuditEvent original(@NotNull String domain, @NotNull String type, @NotNull Map<String, Object> payload) {
         return new AuditEvent() {
@@ -246,5 +260,145 @@ public class CommitMetadataDecoratorTest {
         } catch (UnsupportedOperationException expected) {
             // expected — Collections.unmodifiableMap wrapping
         }
+    }
+
+    //-----------------------------------< reserved-key strip (f-a-f path) >---
+    // stripReservedCommitKeys is the fire-and-forget counterpart of the
+    // overwrite invariant above: the commit-attached path OVERWRITES the
+    // three Oak-attested keys, the fire-and-forget path STRIPS them. Both
+    // enforce the same trust contract on AuditEvent#getPayload(): a
+    // dispatched payload carries those keys iff Oak put them there.
+
+    @Test
+    public void stripRemovesAllThreeReservedKeysAndKeepsTheRest() {
+        AuditEvent in = original("oak.security", "x", Map.of(
+                CommitMetadataDecorator.KEY_SESSION_ID, "forged-session",
+                CommitMetadataDecorator.KEY_USER_ID, "forged-user",
+                CommitMetadataDecorator.KEY_TIMESTAMP, 1L,
+                "commit.custom", "passenger",
+                "k", "v"));
+        AuditEvent stripped = CommitMetadataDecorator.stripReservedCommitKeys(in);
+
+        Map<String, Object> p = stripped.getPayload();
+        assertFalse(p.containsKey(CommitMetadataDecorator.KEY_SESSION_ID));
+        assertFalse(p.containsKey(CommitMetadataDecorator.KEY_USER_ID));
+        assertFalse(p.containsKey(CommitMetadataDecorator.KEY_TIMESTAMP));
+        // Only the three reserved keys are stripped — commit.-prefixed
+        // passengers and ordinary entries are forwarded verbatim.
+        assertEquals("passenger", p.get("commit.custom"));
+        assertEquals("v", p.get("k"));
+        // Domain/type/capture-timestamp survive: the wrapper delegates, it
+        // does NOT rebuild via AuditEvent.of() (which would reset the
+        // timestamp to wall-clock now).
+        assertEquals("oak.security", stripped.getDomain());
+        assertEquals("x", stripped.getType());
+        assertEquals(12345L, stripped.getTimestamp());
+        // Input event untouched.
+        assertEquals("forged-session", in.getPayload().get(CommitMetadataDecorator.KEY_SESSION_ID));
+    }
+
+    @Test
+    public void stripWithSingleReservedKeyStripsIt() {
+        AuditEvent in = original("oak.security", "x", Map.of(
+                CommitMetadataDecorator.KEY_USER_ID, "forged-user",
+                "k", "v"));
+        Map<String, Object> p = CommitMetadataDecorator.stripReservedCommitKeys(in).getPayload();
+        assertFalse("any one reserved key must trigger the strip",
+                p.containsKey(CommitMetadataDecorator.KEY_USER_ID));
+        assertEquals("v", p.get("k"));
+    }
+
+    @Test
+    public void stripReturnsSameInstanceWhenNoReservedKeyPresent() {
+        AuditEvent in = original("oak.security", "x", Map.of("commit.custom", "passenger", "k", "v"));
+        assertSame("clean payloads must not be wrapped — concrete event type preserved",
+                in, CommitMetadataDecorator.stripReservedCommitKeys(in));
+    }
+
+    /**
+     * No silent data deletion: the first strip in the JVM logs a WARN
+     * naming the stripped keys plus the event's domain and type — and
+     * NEVER the forged values (they are attacker-controlled and would
+     * poison the log). Subsequent strips stay at DEBUG so a persistent
+     * emitter cannot use the pipeline as a WARN-flood vector.
+     */
+    @Test
+    public void stripLogsWarnOnceWithKeyNamesButNeverValues() {
+        LogCustomizer log = LogCustomizer.forLogger(CommitMetadataDecorator.class)
+                .enable(Level.WARN).create();
+        log.starting();
+        try {
+            CommitMetadataDecorator.stripReservedCommitKeys(original("oak.security", "strip.warn.type",
+                    Map.of(CommitMetadataDecorator.KEY_SESSION_ID, "forged-session-value", "k", "v")));
+            CommitMetadataDecorator.stripReservedCommitKeys(original("oak.security", "strip.other.type",
+                    Map.of(CommitMetadataDecorator.KEY_USER_ID, "forged-user-value")));
+
+            List<String> logs = log.getLogs();
+            assertEquals("strip must WARN exactly once, then drop to DEBUG", 1, logs.size());
+            String warn = logs.get(0);
+            assertTrue("WARN must name the stripped key; was: " + warn,
+                    warn.contains(CommitMetadataDecorator.KEY_SESSION_ID));
+            assertTrue("WARN must name the event domain; was: " + warn,
+                    warn.contains("oak.security"));
+            assertTrue("WARN must name the event type; was: " + warn,
+                    warn.contains("strip.warn.type"));
+            assertFalse("WARN must never echo the forged value; was: " + warn,
+                    warn.contains("forged-session-value"));
+        } finally {
+            log.finished();
+        }
+    }
+
+    @Test
+    public void strippedPayloadIsUnmodifiable() {
+        // Mutable input payload on purpose: a stub that returned the input
+        // event (or its map) unchanged would let the put() succeed.
+        Map<String, Object> mutable = new HashMap<>();
+        mutable.put(CommitMetadataDecorator.KEY_SESSION_ID, "forged");
+        mutable.put("k", "v");
+        AuditEvent stripped = CommitMetadataDecorator.stripReservedCommitKeys(
+                original("oak.security", "x", mutable));
+        try {
+            stripped.getPayload().put("newkey", "newvalue");
+            fail("stripped payload must be unmodifiable — caller mutation must throw");
+        } catch (UnsupportedOperationException expected) {
+            // expected
+        }
+    }
+
+    /**
+     * TOCTOU regression: the strip consults {@code getPayload()} EXACTLY
+     * once and snapshots the filtered result eagerly in the wrapper
+     * constructor (mirrors {@code DecoratedAuditEvent}). {@link AuditEvent}
+     * is directly implementable, so a hostile implementation could return a
+     * clean map when checked and a forged one when the listener later reads
+     * it — lazy filtering or a second consult would re-open the hole this
+     * strip closes.
+     */
+    @Test
+    public void stripSnapshotsPayloadEagerlyFromSingleConsult() {
+        AtomicInteger consults = new AtomicInteger();
+        AuditEvent hostile = new AuditEvent() {
+            @Override public @NotNull String getDomain() { return "oak.security"; }
+            @Override public @NotNull String getType() { return "x"; }
+            @Override public long getTimestamp() { return 12345L; }
+            @Override public @NotNull Map<String, Object> getPayload() {
+                if (consults.incrementAndGet() == 1) {
+                    return Map.of(CommitMetadataDecorator.KEY_SESSION_ID, "forged", "k", "v");
+                }
+                return Map.of("toctou.marker", "swapped-after-check");
+            }
+        };
+        AuditEvent stripped = CommitMetadataDecorator.stripReservedCommitKeys(hostile);
+        assertEquals("strip must consult the delegate payload exactly once",
+                1, consults.get());
+
+        Map<String, Object> p = stripped.getPayload();
+        assertEquals("reading the stripped payload must not re-consult the delegate",
+                1, consults.get());
+        assertFalse(p.containsKey(CommitMetadataDecorator.KEY_SESSION_ID));
+        assertFalse("payload swapped in after the check must be invisible",
+                p.containsKey("toctou.marker"));
+        assertEquals("v", p.get("k"));
     }
 }

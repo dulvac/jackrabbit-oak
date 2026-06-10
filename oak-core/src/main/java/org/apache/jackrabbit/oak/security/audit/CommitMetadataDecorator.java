@@ -22,17 +22,22 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
 import org.apache.jackrabbit.oak.spi.commit.CommitInfo;
 import org.jetbrains.annotations.NotNull;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
- * Decorates audit-event payloads with commit metadata (sessionId, userId,
- * timestamp) at drain time. Used exclusively by the commit-attached
- * dispatch path. Fire-and-forget events bypass this decoration.
+ * Enforces the {@code commit.*} trust contract at both dispatch
+ * boundaries: {@link #decorate} stamps commit-attached payloads with
+ * commit metadata (sessionId, userId, timestamp) at drain time, and
+ * {@link #stripReservedCommitKeys} removes caller-supplied values for the
+ * same three keys from fire-and-forget payloads before delivery.
  * <p>
- * The decorator returns NEW {@link AuditEvent} instances that wrap the
+ * Both operations return NEW {@link AuditEvent} instances that wrap the
  * originals; the input events are not mutated. The wrapper's payload map
  * is unmodifiable.
  *
@@ -57,12 +62,90 @@ import org.jetbrains.annotations.NotNull;
  */
 final class CommitMetadataDecorator {
 
+    private static final Logger log = LoggerFactory.getLogger(CommitMetadataDecorator.class);
+
     static final String KEY_SESSION_ID = "commit.sessionId";
     static final String KEY_USER_ID = "commit.userId";
     static final String KEY_TIMESTAMP = "commit.timestamp";
 
+    /**
+     * One-shot latch for the strip WARN (package-private so tests can
+     * reset it). First strip in the JVM logs WARN; subsequent strips log
+     * DEBUG — an emitter that persistently sends reserved keys would
+     * otherwise hand any bundle a WARN-flood vector.
+     */
+    static final AtomicBoolean STRIP_WARNED = new AtomicBoolean();
+
     private CommitMetadataDecorator() {
         // utility class
+    }
+
+    /**
+     * Strips caller-supplied values for the three Oak-attested keys
+     * ({@link #KEY_SESSION_ID}, {@link #KEY_USER_ID}, {@link #KEY_TIMESTAMP})
+     * from a fire-and-forget payload. Applied by {@code BufferSink.dispatch}
+     * before listener delivery so the presence of those keys in a dispatched
+     * payload is a reliable Oak-attestation signal — the fire-and-forget
+     * counterpart of the unconditional overwrite in {@link #decorate}.
+     * Non-reserved {@code commit.*} keys and all other entries are forwarded
+     * verbatim; events without any reserved key are returned unchanged (no
+     * wrapping, no copy), preserving concrete event types for well-behaved
+     * emitters.
+     * <p>
+     * <strong>TOCTOU.</strong> The payload is consulted exactly once and the
+     * filtered snapshot is taken eagerly in the wrapper constructor —
+     * {@link AuditEvent} is directly implementable, so deciding on one
+     * {@code getPayload()} result and delivering another (lazy filtering, a
+     * second consult) would let a hostile implementation pass the check
+     * clean and hand listeners a forged map. A hostile implementation that
+     * instead returns a clean map to THIS consult escapes wrapping, but the
+     * snapshot listeners read is that same clean map; presenting forged keys
+     * later is only possible where Oak dispatch is not mediating (direct
+     * {@code listener.onEvents()} invocation) — the already-accepted
+     * deployment-boundary bypass.
+     * <p>
+     * The wrapper delegates domain/type/timestamp rather than rebuilding via
+     * {@link AuditEvent#of} — rebuilding would reset the capture timestamp
+     * to wall-clock now.
+     */
+    static @NotNull AuditEvent stripReservedCommitKeys(@NotNull AuditEvent event) {
+        Map<String, Object> payload = event.getPayload();
+        if (!payload.containsKey(KEY_SESSION_ID)
+                && !payload.containsKey(KEY_USER_ID)
+                && !payload.containsKey(KEY_TIMESTAMP)) {
+            return event;
+        }
+        logStrip(event, payload);
+        return new StrippedAuditEvent(event, payload);
+    }
+
+    private static void logStrip(@NotNull AuditEvent event, @NotNull Map<String, Object> payload) {
+        boolean firstTime = STRIP_WARNED.compareAndSet(false, true);
+        if (!firstTime && !log.isDebugEnabled()) {
+            return;
+        }
+        // Key NAMES only — the forged values are attacker-controlled and
+        // must never reach the log.
+        List<String> stripped = new ArrayList<>(3);
+        if (payload.containsKey(KEY_SESSION_ID)) {
+            stripped.add(KEY_SESSION_ID);
+        }
+        if (payload.containsKey(KEY_USER_ID)) {
+            stripped.add(KEY_USER_ID);
+        }
+        if (payload.containsKey(KEY_TIMESTAMP)) {
+            stripped.add(KEY_TIMESTAMP);
+        }
+        if (firstTime) {
+            log.warn("Stripped reserved commit attestation key(s) {} from fire-and-forget audit event"
+                    + " (domain '{}', type '{}'); these keys are Oak-attested and cannot be supplied"
+                    + " by emitters. Further occurrences are logged at DEBUG.",
+                    stripped, event.getDomain(), event.getType());
+        } else {
+            log.debug("Stripped reserved commit attestation key(s) {} from fire-and-forget audit event"
+                    + " (domain '{}', type '{}').",
+                    stripped, event.getDomain(), event.getType());
+        }
     }
 
     static @NotNull List<AuditEvent> decorate(@NotNull List<AuditEvent> events,
@@ -95,6 +178,33 @@ final class CommitMetadataDecorator {
             merged.put(KEY_USER_ID, userId);
             merged.put(KEY_TIMESTAMP, commitTimestamp);
             this.payload = Collections.unmodifiableMap(merged);
+        }
+
+        @Override public @NotNull String getDomain() { return delegate.getDomain(); }
+        @Override public @NotNull String getType() { return delegate.getType(); }
+        @Override public long getTimestamp() { return delegate.getTimestamp(); }
+        @Override public @NotNull Map<String, Object> getPayload() { return payload; }
+    }
+
+    /**
+     * Delegating wrapper whose payload is the eagerly-filtered snapshot of
+     * the single {@code getPayload()} consult taken in
+     * {@link #stripReservedCommitKeys} — see the TOCTOU note there. The
+     * delegate's payload accessor is never consulted again.
+     */
+    private static final class StrippedAuditEvent implements AuditEvent {
+
+        private final AuditEvent delegate;
+        private final Map<String, Object> payload;
+
+        StrippedAuditEvent(@NotNull AuditEvent delegate,
+                           @NotNull Map<String, Object> consultedPayload) {
+            this.delegate = Objects.requireNonNull(delegate, "delegate");
+            Map<String, Object> filtered = new HashMap<>(consultedPayload);
+            filtered.remove(KEY_SESSION_ID);
+            filtered.remove(KEY_USER_ID);
+            filtered.remove(KEY_TIMESTAMP);
+            this.payload = Collections.unmodifiableMap(filtered);
         }
 
         @Override public @NotNull String getDomain() { return delegate.getDomain(); }

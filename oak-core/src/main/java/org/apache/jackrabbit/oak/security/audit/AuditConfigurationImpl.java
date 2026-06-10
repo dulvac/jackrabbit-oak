@@ -454,13 +454,6 @@ public class AuditConfigurationImpl implements AuditConfiguration {
 
         @Override
         public void dispatch(@NotNull AuditEvent event) {
-            // Fire-and-forget path: the caller payload is forwarded UNDECORATED
-            // (no commit.* attestation). Optional hardening follow-up: strip
-            // commit.sessionId/userId/timestamp here so their presence becomes a
-            // reliable "Oak-attested commit" signal. Deferred — it only guards
-            // accidental misattribution (a malicious in-JVM caller bypasses it
-            // anyway), and Oak's open trust model does not filter payloads at
-            // dispatch. See the AuditEvent.getPayload() trust contract.
             if (!toggle.isEnabled()) {
                 return;
             }
@@ -468,8 +461,13 @@ public class AuditConfigurationImpl implements AuditConfiguration {
             if (listeners.isEmpty()) {
                 return;
             }
-            String domain = event.getDomain();
-            List<AuditEvent> single = Collections.singletonList(event);
+            // Fire-and-forget payloads are caller-supplied and undecorated:
+            // strip the three Oak-attested commit.* keys so their presence in
+            // any dispatched payload is a reliable "Oak-attested" signal —
+            // see the AuditEvent.getPayload() trust contract.
+            AuditEvent toDispatch = CommitMetadataDecorator.stripReservedCommitKeys(event);
+            String domain = toDispatch.getDomain();
+            List<AuditEvent> single = Collections.singletonList(toDispatch);
             for (AuditEventListener listener : listeners) {
                 if (!domain.equals(listener.getDomain())) {
                     continue;

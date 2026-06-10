@@ -65,6 +65,7 @@ import org.slf4j.event.Level;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -246,6 +247,66 @@ public class AuditPipelineTest {
             assertTrue(p.containsKey("commit.timestamp"));
             assertEquals("v", p.get("note"));
         }
+    }
+
+    //--------------------------< fire-and-forget attestation-key strip >---
+
+    /**
+     * Trust-contract regression (fire-and-forget half): an emitter that
+     * pre-populates the three Oak-attested keys ({@code commit.sessionId},
+     * {@code commit.userId}, {@code commit.timestamp}) must NOT get them
+     * delivered to listeners — {@code BufferSink.dispatch} strips exactly
+     * those three so their presence in a dispatched payload is a reliable
+     * "Oak-attested commit-attached event" signal (see
+     * {@link AuditEvent#getPayload()}). Without the strip, any bundle could
+     * forge commit identity in audit logs (CWE-345).
+     * <p>
+     * Only the three reserved keys are stripped: an arbitrary
+     * {@code commit.*}-prefixed passenger key and ordinary payload entries
+     * are forwarded verbatim — mirrors
+     * {@code CommitMetadataDecoratorTest#decoratorDoesNotProtectOtherCommitPrefixedKeys}
+     * on the commit-attached half.
+     */
+    @Test
+    public void fireAndForgetStripsForgedCommitAttestationKeys() {
+        emitter.emit(eventFor(DOMAIN, "forged", Map.of(
+                "commit.sessionId", "forged-session",
+                "commit.userId", "forged-admin",
+                "commit.timestamp", 99999999L,
+                "commit.custom", "passenger",
+                "key", "v")));
+
+        assertEquals(1, received.size());
+        Map<String, Object> p = received.get(0).getPayload();
+        assertFalse("forged commit.sessionId must be stripped on fire-and-forget dispatch",
+                p.containsKey("commit.sessionId"));
+        assertFalse("forged commit.userId must be stripped on fire-and-forget dispatch",
+                p.containsKey("commit.userId"));
+        assertFalse("forged commit.timestamp must be stripped on fire-and-forget dispatch",
+                p.containsKey("commit.timestamp"));
+        assertEquals("non-reserved commit.* keys are forwarded verbatim (untrusted)",
+                "passenger", p.get("commit.custom"));
+        assertEquals("ordinary payload entries are forwarded verbatim", "v", p.get("key"));
+        assertEquals("domain must survive the strip", DOMAIN, received.get(0).getDomain());
+        assertEquals("type must survive the strip", "forged", received.get(0).getType());
+    }
+
+    /**
+     * Conditional-wrap pin (passes before and after the strip fix; guards
+     * the GREEN implementation shape): an event WITHOUT any reserved
+     * {@code commit.*} key is dispatched as the SAME instance — no
+     * defensive wrapping, no payload copy. Emitters relying on concrete
+     * event subtypes (typed accessors) keep working on the
+     * fire-and-forget path as long as their payloads are clean.
+     */
+    @Test
+    public void fireAndForgetCleanPayloadDispatchesSameEventInstance() {
+        AuditEvent clean = eventFor(DOMAIN, "clean", Map.of("key", "v"));
+        emitter.emit(clean);
+
+        assertEquals(1, received.size());
+        assertSame("clean payloads must not be re-wrapped — concrete event type preserved",
+                clean, received.get(0));
     }
 
     //------------------------------------------------< new — discard tests >---
