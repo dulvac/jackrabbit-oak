@@ -19,10 +19,14 @@ package org.apache.jackrabbit.oak.security.audit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.jackrabbit.oak.spi.audit.AuditEventListener;
 import org.apache.jackrabbit.oak.spi.whiteboard.AbstractServiceTracker;
 import org.jetbrains.annotations.NotNull;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Whiteboard-backed registry of {@link AuditEventListener} services.
@@ -46,17 +50,40 @@ import org.jetbrains.annotations.NotNull;
  * relying on the underlying {@code Whiteboard} is not portable:
  * {@code DefaultWhiteboard} does not honor OSGi {@code service.ranking},
  * only {@code OsgiWhiteboard} does.
+ * <p>
+ * <strong>Accessor isolation.</strong> {@code getDomain()} and
+ * {@code getRank()} are listener code just like {@code onEvents()} — a
+ * consumer bundle with a broken classpath throws {@link LinkageError} from
+ * whichever method is called first. The per-listener isolation barrier
+ * documented on {@link AuditEventListener} therefore covers the accessors
+ * too: a listener whose accessor throws is skipped (logged at WARN once
+ * per listener identity, then DEBUG) instead of propagating into capture
+ * gates and dispatch loops, where the throw would either fail the
+ * user-facing write operation or starve healthy peer listeners.
  */
 final class WhiteboardAuditEventListenerRegistry
         extends AbstractServiceTracker<AuditEventListener> {
 
+    private static final Logger log =
+            LoggerFactory.getLogger(WhiteboardAuditEventListenerRegistry.class);
+
     /**
-     * Stable comparator descending by {@link AuditEventListener#getRank()};
-     * ties preserve {@code Whiteboard} insertion order because
-     * {@link List#sort(Comparator)} is stable.
+     * Stable comparator descending by the rank snapshotted into
+     * {@link Ranked}; ties preserve {@code Whiteboard} insertion order
+     * because {@link List#sort(Comparator)} is stable. Sorting operates on
+     * the snapshot so a throwing {@code getRank()} can never surface from
+     * inside the comparator.
      */
-    private static final Comparator<AuditEventListener> BY_RANK_DESC =
-            Comparator.comparingInt(AuditEventListener::getRank).reversed();
+    private static final Comparator<Ranked> BY_RANK_DESC =
+            Comparator.comparingInt((Ranked r) -> r.rank).reversed();
+
+    /**
+     * Identity keys of listeners already WARN-logged as broken — the skip
+     * itself is per-call (a listener that stops throwing is picked up
+     * again), only the WARN is latched. Bounded by the number of distinct
+     * broken listener instances seen over the registry's lifetime.
+     */
+    private final Set<String> warnedBroken = ConcurrentHashMap.newKeySet();
 
     WhiteboardAuditEventListenerRegistry() {
         super(AuditEventListener.class);
@@ -64,9 +91,12 @@ final class WhiteboardAuditEventListenerRegistry
 
     /**
      * Returns the currently registered listeners, sorted by
-     * {@link AuditEventListener#getRank()} descending (stable).
+     * {@link AuditEventListener#getRank()} descending (stable). Listeners
+     * whose {@code getRank()} throws are skipped — see the accessor
+     * isolation note in the class Javadoc.
      *
-     * @return non-null list of registered listeners (possibly empty).
+     * @return non-null immutable list of registered listeners (possibly
+     *         empty).
      */
     @NotNull
     List<AuditEventListener> getListeners() {
@@ -74,16 +104,23 @@ final class WhiteboardAuditEventListenerRegistry
         if (services.isEmpty()) {
             return List.of();
         }
-        // Always return an immutable copy — the underlying tracker may
-        // expose a live mutable view; we don't want callers to be able
-        // to mutate it. Sorting is a no-op for size 1 but we still copy
-        // to defend the contract.
-        if (services.size() == 1) {
-            return List.copyOf(services);
+        // Snapshot each rank under the per-listener guard BEFORE sorting.
+        // Every listener is vetted regardless of count — a lone broken
+        // listener must be skipped too, not returned through a fast path.
+        List<Ranked> ranked = new ArrayList<>(services.size());
+        for (AuditEventListener listener : services) {
+            try {
+                ranked.add(new Ranked(listener, listener.getRank()));
+            } catch (Throwable t) {
+                logBrokenListener(listener, "getRank()", t);
+            }
         }
-        List<AuditEventListener> sorted = new ArrayList<>(services);
-        sorted.sort(BY_RANK_DESC);
-        return sorted;
+        ranked.sort(BY_RANK_DESC);
+        List<AuditEventListener> out = new ArrayList<>(ranked.size());
+        for (Ranked r : ranked) {
+            out.add(r.listener);
+        }
+        return List.copyOf(out);
     }
 
     /**
@@ -111,10 +148,51 @@ final class WhiteboardAuditEventListenerRegistry
      */
     boolean hasListenerFor(@NotNull String domain) {
         for (AuditEventListener listener : getServices()) {
-            if (domain.equals(listener.getDomain())) {
-                return true;
+            try {
+                if (domain.equals(listener.getDomain())) {
+                    return true;
+                }
+            } catch (Throwable t) {
+                logBrokenListener(listener, "getDomain()", t);
             }
         }
         return false;
+    }
+
+    /**
+     * Logs a broken-accessor skip at WARN once per listener identity, then
+     * DEBUG — capture gates poll {@link #hasListenerFor} on every audited
+     * write, so an unconditional WARN would let one broken bundle flood the
+     * log. Keyed by instance identity, not class: a re-registered
+     * replacement instance warns again.
+     */
+    private void logBrokenListener(@NotNull AuditEventListener listener,
+                                   @NotNull String accessor,
+                                   @NotNull Throwable t) {
+        String key = listener.getClass().getName() + "@"
+                + Integer.toHexString(System.identityHashCode(listener));
+        if (warnedBroken.add(key)) {
+            log.warn("Skipping broken AuditEventListener {}: {} threw {}. The listener is"
+                    + " skipped per call until it stops throwing; further occurrences are"
+                    + " logged at DEBUG.",
+                    key, accessor, t.getClass().getSimpleName(), t);
+        } else {
+            log.debug("Skipping broken AuditEventListener {}: {} threw {}.",
+                    key, accessor, t.getClass().getSimpleName(), t);
+        }
+    }
+
+    /**
+     * Listener with its rank snapshotted under the accessor guard in
+     * {@link #getListeners()}.
+     */
+    private static final class Ranked {
+        final AuditEventListener listener;
+        final int rank;
+
+        Ranked(@NotNull AuditEventListener listener, int rank) {
+            this.listener = listener;
+            this.rank = rank;
+        }
     }
 }

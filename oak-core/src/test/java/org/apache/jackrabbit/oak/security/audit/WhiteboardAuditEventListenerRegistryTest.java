@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.apache.jackrabbit.oak.commons.junit.LogCustomizer;
 import org.apache.jackrabbit.oak.spi.audit.AuditEvent;
 import org.apache.jackrabbit.oak.spi.audit.AuditEventListener;
 import org.apache.jackrabbit.oak.spi.whiteboard.DefaultWhiteboard;
@@ -27,11 +28,13 @@ import org.apache.jackrabbit.oak.spi.whiteboard.Registration;
 import org.apache.jackrabbit.oak.spi.whiteboard.Whiteboard;
 import org.jetbrains.annotations.NotNull;
 import org.junit.Test;
+import org.slf4j.event.Level;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public class WhiteboardAuditEventListenerRegistryTest {
 
@@ -172,6 +175,177 @@ public class WhiteboardAuditEventListenerRegistryTest {
             // second call even with the same input.
             assertEquals("stable sort — repeat call returns identical order",
                     sorted, reg.getListeners());
+        } finally {
+            reg.stop();
+        }
+    }
+
+    //------------------------< broken-listener accessor isolation >-------
+
+    /**
+     * Listener whose {@code getDomain()} throws — models a consumer bundle
+     * with a broken classpath ({@link LinkageError} is exactly what a
+     * missing transitive dependency produces at first call).
+     */
+    private static final class ThrowingDomainListener implements AuditEventListener {
+        @Override public @NotNull String getDomain() {
+            throw new LinkageError("synthetic-getDomain");
+        }
+        @Override public int getRank() { return 100; }
+        @Override public void onEvents(@NotNull List<AuditEvent> events) {
+            fail("a listener with a broken getDomain() must never receive events");
+        }
+    }
+
+    /**
+     * Listener whose {@code getRank()} throws while {@code getDomain()}
+     * works — exercises the rank-snapshot guard in {@code getListeners()}
+     * independently of the domain guard.
+     */
+    private static final class ThrowingRankListener implements AuditEventListener {
+        private final String domain;
+        ThrowingRankListener(String domain) {
+            this.domain = domain;
+        }
+        @Override public @NotNull String getDomain() { return domain; }
+        @Override public int getRank() {
+            throw new RuntimeException("synthetic-getRank");
+        }
+        @Override public void onEvents(@NotNull List<AuditEvent> events) {
+            fail("a listener with a broken getRank() must never receive events");
+        }
+    }
+
+    /**
+     * {@code getDomain()}/{@code getRank()} are listener code just like
+     * {@code onEvents()} — the per-listener isolation barrier documented on
+     * {@link AuditEventListener} must cover them too. A lone broken
+     * listener must make {@code hasListenerFor} return {@code false}, not
+     * propagate the {@link LinkageError} into the capture gate.
+     */
+    @Test
+    public void hasListenerForToleratesThrowingGetDomain() {
+        Whiteboard wb = new DefaultWhiteboard();
+        WhiteboardAuditEventListenerRegistry reg = new WhiteboardAuditEventListenerRegistry();
+        reg.start(wb);
+        try {
+            wb.register(AuditEventListener.class, new ThrowingDomainListener(), Map.of());
+            assertFalse("broken listener must be skipped, not propagated",
+                    reg.hasListenerFor("oak.security"));
+        } finally {
+            reg.stop();
+        }
+    }
+
+    /**
+     * A broken peer must not mask a healthy listener: the registry skips
+     * the throwing listener and keeps scanning.
+     */
+    @Test
+    public void hasListenerForFindsHealthyListenerDespiteBrokenPeer() {
+        Whiteboard wb = new DefaultWhiteboard();
+        WhiteboardAuditEventListenerRegistry reg = new WhiteboardAuditEventListenerRegistry();
+        reg.start(wb);
+        try {
+            wb.register(AuditEventListener.class, new ThrowingDomainListener(), Map.of());
+            wb.register(AuditEventListener.class, new StubListener("oak.security", 0), Map.of());
+            assertTrue("healthy listener must be found despite broken peer",
+                    reg.hasListenerFor("oak.security"));
+        } finally {
+            reg.stop();
+        }
+    }
+
+    /**
+     * A throwing {@code getRank()} must exclude that listener from the
+     * sorted view instead of blowing up the sort — the rank comparator
+     * would otherwise rethrow from {@code List.sort} and abort dispatch
+     * for every listener.
+     */
+    @Test
+    public void getListenersSkipsListenerWhoseGetRankThrows() {
+        Whiteboard wb = new DefaultWhiteboard();
+        WhiteboardAuditEventListenerRegistry reg = new WhiteboardAuditEventListenerRegistry();
+        reg.start(wb);
+        try {
+            wb.register(AuditEventListener.class, new ThrowingRankListener("d"), Map.of());
+            wb.register(AuditEventListener.class, new StubListener("d", 10), Map.of());
+            wb.register(AuditEventListener.class, new StubListener("d", 1), Map.of());
+            List<AuditEventListener> out = reg.getListeners();
+            assertEquals("broken-rank listener must be skipped", 2, out.size());
+            assertEquals(10, out.get(0).getRank());
+            assertEquals(1, out.get(1).getRank());
+        } finally {
+            reg.stop();
+        }
+    }
+
+    /**
+     * The skip semantics must not depend on listener count: a broken
+     * listener that happens to be the only registration must be skipped
+     * too, not returned unvetted through a single-element fast path.
+     */
+    @Test
+    public void getListenersSkipsThrowingGetRankEvenWhenAlone() {
+        Whiteboard wb = new DefaultWhiteboard();
+        WhiteboardAuditEventListenerRegistry reg = new WhiteboardAuditEventListenerRegistry();
+        reg.start(wb);
+        try {
+            wb.register(AuditEventListener.class, new ThrowingRankListener("d"), Map.of());
+            assertTrue("a lone broken listener must be skipped, not returned",
+                    reg.getListeners().isEmpty());
+        } finally {
+            reg.stop();
+        }
+    }
+
+    /**
+     * Skipping a broken listener is logged at WARN exactly once per
+     * listener identity across all registry methods — repeated capture-gate
+     * polling must not flood the log on behalf of a broken bundle.
+     */
+    @Test
+    public void brokenListenerIsLoggedAtWarnOncePerListener() {
+        LogCustomizer logs = LogCustomizer
+                .forLogger(WhiteboardAuditEventListenerRegistry.class.getName())
+                .enable(Level.WARN)
+                .create();
+        Whiteboard wb = new DefaultWhiteboard();
+        WhiteboardAuditEventListenerRegistry reg = new WhiteboardAuditEventListenerRegistry();
+        reg.start(wb);
+        logs.starting();
+        try {
+            wb.register(AuditEventListener.class, new ThrowingDomainListener(), Map.of());
+            reg.hasListenerFor("oak.security");
+            reg.hasListenerFor("oak.security");
+            reg.getListeners();
+            assertEquals("exactly one WARN per broken listener identity",
+                    1, logs.getLogs().size());
+        } finally {
+            logs.finished();
+            reg.stop();
+        }
+    }
+
+    /**
+     * {@code getListeners()} promises an immutable snapshot in its Javadoc;
+     * the multi-listener (sorted) path must honor it like the other paths.
+     */
+    @Test
+    public void getListenersReturnsImmutableList() {
+        Whiteboard wb = new DefaultWhiteboard();
+        WhiteboardAuditEventListenerRegistry reg = new WhiteboardAuditEventListenerRegistry();
+        reg.start(wb);
+        try {
+            wb.register(AuditEventListener.class, new StubListener("d", 10), Map.of());
+            wb.register(AuditEventListener.class, new StubListener("d", 1), Map.of());
+            List<AuditEventListener> out = reg.getListeners();
+            try {
+                out.add(new StubListener("d", 0));
+                fail("getListeners() must return an immutable list");
+            } catch (UnsupportedOperationException expected) {
+                // contract honored
+            }
         } finally {
             reg.stop();
         }

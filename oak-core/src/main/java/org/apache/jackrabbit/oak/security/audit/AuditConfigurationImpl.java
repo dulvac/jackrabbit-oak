@@ -469,10 +469,15 @@ public class AuditConfigurationImpl implements AuditConfiguration {
             String domain = toDispatch.getDomain();
             List<AuditEvent> single = Collections.singletonList(toDispatch);
             for (AuditEventListener listener : listeners) {
-                if (!domain.equals(listener.getDomain())) {
-                    continue;
-                }
+                // The listener's getDomain() filter sits INSIDE the barrier —
+                // it is listener code just like onEvents(), and a throw here
+                // would otherwise escape into the emitter, breaching the
+                // published AuditEventEmitter contract ("never propagates
+                // back to the caller").
                 try {
+                    if (!domain.equals(listener.getDomain())) {
+                        continue;
+                    }
                     listener.onEvents(single);
                 } catch (Throwable t) {
                     // Per-listener isolation: a misconfigured consumer bundle whose listener
@@ -480,7 +485,8 @@ public class AuditConfigurationImpl implements AuditConfiguration {
                     // JVM-level pathology (OutOfMemoryError) is caught here too but
                     // re-triggers on the next allocation and surfaces through normal channels.
                     // Do not narrow this catch to RuntimeException — listener Throwables
-                    // (any kind) must not escape into the dispatch caller.
+                    // (any kind) must not escape into the dispatch caller. `domain` is the
+                    // EVENT's domain (computed before the loop), not a listener re-invocation.
                     log.warn("AuditEventListener {} threw {} on fire-and-forget dispatch in domain '{}'; isolating from other listeners.",
                             listener.getClass().getName(), t.getClass().getSimpleName(), domain, t);
                 }

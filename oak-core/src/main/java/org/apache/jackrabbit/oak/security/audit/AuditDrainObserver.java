@@ -66,10 +66,15 @@ import org.slf4j.LoggerFactory;
  *   suppresses in-memory commit-apply failures, so an audit-induced throw
  *   would mask a different kind of failure entirely. The outer Throwable
  *   barrier guarantees audit never masquerades as a commit failure.</li>
- *   <li><strong>Inner barrier</strong> per listener (in {@code dispatchOne}).
- *   A misconfigured consumer bundle whose listener throws
- *   {@link LinkageError}, {@link OutOfMemoryError}, or other {@link Throwable}
- *   subtypes does not stop other listeners.</li>
+ *   <li><strong>Inner barrier</strong> per listener (in {@code dispatchOne}),
+ *   covering the {@code getDomain()} routing lookup as well as
+ *   {@code onEvents()} — both are listener code. A misconfigured consumer
+ *   bundle whose listener throws {@link LinkageError},
+ *   {@link OutOfMemoryError}, or other {@link Throwable} subtypes does not
+ *   stop other listeners. Without the accessor coverage, a throwing
+ *   {@code getDomain()} would escape into the outer barrier and silently
+ *   starve every remaining listener of the already-drained (hence
+ *   unrecoverable) batch.</li>
  * </ul>
  *
  * <p><strong>DO NOT wrap this Observer in {@code BackgroundObserver}.</strong>
@@ -161,13 +166,7 @@ final class AuditDrainObserver implements Observer {
         List<AuditEvent> decorated = CommitMetadataDecorator.decorate(events, info);
         Map<String, List<AuditEvent>> byDomain = groupByDomain(decorated);
         for (AuditEventListener listener : listeners) {
-            List<AuditEvent> forListener = byDomain.get(listener.getDomain());
-            if (forListener == null || forListener.isEmpty()) {
-                continue;
-            }
-            // Hand each listener an immutable view so one misbehaving listener
-            // cannot mutate the per-domain list seen by its peers.
-            dispatchOne(listener, Collections.unmodifiableList(forListener));
+            dispatchOne(listener, byDomain);
         }
     }
 
@@ -180,19 +179,28 @@ final class AuditDrainObserver implements Observer {
     }
 
     private static void dispatchOne(@NotNull AuditEventListener listener,
-                                    @NotNull List<AuditEvent> events) {
+                                    @NotNull Map<String, List<AuditEvent>> byDomain) {
+        // The getDomain() routing lookup sits INSIDE the barrier — it is
+        // listener code just like onEvents(), and a throw escaping to the
+        // outer barrier would starve every remaining listener.
         try {
-            listener.onEvents(events);
+            List<AuditEvent> forListener = byDomain.get(listener.getDomain());
+            if (forListener == null || forListener.isEmpty()) {
+                return;
+            }
+            // Hand each listener an immutable view so one misbehaving listener
+            // cannot mutate the per-domain list seen by its peers.
+            listener.onEvents(Collections.unmodifiableList(forListener));
         } catch (Throwable t) {
             // Per-listener isolation: a misconfigured consumer bundle whose listener
             // throws e.g. LinkageError must not crash the commit-dispatch path for
             // unrelated work. JVM-level pathology (OutOfMemoryError) is caught here
             // too but re-triggers on the next allocation and surfaces through normal
             // channels. Do not narrow this catch to RuntimeException — listener
-            // Throwables (any kind) must not escape into the dispatch loop.
-            log.warn("AuditEventListener {} threw {} for {} event(s) in domain '{}'; isolating from other listeners.",
-                    listener.getClass().getName(), t.getClass().getSimpleName(),
-                    events.size(), listener.getDomain(), t);
+            // Throwables (any kind) must not escape into the dispatch loop. The log
+            // must not re-invoke getDomain(): it may be exactly what threw.
+            log.warn("AuditEventListener {} threw {} during commit-attached dispatch; isolating from other listeners.",
+                    listener.getClass().getName(), t.getClass().getSimpleName(), t);
         }
     }
 }

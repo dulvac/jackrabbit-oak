@@ -991,6 +991,66 @@ public class AuditPipelineTest {
         }
     }
 
+    /**
+     * Accessor variant of fire-and-forget isolation, with the published
+     * {@link AuditEventEmitter#emit} contract at stake: listener failures
+     * "never propagate back to the caller" — and {@code getDomain()} is
+     * listener code just like {@code onEvents()}. A listener whose
+     * {@code getDomain()} throws {@link LinkageError} (broken consumer-bundle
+     * classpath) must neither escape {@code emit()} into the calling write
+     * operation nor prevent the healthy listener from receiving the event.
+     */
+    @Test
+    public void fireAndForgetBrokenGetDomainListenerDoesNotThrowToEmitter() {
+        AuditEventListener brokenDomain = new AuditEventListener() {
+            @Override public @NotNull String getDomain() {
+                throw new LinkageError("synthetic-getDomain");
+            }
+            @Override public int getRank() { return 10; } // consulted first
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                fail("a listener with a broken getDomain() must never receive events");
+            }
+        };
+        Registration reg = whiteboard.register(AuditEventListener.class, brokenDomain, Map.of());
+        try {
+            emitter.emit(eventFor(DOMAIN, "x", Map.of("key", "v")));
+            assertEquals("healthy listener must receive despite peer's broken getDomain()",
+                    1, received.size());
+        } finally {
+            reg.unregister();
+        }
+    }
+
+    /**
+     * Capture-gate variant: {@link AuditEventEmitter#isEnabledFor} — the
+     * probe capture sites consult BEFORE staging an event — must tolerate a
+     * broken listener too. Without the registry-level guard, the throwing
+     * {@code getDomain()} escapes through {@code BufferSink.isEnabledFor}
+     * into the capture site and fails the user-facing write operation.
+     */
+    @Test
+    public void captureGateIsEnabledForToleratesBrokenListener() {
+        AuditEventListener brokenDomain = new AuditEventListener() {
+            @Override public @NotNull String getDomain() {
+                throw new LinkageError("synthetic-getDomain");
+            }
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                fail("a listener with a broken getDomain() must never receive events");
+            }
+        };
+        Registration reg = whiteboard.register(AuditEventListener.class, brokenDomain, Map.of());
+        try {
+            // Unserved domain first — the full registry scan must consult
+            // (and skip) the broken listener, never propagate its throw.
+            assertFalse("gate must return false (not throw) for an unserved domain",
+                    emitter.isEnabledFor("no.such.domain"));
+            assertTrue("gate must find the healthy fixture listener despite the broken peer",
+                    emitter.isEnabledFor(DOMAIN));
+        } finally {
+            reg.unregister();
+        }
+    }
+
     //------------------------< masquerade-prevention (sage invariant I8) >---
 
     /**

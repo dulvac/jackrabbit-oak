@@ -19,6 +19,7 @@ package org.apache.jackrabbit.oak.security.audit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.jackrabbit.oak.commons.junit.LogCustomizer;
@@ -40,6 +41,7 @@ import org.junit.Test;
 import org.slf4j.event.Level;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -316,6 +318,39 @@ public class AuditDrainObserverTest {
         assertEquals("second listener must receive despite first listener throwing "
                         + thrown.getClass().getSimpleName(),
                 1, okSecond.received.size());
+    }
+
+    /**
+     * Per-listener isolation must cover the {@code getDomain()} ACCESSOR,
+     * not just {@code onEvents()}: routing consults each listener's domain
+     * to pick its per-domain event slice, and a listener whose
+     * {@code getDomain()} throws at that point must be skipped — not allowed
+     * to escape into the outer barrier, which would silently starve every
+     * remaining listener of an already-drained (hence unrecoverable) batch.
+     */
+    @Test
+    public void listenerGetDomainThrowableDoesNotStarvePeerListeners() {
+        setToggle(true);
+        AtomicBoolean brokenInvoked = new AtomicBoolean();
+        AuditEventListener brokenDomain = new AuditEventListener() {
+            @Override public @NotNull String getDomain() {
+                throw new LinkageError("synthetic-getDomain");
+            }
+            @Override public int getRank() { return 100; } // routed first
+            @Override public void onEvents(@NotNull List<AuditEvent> events) {
+                brokenInvoked.set(true);
+            }
+        };
+        whiteboard.register(AuditEventListener.class, brokenDomain, Map.of());
+        CapturingListener okSecond = registerCapturingListener(DOMAIN_A);
+
+        buffer.record(SESSION_ID, AuditEvent.of(DOMAIN_A, "type-1"));
+        observer.contentChanged(ROOT, localCommit());
+
+        assertEquals("healthy listener must receive despite peer's broken getDomain()",
+                1, okSecond.received.size());
+        assertFalse("a listener with a broken getDomain() must never receive events",
+                brokenInvoked.get());
     }
 
     //------------------------< outer (whole-method) Throwable barrier >---
