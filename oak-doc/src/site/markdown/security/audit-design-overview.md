@@ -90,10 +90,11 @@ Fire-and-forget path (any OSGi bundle)
       |-- if FT_AUDIT disabled   -> return
       |-- if no listeners        -> return
       |
-      |  for each listener whose getDomain() matches event.getDomain():
-      |  INNER per-listener Throwable barrier wraps the call below
+      |  strip caller-supplied reserved commit.* attestation keys
+      |  for each listener: INNER per-listener Throwable barrier wraps
+      |  the getDomain() match and the onEvents() call below
       v
-  AuditEventListener.onEvents([event])                  [no payload decoration]
+  AuditEventListener.onEvents([event])                  [no decoration beyond the strip]
 ```
 
 ## Key components
@@ -113,7 +114,7 @@ Fire-and-forget path (any OSGi bundle)
 | `AuditBuffer` | `oak-core` | `ThreadLocal` per-session event buffer. |
 | `BufferSink` | `oak-core` (in `AuditConfigurationImpl`) | `AuditEvents.Sink` impl — gates on `FT_AUDIT` + listener presence, buffers on `record`, dispatches inline on `dispatch`. |
 | `AuditDrainObserver` | `oak-core` | `NodeStore` `Observer` that drains the buffer on commit success. OUTER + INNER `Throwable` barriers. |
-| `CommitMetadataDecorator` | `oak-core` | Adds `commit.*` payload entries on the commit-attached path. |
+| `CommitMetadataDecorator` | `oak-core` | Stamps the three reserved `commit.*` attestation entries at drain time (commit-attached) and strips caller-supplied values for the same keys at dispatch (fire-and-forget). |
 | `AuditEventEmitterImpl` | `oak-core` | OSGi `@Component` implementing `AuditEventEmitter`. Delegates to `AuditEvents.dispatch`. |
 | `WhiteboardAuditEventListenerRegistry` | `oak-core` | Tracks `AuditEventListener` services on the Whiteboard. `getListeners()` returns by-rank-desc; `hasListenerFor(domain)` is the per-domain pre-allocation gate consulted via `BufferSink.isEnabledFor(domain)`. |
 | `AuditConfigurationImpl` | `oak-core` | Pipeline owner — `FT_AUDIT` toggle, buffer, registry, sink, drain observer. OSGi-published as `AuditConfiguration`. |

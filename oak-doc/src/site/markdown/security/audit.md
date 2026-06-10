@@ -112,11 +112,14 @@ with three additional payload entries:
 | `commit.userId`    | acting user id (`CommitInfo.OAK_UNKNOWN` (`"oak:unknown"`) for system commits) | `CommitInfo.getUserId()` |
 | `commit.timestamp` | commit timestamp in milliseconds since epoch     | `CommitInfo.getDate()` |
 
-Events arriving through the fire-and-forget pipeline do NOT carry these keys.
-Consumers that need to tell the two sources apart inspect for the presence of
-`commit.sessionId`. The `commit.userId` value `CommitInfo.OAK_UNKNOWN`
-(`"oak:unknown"`) is a deliberate anonymity marker for system commits;
-listeners MUST NOT attempt to resolve it to a real user.
+Events arriving through the fire-and-forget pipeline cannot carry these keys:
+Oak strips caller-supplied values for exactly these three at dispatch, so for
+events delivered through Oak dispatch their presence is a reliable
+commit-attached signal (normative statement: the trust contract on
+`AuditEvent#getPayload()`). Consumers that need to tell the two sources apart
+inspect for the presence of `commit.sessionId`. The `commit.userId` value
+`CommitInfo.OAK_UNKNOWN` (`"oak:unknown"`) is a deliberate anonymity marker
+for system commits; listeners MUST NOT attempt to resolve it to a real user.
 
 <a name="pipelines"></a>
 ### Pipelines
@@ -173,11 +176,15 @@ Properties:
   subsequent JCR operations do not affect it.
 - **Synchronous on the calling thread.** Listeners performing I/O are
   responsible for wrapping themselves in an async dispatcher.
-- **Per-listener isolation.** Exceptions thrown by one listener are logged and
-  swallowed; remaining listeners still run. `emit` never propagates a listener
-  exception back to the caller.
-- **No payload decoration.** The event reaches listeners with exactly the
-  payload the caller provided. No `commit.*` keys are added.
+- **Per-listener isolation.** Exceptions thrown by one listener — from
+  `onEvents` or from the `getDomain()` / `getRank()` accessors consulted
+  during routing — are logged and swallowed; remaining listeners still run.
+  `emit` never propagates a listener exception back to the caller.
+- **No payload decoration — but reserved keys are stripped.** No `commit.*`
+  keys are added; caller-supplied values for the three reserved attestation
+  keys (`commit.sessionId`, `commit.userId`, `commit.timestamp`) are removed
+  before delivery. Every other entry reaches listeners exactly as the caller
+  provided it.
 
 <a name="pipeline_state_probe"></a>
 ### Probing Pipeline State
@@ -365,6 +372,9 @@ Contract notes:
 - **`getRank()`** orders listeners within a domain. Higher rank first.
   Default 0. Useful when one listener must observe state set by another (for
   example, a redaction listener running before a SIEM forwarder).
+- A listener whose `getDomain()` or `getRank()` throws is skipped for that
+  dispatch (logged at WARN once per listener instance) and picked up again
+  once the accessor stops throwing; other listeners are unaffected.
 - **`onEvents(List<AuditEvent>)`** is invoked with a non-empty, non-null list
   of events in capture order. The same method serves both pipelines:
   commit-attached events arrive in a batch sized by the originating session's
@@ -388,11 +398,16 @@ The fire-and-forget producer surface is open by design.
   bundle. Consumers that require Oak attestation MUST distinguish events at
   the consumer side.
 
-The distinguishing signal is payload-based: events produced by Oak's
-commit-attached pipeline carry the `commit.sessionId`, `commit.userId`, and
-`commit.timestamp` keys; fire-and-forget events do not. A SIEM forwarder that
-treats only the former as Oak-attested mutations is operating within the
-contract.
+The distinguishing signal is payload-based and enforced at dispatch: events
+produced by Oak's commit-attached pipeline carry the `commit.sessionId`,
+`commit.userId`, and `commit.timestamp` keys (unconditionally overwritten from
+the commit's `CommitInfo`); fire-and-forget events cannot carry them, because
+Oak strips caller-supplied values for exactly these three keys before
+delivery. A SIEM forwarder that treats only the former as Oak-attested
+mutations is operating within the contract. The normative statement —
+including the boundaries of the attestation (it applies to Oak dispatch only
+and does not survive re-emission) — is the trust contract on
+`AuditEvent#getPayload()`.
 
 The trade-off is explicit. The team explored a stricter design enforcing
 compile-time reserved domains and typed event subclasses, but settled on the
@@ -405,9 +420,9 @@ Recommended consumer-side discipline:
 
 | Need | Approach |
 |---|---|
-| Distinguish Oak-attested mutations from caller-asserted events. | Inspect for `commit.sessionId` in the payload. Present implies commit-attached. |
+| Distinguish Oak-attested mutations from caller-asserted events. | Inspect for `commit.sessionId` in the payload. Present implies commit-attached; anchor on the three reserved keys, not on the `commit.` prefix in general. |
 | Restrict trusted producers. | Maintain a consumer-side allowlist of trusted domain prefixes and reject unknown domains. |
-| Compliance audit (Oak-verified writes only). | Subscribe to `"oak.security"` and filter for events carrying the `commit.*` keys. |
+| Compliance audit (Oak-verified writes only). | Subscribe to `"oak.security"` and filter for events carrying the three reserved `commit.*` keys. |
 
 <a name="related_documentation"></a>
 ### Related documentation

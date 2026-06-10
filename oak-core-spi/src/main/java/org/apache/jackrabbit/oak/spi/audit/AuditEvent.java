@@ -33,8 +33,10 @@ import org.osgi.annotation.versioning.ProviderType;
  *       payload with {@code commit.sessionId}, {@code commit.userId},
  *       and {@code commit.timestamp} entries before dispatch.</li>
  *   <li>Any bundle calling {@link AuditEventEmitter#emit(AuditEvent)}.
- *       Such events carry the payload provided by the caller; Oak does
- *       not add or verify any fields.</li>
+ *       Such events carry the payload provided by the caller, except that
+ *       Oak strips caller-supplied values for the three reserved
+ *       {@code commit.*} attestation keys before dispatch — see the trust
+ *       contract on {@link #getPayload()}.</li>
  * </ul>
  * The {@link #getDomain()} value selects the listeners that receive this
  * event.
@@ -97,31 +99,42 @@ public interface AuditEvent {
      * success. Oak does not <em>add</em> these entries on the fire-and-forget
      * path (see the trust contract below).
      * <p>
-     * <strong>Trust contract.</strong> On the <em>commit-attached</em> path
-     * Oak <em>unconditionally overrides</em> exactly three payload keys with
-     * the values from {@code CommitInfo}: {@code commit.sessionId},
-     * {@code commit.userId} and {@code commit.timestamp} (via
-     * {@code CommitMetadataDecorator}); on that path those three cannot be
-     * forged by the caller. Every other {@code commit.*} key is forwarded
-     * verbatim from the caller-supplied payload — even on the commit path —
-     * and is untrusted; anchor trust on the three specific keys, never on the
-     * {@code commit.} prefix in general.
+     * <strong>Trust contract</strong> (normative — other audit SPI and
+     * implementation docs defer to this paragraph). For events delivered
+     * through Oak dispatch, the three reserved keys {@code commit.sessionId},
+     * {@code commit.userId} and {@code commit.timestamp} are Oak-attested:
+     * <ul>
+     *   <li>On the <em>commit-attached</em> path Oak <em>unconditionally
+     *       overwrites</em> the three keys with the values from
+     *       {@code CommitInfo} at drain time (via
+     *       {@code CommitMetadataDecorator}).</li>
+     *   <li>On the <em>fire-and-forget</em> path
+     *       ({@link AuditEventEmitter#emit(AuditEvent)} /
+     *       {@code AuditEvents.dispatch}) Oak <em>strips</em> caller-supplied
+     *       values for the same three keys before delivery.</li>
+     * </ul>
+     * A listener may therefore treat the presence of any of the three keys
+     * in a dispatched payload as "commit-attached event, values supplied by
+     * Oak". Every other entry — including other {@code commit.*}-prefixed
+     * keys — is forwarded verbatim from the caller-supplied payload on both
+     * paths and is untrusted: anchor trust on the three reserved keys, never
+     * on the {@code commit.} prefix in general.
      * <p>
-     * The <em>fire-and-forget</em> path
-     * ({@link AuditEventEmitter#emit(AuditEvent)} / {@code AuditEvents.dispatch})
-     * attests <strong>nothing</strong>: it forwards the caller payload
-     * undecorated, so a caller MAY itself populate {@code commit.sessionId} /
-     * {@code commit.userId} / {@code commit.timestamp} and Oak will neither
-     * overwrite nor strip them. A listener therefore <strong>cannot</strong>
-     * tell an Oak-attested commit-attached event from a fire-and-forget event
-     * that merely carries those keys by inspecting the payload alone — under
-     * Oak's open trust model the payload is never redacted or filtered at
-     * dispatch. The presence of {@code commit.*} keys is therefore
-     * <strong>not</strong> a trustworthy attestation signal: the listener SPI
-     * delivers both the commit-attached and fire-and-forget paths through the
-     * same {@code AuditEventListener.onEvents} with no path indicator, so trust
-     * in commit identity must be established by constraining which bundles may
-     * emit (a deployment-level control), not inferred from the payload.
+     * Boundaries of the attestation:
+     * <ul>
+     *   <li><em>Oak dispatch only.</em> Code that invokes
+     *       {@code AuditEventListener.onEvents(...)} directly bypasses both
+     *       the overwrite and the strip; constraining which bundles can do
+     *       that is a deployment-level control.</li>
+     *   <li><em>Attestation does not survive re-emission.</em> A forwarder
+     *       that copies a commit-attached payload into a new event and
+     *       re-emits it via {@code emit(...)} gets the three keys stripped
+     *       again — the re-emitted event is no longer the Oak-attested
+     *       original.</li>
+     *   <li><em>No redaction.</em> Apart from the three reserved keys on the
+     *       fire-and-forget path, the payload is never filtered at dispatch;
+     *       the producer-side hygiene rules on {@link #of} still apply.</li>
+     * </ul>
      *
      * @return non-null, immutable payload map.
      */

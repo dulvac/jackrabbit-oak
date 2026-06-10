@@ -42,15 +42,17 @@ import org.slf4j.LoggerFactory;
  * is unmodifiable.
  *
  * <h3>Security invariant</h3>
- * Caller-supplied {@link #KEY_SESSION_ID}, {@link #KEY_USER_ID}, and
- * {@link #KEY_TIMESTAMP} entries in the input payload are
- * <strong>unconditionally overwritten</strong> with the values from the
- * {@link CommitInfo} captured for the surrounding commit. This invariant
- * is what allows listeners to treat the presence of {@code commit.*} keys
- * as Oak-attested — see the trust contract on
- * {@link org.apache.jackrabbit.oak.spi.audit.AuditEvent#getPayload()}.
- * Any change to {@code putIfAbsent} / {@code computeIfAbsent} / conditional
- * {@code put} for these keys is a regression in the trust model.
+ * Both halves enforce the same property: listeners can treat the presence
+ * of {@link #KEY_SESSION_ID}, {@link #KEY_USER_ID}, or {@link #KEY_TIMESTAMP}
+ * in a dispatched payload as Oak-attested — see the normative trust contract
+ * on {@link org.apache.jackrabbit.oak.spi.audit.AuditEvent#getPayload()}.
+ * {@link #decorate} <strong>unconditionally overwrites</strong> the three
+ * keys with the values from the {@link CommitInfo} captured for the
+ * surrounding commit; {@link #stripReservedCommitKeys} removes
+ * caller-supplied values for the same keys on the fire-and-forget path.
+ * Weakening either half — {@code putIfAbsent} / {@code computeIfAbsent} /
+ * conditional {@code put} in the decorator, or skipping the strip at
+ * dispatch — is a regression in the trust model.
  *
  * <h3>Payload null-value contract</h3>
  * The decorator trusts the no-null-keys/no-null-values contract documented

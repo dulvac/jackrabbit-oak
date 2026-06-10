@@ -42,8 +42,9 @@ import org.apache.jackrabbit.oak.spi.security.audit.SecurityAuditDomain;
  * can still call {@link AuditEvent#of(String, String, java.util.Map)}
  * directly with this domain + a type from this class). Listeners that
  * need to distinguish Oak-attested events from fire-and-forget emissions
- * MUST check the {@code commit.*} keys in the payload — see the trust
- * contract on {@link AuditEvent#getPayload()}.
+ * MUST check the three reserved {@code commit.*} keys in the payload —
+ * a reliable signal for events delivered through Oak dispatch; see the
+ * trust contract on {@link AuditEvent#getPayload()}.
  */
 public final class UserAuditTypes {
 

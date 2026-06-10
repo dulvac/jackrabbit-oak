@@ -31,13 +31,16 @@ import org.osgi.annotation.versioning.ConsumerType;
  * dispatching thread; expensive work (I/O, fan-out, persistence) belongs
  * in an async wrapper provided by the consumer.
  * <p>
- * Exceptions and Errors thrown from {@link #onEvents} are caught, logged
- * at {@code WARN}, and swallowed by the dispatcher; they never propagate
- * back to the dispatching thread. The dispatcher swallows {@link Throwable}
- * broadly to ensure that one misconfigured listener (e.g., a
- * {@link LinkageError} from a missing transitive dependency) cannot
- * prevent other listeners from receiving events or abort the surrounding
- * commit.
+ * Exceptions and Errors thrown from {@link #onEvents} — or from the
+ * {@link #getDomain()} / {@link #getRank()} accessors consulted during
+ * routing — are caught, logged at {@code WARN}, and swallowed by the
+ * dispatcher; they never propagate back to the dispatching thread. The
+ * dispatcher swallows {@link Throwable} broadly to ensure that one
+ * misconfigured listener (e.g., a {@link LinkageError} from a missing
+ * transitive dependency) cannot prevent other listeners from receiving
+ * events or abort the surrounding commit. A listener whose accessor
+ * throws is skipped for that dispatch (it receives nothing) and is
+ * picked up again once the accessor stops throwing.
  * <p>
  * Listener invocation order is determined by {@link #getRank()} (higher
  * value first). The dispatcher applies a stable sort, so listeners with
@@ -54,11 +57,15 @@ import org.osgi.annotation.versioning.ConsumerType;
  *       resolve it to a real user identity.</li>
  *   <li>Any bundle calling {@link AuditEventEmitter#emit(AuditEvent)}.
  *       The accuracy of such events is the emitting bundle's responsibility;
- *       Oak does not verify them. They do not carry the {@code commit.*}
- *       payload entries.</li>
+ *       Oak does not verify them. They cannot carry the three reserved
+ *       {@code commit.*} keys — Oak strips caller-supplied values for them
+ *       before delivery. Other {@code commit.*}-prefixed keys are forwarded
+ *       verbatim and are untrusted.</li>
  * </ul>
- * Consumers that need to distinguish between the two sources should
- * inspect the payload for the {@code commit.sessionId} key.
+ * Consumers that need to distinguish between the two sources can rely on
+ * the presence of the {@code commit.sessionId} key — the normative
+ * statement and the boundaries of this attestation are documented on
+ * {@link AuditEvent#getPayload()}.
  */
 @ConsumerType
 public interface AuditEventListener {
@@ -68,7 +75,9 @@ public interface AuditEventListener {
      * queries {@code getDomain()} on every dispatch (no cache), so
      * implementations must return a stable value across the listener's
      * lifetime — if the value changes between dispatches the listener
-     * may silently start or stop receiving events.
+     * may silently start or stop receiving events. If it throws, the
+     * listener is skipped for that dispatch — see the Throwable-isolation
+     * note in the class Javadoc.
      *
      * @return non-null domain name.
      */

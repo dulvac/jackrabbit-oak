@@ -35,21 +35,24 @@ import org.osgi.annotation.versioning.ProviderType;
  * listeners registered for the event's domain. Not tied to any commit;
  * not buffered; not rolled back on failure.
  * <p>
- * Listeners are invoked under per-listener try/catch isolation: one
- * listener throwing does not prevent others from running. Any
- * {@link Throwable} (including {@link RuntimeException} and {@link Error}
- * subclasses such as {@link LinkageError}) is logged at {@code WARN} and
- * never propagates back to the caller. The barrier catches {@code Throwable}
- * rather than {@code RuntimeException} so JVM-level failures from a
- * misconfigured consumer bundle (missing transitive dependency,
- * {@link OutOfMemoryError}, etc.) cannot prevent other listeners from
- * receiving the event.
+ * Listeners are invoked under per-listener try/catch isolation — covering
+ * the {@link AuditEventListener#getDomain()} routing lookup as well as
+ * {@code onEvents()}: one listener throwing does not prevent others from
+ * running. Any {@link Throwable} (including {@link RuntimeException} and
+ * {@link Error} subclasses such as {@link LinkageError}) is logged at
+ * {@code WARN} and never propagates back to the caller. The barrier catches
+ * {@code Throwable} rather than {@code RuntimeException} so JVM-level
+ * failures from a misconfigured consumer bundle (missing transitive
+ * dependency, {@link OutOfMemoryError}, etc.) cannot prevent other
+ * listeners from receiving the event.
  * <p>
  * <strong>Trust model:</strong> any bundle that resolves this service can
  * emit any event for any domain. The event payload reflects the emitting
- * bundle's claim; Oak does not verify it. See
- * {@link AuditEventListener} class-level Javadoc for the listener-side
- * trust contract.
+ * bundle's claim; Oak does not verify it — except that caller-supplied
+ * values for the three reserved {@code commit.*} attestation keys are
+ * stripped before delivery. The normative statement is the trust contract
+ * on {@link AuditEvent#getPayload()}; see {@link AuditEventListener} for
+ * the listener-side view.
  */
 @ProviderType
 public interface AuditEventEmitter {

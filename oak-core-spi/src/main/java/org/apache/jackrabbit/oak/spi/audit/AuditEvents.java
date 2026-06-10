@@ -59,7 +59,10 @@ public final class AuditEvents {
         /**
          * Fire-and-forget path. Dispatches the event synchronously on the
          * calling thread to all listeners registered for its domain. Not
-         * buffered; not tied to any commit.
+         * buffered; not tied to any commit. Caller-supplied values for the
+         * three reserved {@code commit.*} attestation keys are stripped
+         * before delivery — see the trust contract on
+         * {@link AuditEvent#getPayload()}.
          */
         void dispatch(@NotNull AuditEvent event);
     }
