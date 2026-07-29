@@ -163,7 +163,7 @@ public class AuditWiringTest {
     /**
      * The capture-site in {@code UserManagerImpl.addMember} fires an audit
      * event with domain {@link SecurityAuditDomain#NAME} and type
-     * {@link UserAuditTypes#USER_MEMBER_ADDED} on successful group
+     * {@link UserAuditTypes#MEMBER_ADDED} on successful group
      * update; the event must traverse the entire pipeline to the
      * registered listener with the commit metadata decorated.
      */
@@ -188,18 +188,19 @@ public class AuditWiringTest {
             assertNotNull(testGroup);
             assertNotNull(testUser);
             String groupPath = testGroup.getPath();
+            String memberId = testUser.getID();
             String memberPath = testUser.getPath();
 
             assertTrue("addMember must succeed", testGroup.addMember(testUser));
             root.commit();
 
-            // Exactly one user.member.added event must have traversed the
+            // Exactly one membership.added event must have traversed the
             // entire pipeline.
             assertEquals("exactly one member-added audit event must arrive",
                     1, received.size());
             AuditEvent event = received.get(0);
             assertEquals(SecurityAuditDomain.NAME, event.getDomain());
-            assertEquals(UserAuditTypes.USER_MEMBER_ADDED, event.getType());
+            assertEquals(UserAuditTypes.MEMBER_ADDED, event.getType());
 
             Map<String, Object> payload = event.getPayload();
             // Commit metadata decorated by AuditDrainObserver (via CommitMetadataDecorator).
@@ -213,7 +214,8 @@ public class AuditWiringTest {
             // so a future refactor that left the keys but lost the values
             // (e.g. wrong getPath() variable in the capture site) is caught.
             assertEquals(groupPath, payload.get(UserAuditTypes.PAYLOAD_GROUP_PATH));
-            assertEquals(memberPath, payload.get(UserAuditTypes.PAYLOAD_MEMBER_PATH));
+            assertEquals(List.of(memberId), payload.get(UserAuditTypes.PAYLOAD_MEMBER_IDS));
+            assertEquals(List.of(memberPath), payload.get(UserAuditTypes.PAYLOAD_MEMBER_PATHS));
         }
     }
 
@@ -221,7 +223,7 @@ public class AuditWiringTest {
      * Symmetric to {@link #groupAddMemberFiresUserMemberAddedEndToEnd()}:
      * the capture-site in {@code UserManagerImpl.removeMember} fires an
      * audit event with type
-     * {@link UserAuditTypes#USER_MEMBER_REMOVED} on successful group
+     * {@link UserAuditTypes#MEMBER_REMOVED} on successful group
      * update. Exercises the {@code isRemove=true} branch of
      * {@code recordSingleMembershipAuditEvent} end-to-end through the
      * entire pipeline.
@@ -245,7 +247,7 @@ public class AuditWiringTest {
             assertTrue("addMember setup must succeed", testGroup.addMember(testUser));
             root.commit();
 
-            // Clear received — the setup-commit emits user.member.added,
+            // Clear received — the setup-commit emits membership.added,
             // not the event we want to pin here.
             received.clear();
             root = session.getLatestRoot();
@@ -255,6 +257,7 @@ public class AuditWiringTest {
             assertNotNull(testGroup);
             assertNotNull(testUser);
             String groupPath = testGroup.getPath();
+            String memberId = testUser.getID();
             String memberPath = testUser.getPath();
 
             // Act: remove the member and commit.
@@ -265,13 +268,14 @@ public class AuditWiringTest {
                     1, received.size());
             AuditEvent event = received.get(0);
             assertEquals(SecurityAuditDomain.NAME, event.getDomain());
-            assertEquals(UserAuditTypes.USER_MEMBER_REMOVED, event.getType());
+            assertEquals(UserAuditTypes.MEMBER_REMOVED, event.getType());
 
             Map<String, Object> payload = event.getPayload();
             assertTrue("commit.sessionId must be decorated",
                     payload.containsKey("commit.sessionId"));
             assertEquals(groupPath, payload.get(UserAuditTypes.PAYLOAD_GROUP_PATH));
-            assertEquals(memberPath, payload.get(UserAuditTypes.PAYLOAD_MEMBER_PATH));
+            assertEquals(List.of(memberId), payload.get(UserAuditTypes.PAYLOAD_MEMBER_IDS));
+            assertEquals(List.of(memberPath), payload.get(UserAuditTypes.PAYLOAD_MEMBER_PATHS));
         }
     }
 

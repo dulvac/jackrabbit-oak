@@ -427,10 +427,11 @@ public class UserManagerImpl implements UserManager {
     private void recordSingleMembershipAuditEvent(@NotNull Group group, boolean isRemove, @NotNull Authorizable member) {
         try {
             String groupPath = group.getPath();
+            String memberId = member.getID();
             String memberPath = member.getPath();
             AuditEvents.record(root, isRemove
-                    ? UserAuditEvents.memberRemoved(groupPath, memberPath)
-                    : UserAuditEvents.memberAdded(groupPath, memberPath));
+                    ? UserAuditEvents.memberRemoved(groupPath, memberId, memberPath)
+                    : UserAuditEvents.memberAdded(groupPath, memberId, memberPath));
         } catch (RepositoryException e) {
             // Path resolution failed — drop the event rather than fail the
             // surrounding group update. It is an audit-completeness signal:

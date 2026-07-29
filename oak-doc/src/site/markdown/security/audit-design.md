@@ -183,7 +183,7 @@ public interface AuditConfiguration {
 
 Per-sub-domain type-string vocabulary lives alongside the SPI it describes. Today only user-membership events ship:
 
-- `oak-security-spi/.../spi/security/user/UserAuditTypes` — type strings (`USER_MEMBER_ADDED`, `USER_MEMBERS_ADDED_BULK`, etc.) and payload keys (`PAYLOAD_GROUP_PATH`, `PAYLOAD_MEMBER_IDS`, etc.). Listener bundles compile-time-reference these to discriminate user events.
+- `oak-security-spi/.../spi/security/user/UserAuditTypes` — type strings (`MEMBER_ADDED`, `MEMBER_REMOVED`) and payload keys (`PAYLOAD_GROUP_PATH`, `PAYLOAD_MEMBER_IDS`, `PAYLOAD_MEMBER_PATHS`, `PAYLOAD_MEMBERSHIP_SOURCE`, `PAYLOAD_IS_CONTENT_ID`, `PAYLOAD_FAILED_IDS`). A single and a bulk membership change share the same type; a bulk change is one whose `PAYLOAD_MEMBER_IDS` list holds more than one entry. Listener bundles compile-time-reference these to discriminate user events.
 
 Future ACL / principal / token events declare their own per-sub-domain `*AuditTypes` classes in the respective SPI sub-packages.
 

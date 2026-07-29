@@ -35,33 +35,40 @@ public class UserAuditEventsTest {
 
     private static final String GROUP = "/rep:security/groups/g1";
     private static final String MEMBER = "/rep:security/users/u1";
+    private static final String MEMBER_ID = "u1";
 
     //-------------------------------------------------< memberAdded / Removed >---
 
     @Test
     public void memberAddedReturnsExpectedDomainTypeAndPayload() {
-        AuditEvent e = UserAuditEvents.memberAdded(GROUP, MEMBER);
+        AuditEvent e = UserAuditEvents.memberAdded(GROUP, MEMBER_ID, MEMBER);
 
         assertNotNull(e);
         assertEquals(SecurityAuditDomain.NAME, e.getDomain());
-        assertEquals(UserAuditTypes.USER_MEMBER_ADDED, e.getType());
+        assertEquals(UserAuditTypes.MEMBER_ADDED, e.getType());
         assertEquals(
                 Map.of(
                         UserAuditTypes.PAYLOAD_GROUP_PATH, GROUP,
-                        UserAuditTypes.PAYLOAD_MEMBER_PATH, MEMBER),
+                        UserAuditTypes.PAYLOAD_MEMBER_IDS, List.of(MEMBER_ID),
+                        UserAuditTypes.PAYLOAD_MEMBER_PATHS, List.of(MEMBER),
+                        UserAuditTypes.PAYLOAD_MEMBERSHIP_SOURCE, UserAuditTypes.MEMBERSHIP_SOURCE_STATIC,
+                        UserAuditTypes.PAYLOAD_IS_CONTENT_ID, Boolean.FALSE),
                 e.getPayload());
     }
 
     @Test
     public void memberRemovedReturnsExpectedDomainTypeAndPayload() {
-        AuditEvent e = UserAuditEvents.memberRemoved(GROUP, MEMBER);
+        AuditEvent e = UserAuditEvents.memberRemoved(GROUP, MEMBER_ID, MEMBER);
 
         assertEquals(SecurityAuditDomain.NAME, e.getDomain());
-        assertEquals(UserAuditTypes.USER_MEMBER_REMOVED, e.getType());
+        assertEquals(UserAuditTypes.MEMBER_REMOVED, e.getType());
         assertEquals(
                 Map.of(
                         UserAuditTypes.PAYLOAD_GROUP_PATH, GROUP,
-                        UserAuditTypes.PAYLOAD_MEMBER_PATH, MEMBER),
+                        UserAuditTypes.PAYLOAD_MEMBER_IDS, List.of(MEMBER_ID),
+                        UserAuditTypes.PAYLOAD_MEMBER_PATHS, List.of(MEMBER),
+                        UserAuditTypes.PAYLOAD_MEMBERSHIP_SOURCE, UserAuditTypes.MEMBERSHIP_SOURCE_STATIC,
+                        UserAuditTypes.PAYLOAD_IS_CONTENT_ID, Boolean.FALSE),
                 e.getPayload());
     }
 
@@ -74,8 +81,10 @@ public class UserAuditEventsTest {
         AuditEvent e = UserAuditEvents.membersAddedBulk(GROUP, members, false, failed);
 
         assertEquals(SecurityAuditDomain.NAME, e.getDomain());
-        assertEquals(UserAuditTypes.USER_MEMBERS_ADDED_BULK, e.getType());
+        assertEquals(UserAuditTypes.MEMBER_ADDED, e.getType());
         assertEquals(GROUP, e.getPayload().get(UserAuditTypes.PAYLOAD_GROUP_PATH));
+        assertEquals(UserAuditTypes.MEMBERSHIP_SOURCE_STATIC,
+                e.getPayload().get(UserAuditTypes.PAYLOAD_MEMBERSHIP_SOURCE));
         assertEquals(Boolean.FALSE, e.getPayload().get(UserAuditTypes.PAYLOAD_IS_CONTENT_ID));
 
         // Payload uses List<String> (insertion-order, serializer-friendly).
@@ -129,7 +138,7 @@ public class UserAuditEventsTest {
         AuditEvent e = UserAuditEvents.membersRemovedBulk(GROUP, members, true, failed);
 
         assertEquals(SecurityAuditDomain.NAME, e.getDomain());
-        assertEquals(UserAuditTypes.USER_MEMBERS_REMOVED_BULK, e.getType());
+        assertEquals(UserAuditTypes.MEMBER_REMOVED, e.getType());
         assertEquals(GROUP, e.getPayload().get(UserAuditTypes.PAYLOAD_GROUP_PATH));
         assertEquals(Boolean.TRUE, e.getPayload().get(UserAuditTypes.PAYLOAD_IS_CONTENT_ID));
 

@@ -76,7 +76,7 @@ public interface AuditEvent {
   Bundles defining new event types choose their own domain string; the SPI
   imposes no schema.
 - **Type** — stable identifier within the domain (e.g.
-  `"user.member.added"`). Used by consumers to dispatch on specific event
+  `"membership.added"`). Used by consumers to dispatch on specific event
   shapes.
 - **Timestamp** — milliseconds since epoch at the time the event was
   constructed.
@@ -91,9 +91,9 @@ rather than by `instanceof` checks against typed subclasses.
 The `oak.security` domain pins its type-string and payload-key constants
 in per-sub-domain classes alongside the security area they describe —
 e.g., user-membership types live in `UserAuditTypes` in the
-`spi.security.user` package (`USER_MEMBER_ADDED`, `PAYLOAD_GROUP_PATH`,
+`spi.security.user` package (`MEMBER_ADDED`, `PAYLOAD_GROUP_PATH`,
 etc.). Capture sites inside Oak use package-local factory helpers
-(e.g., `UserAuditEvents.memberAdded(groupPath, memberPath)` in
+(e.g., `UserAuditEvents.memberAdded(groupPath, memberId, memberPath)` in
 `oak-core/.../security/user/`) which wrap the factory + constants for
 ergonomic call sites; listeners receive plain `AuditEvent` instances
 and never see the helper. Bundles emitting custom events implement

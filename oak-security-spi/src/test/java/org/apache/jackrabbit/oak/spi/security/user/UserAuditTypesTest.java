@@ -67,17 +67,16 @@ public class UserAuditTypesTest {
 
     private static List<String> typeStrings() {
         return List.of(
-                UserAuditTypes.USER_MEMBER_ADDED,
-                UserAuditTypes.USER_MEMBER_REMOVED,
-                UserAuditTypes.USER_MEMBERS_ADDED_BULK,
-                UserAuditTypes.USER_MEMBERS_REMOVED_BULK);
+                UserAuditTypes.MEMBER_ADDED,
+                UserAuditTypes.MEMBER_REMOVED);
     }
 
     private static List<String> payloadKeys() {
         return List.of(
                 UserAuditTypes.PAYLOAD_GROUP_PATH,
-                UserAuditTypes.PAYLOAD_MEMBER_PATH,
                 UserAuditTypes.PAYLOAD_MEMBER_IDS,
+                UserAuditTypes.PAYLOAD_MEMBER_PATHS,
+                UserAuditTypes.PAYLOAD_MEMBERSHIP_SOURCE,
                 UserAuditTypes.PAYLOAD_IS_CONTENT_ID,
                 UserAuditTypes.PAYLOAD_FAILED_IDS);
     }

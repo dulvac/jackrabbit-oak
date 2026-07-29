@@ -45,13 +45,13 @@ public class AuditEventTest {
     @Test
     public void factoryWithPayloadReturnsEventWithSuppliedFields() {
         long before = System.currentTimeMillis();
-        AuditEvent e = AuditEvent.of("test.domain", "user.member.added",
+        AuditEvent e = AuditEvent.of("test.domain", "membership.added",
                 Map.of("groupPath", "/g", "memberPath", "/u"));
         long after = System.currentTimeMillis();
 
         assertNotNull(e);
         assertEquals("test.domain", e.getDomain());
-        assertEquals("user.member.added", e.getType());
+        assertEquals("membership.added", e.getType());
         assertEquals(Map.of("groupPath", "/g", "memberPath", "/u"), e.getPayload());
         // Capture timestamp is taken inside of(...) — must fall within the
         // call window observed by the test thread.
@@ -61,9 +61,9 @@ public class AuditEventTest {
 
     @Test
     public void factoryWithoutPayloadReturnsEventWithEmptyPayload() {
-        AuditEvent e = AuditEvent.of("test.domain", "user.member.removed");
+        AuditEvent e = AuditEvent.of("test.domain", "membership.removed");
         assertEquals("test.domain", e.getDomain());
-        assertEquals("user.member.removed", e.getType());
+        assertEquals("membership.removed", e.getType());
         assertEquals(Collections.emptyMap(), e.getPayload());
     }
 

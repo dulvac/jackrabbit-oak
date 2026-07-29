@@ -112,10 +112,11 @@ public class UserManagerImplAuditTest extends AbstractSecurityTest {
             assertEquals(1, recordedEvents.size());
             AuditEvent e = recordedEvents.get(0);
             assertEquals(SecurityAuditDomain.NAME, e.getDomain());
-            assertEquals(UserAuditTypes.USER_MEMBER_ADDED, e.getType());
+            assertEquals(UserAuditTypes.MEMBER_ADDED, e.getType());
             Map<String, Object> payload = e.getPayload();
             assertEquals(group.getPath(), payload.get(UserAuditTypes.PAYLOAD_GROUP_PATH));
-            assertEquals(user.getPath(), payload.get(UserAuditTypes.PAYLOAD_MEMBER_PATH));
+            assertEquals(List.of(user.getID()), payload.get(UserAuditTypes.PAYLOAD_MEMBER_IDS));
+            assertEquals(List.of(user.getPath()), payload.get(UserAuditTypes.PAYLOAD_MEMBER_PATHS));
         } finally {
             group.remove();
             root.commit();
@@ -132,10 +133,11 @@ public class UserManagerImplAuditTest extends AbstractSecurityTest {
             assertEquals(1, recordedEvents.size());
             AuditEvent e = recordedEvents.get(0);
             assertEquals(SecurityAuditDomain.NAME, e.getDomain());
-            assertEquals(UserAuditTypes.USER_MEMBER_REMOVED, e.getType());
+            assertEquals(UserAuditTypes.MEMBER_REMOVED, e.getType());
             Map<String, Object> payload = e.getPayload();
             assertEquals(group.getPath(), payload.get(UserAuditTypes.PAYLOAD_GROUP_PATH));
-            assertEquals(user.getPath(), payload.get(UserAuditTypes.PAYLOAD_MEMBER_PATH));
+            assertEquals(List.of(user.getID()), payload.get(UserAuditTypes.PAYLOAD_MEMBER_IDS));
+            assertEquals(List.of(user.getPath()), payload.get(UserAuditTypes.PAYLOAD_MEMBER_PATHS));
         } finally {
             group.remove();
             root.commit();
@@ -153,9 +155,11 @@ public class UserManagerImplAuditTest extends AbstractSecurityTest {
             assertEquals(1, recordedEvents.size());
             AuditEvent e = recordedEvents.get(0);
             assertEquals(SecurityAuditDomain.NAME, e.getDomain());
-            assertEquals(UserAuditTypes.USER_MEMBERS_ADDED_BULK, e.getType());
+            assertEquals(UserAuditTypes.MEMBER_ADDED, e.getType());
             Map<String, Object> payload = e.getPayload();
             assertEquals(group.getPath(), payload.get(UserAuditTypes.PAYLOAD_GROUP_PATH));
+            assertEquals(UserAuditTypes.MEMBERSHIP_SOURCE_STATIC,
+                    payload.get(UserAuditTypes.PAYLOAD_MEMBERSHIP_SOURCE));
             assertEquals(Boolean.FALSE, payload.get(UserAuditTypes.PAYLOAD_IS_CONTENT_ID));
             assertEquals(List.of("memberId"), payload.get(UserAuditTypes.PAYLOAD_MEMBER_IDS));
             assertEquals(List.of(), payload.get(UserAuditTypes.PAYLOAD_FAILED_IDS));
@@ -176,7 +180,7 @@ public class UserManagerImplAuditTest extends AbstractSecurityTest {
             assertEquals(1, recordedEvents.size());
             AuditEvent e = recordedEvents.get(0);
             assertEquals(SecurityAuditDomain.NAME, e.getDomain());
-            assertEquals(UserAuditTypes.USER_MEMBERS_REMOVED_BULK, e.getType());
+            assertEquals(UserAuditTypes.MEMBER_REMOVED, e.getType());
             Map<String, Object> payload = e.getPayload();
             assertEquals(group.getPath(), payload.get(UserAuditTypes.PAYLOAD_GROUP_PATH));
             assertEquals(Boolean.FALSE, payload.get(UserAuditTypes.PAYLOAD_IS_CONTENT_ID));
@@ -342,7 +346,7 @@ public class UserManagerImplAuditTest extends AbstractSecurityTest {
                     Collections.emptySet());
             assertEquals(1, recordedEvents.size());
             AuditEvent e = recordedEvents.get(0);
-            assertEquals(UserAuditTypes.USER_MEMBERS_ADDED_BULK, e.getType());
+            assertEquals(UserAuditTypes.MEMBER_ADDED, e.getType());
             assertEquals(Boolean.TRUE,
                     e.getPayload().get(UserAuditTypes.PAYLOAD_IS_CONTENT_ID));
         } finally {

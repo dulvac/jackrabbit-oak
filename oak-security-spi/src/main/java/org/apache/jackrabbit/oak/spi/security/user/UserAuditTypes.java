@@ -26,13 +26,18 @@ import org.apache.jackrabbit.oak.spi.security.audit.SecurityAuditDomain;
  * <p>
  * Listener bundles discriminate user-management events by combining
  * {@code event.getDomain().equals(SecurityAuditDomain.NAME)} with
- * {@code event.getType().equals(UserAuditTypes.USER_MEMBER_ADDED)}
- * (or another constant declared here).
+ * {@code event.getType().equals(UserAuditTypes.MEMBER_ADDED)} (or another
+ * constant declared here).
  * <p>
- * Each {@code USER_*} constant is paired with Javadoc describing which
- * {@code PAYLOAD_*} keys its events carry. Future sub-domains under
- * {@code oak.security} (ACL, principal, token) declare their own
- * type-string classes alongside their respective configuration packages.
+ * A single membership add or remove and a bulk one share the same type
+ * string ({@link #MEMBER_ADDED} / {@link #MEMBER_REMOVED}); a bulk change is
+ * simply an event whose {@link #PAYLOAD_MEMBER_IDS} list holds more than one
+ * entry. Consumers that need a bulk/single flag derive it from the list size
+ * rather than from a distinct type.
+ * <p>
+ * Future sub-domains under {@code oak.security} (ACL, principal, token)
+ * declare their own type-string classes alongside their respective
+ * configuration packages.
  * <p>
  * <strong>Asymmetric exposure.</strong> This class is the read-side
  * vocabulary; the producer-side factories ({@code UserAuditEvents} in
@@ -42,64 +47,84 @@ import org.apache.jackrabbit.oak.spi.security.audit.SecurityAuditDomain;
  * can still call {@link AuditEvent#of(String, String, java.util.Map)}
  * directly with this domain + a type from this class). Listeners that
  * need to distinguish Oak-attested events from fire-and-forget emissions
- * MUST check the three reserved {@code commit.*} keys in the payload —
- * a reliable signal for events delivered through Oak dispatch; see the
- * trust contract on {@link AuditEvent#getPayload()}.
+ * MUST check the reserved {@code commit.*} keys in the payload — a reliable
+ * signal for events delivered through Oak dispatch; see the trust contract
+ * on {@link AuditEvent#getPayload()}.
  */
 public final class UserAuditTypes {
 
     // ── Type strings ──────────────────────────────────────────────────
 
     /**
-     * Recorded when a single authorizable is added as a member of a group.
-     * Payload keys: {@link #PAYLOAD_GROUP_PATH}, {@link #PAYLOAD_MEMBER_PATH}.
+     * Recorded when one or more authorizables are added as members of a
+     * group. A single {@code Group.addMember} and a bulk
+     * {@code Group.addMembers} share this type; discriminate by the size of
+     * {@link #PAYLOAD_MEMBER_IDS}.
+     * <p>
+     * Payload keys: {@link #PAYLOAD_GROUP_PATH}, {@link #PAYLOAD_MEMBER_IDS},
+     * {@link #PAYLOAD_MEMBERSHIP_SOURCE}, {@link #PAYLOAD_IS_CONTENT_ID}, and —
+     * for single-member changes — {@link #PAYLOAD_MEMBER_PATHS}; bulk changes
+     * additionally carry {@link #PAYLOAD_FAILED_IDS}.
      */
-    public static final String USER_MEMBER_ADDED = "user.member.added";
+    public static final String MEMBER_ADDED = "membership.added";
 
     /**
-     * Recorded when a single authorizable is removed from a group.
-     * Payload keys: {@link #PAYLOAD_GROUP_PATH}, {@link #PAYLOAD_MEMBER_PATH}.
+     * Recorded when one or more authorizables are removed from a group.
+     * Single and bulk removes share this type; discriminate by the size of
+     * {@link #PAYLOAD_MEMBER_IDS}. Payload keys: same as {@link #MEMBER_ADDED}.
      */
-    public static final String USER_MEMBER_REMOVED = "user.member.removed";
-
-    /**
-     * Recorded when multiple authorizables are added to a group in a single
-     * API call. Payload keys: {@link #PAYLOAD_GROUP_PATH},
-     * {@link #PAYLOAD_MEMBER_IDS}, {@link #PAYLOAD_IS_CONTENT_ID},
-     * {@link #PAYLOAD_FAILED_IDS}.
-     */
-    public static final String USER_MEMBERS_ADDED_BULK = "user.members.added.bulk";
-
-    /**
-     * Recorded when multiple authorizables are removed from a group in a
-     * single API call. Payload keys: same as
-     * {@link #USER_MEMBERS_ADDED_BULK}.
-     */
-    public static final String USER_MEMBERS_REMOVED_BULK = "user.members.removed.bulk";
+    public static final String MEMBER_REMOVED = "membership.removed";
 
     // ── Payload keys ──────────────────────────────────────────────────
 
     /** Group path. Value type: {@code String}. */
     public static final String PAYLOAD_GROUP_PATH = "groupPath";
 
-    /** Member path. Value type: {@code String}. */
-    public static final String PAYLOAD_MEMBER_PATH = "memberPath";
-
-    /** Successfully-staged member IDs. Value type: {@code List<String>}. */
+    /**
+     * Member identifiers added or removed. Value type: {@code List<String>};
+     * always present with at least one entry. Entries are content ids (UUIDs
+     * from {@code rep:members}) when {@link #PAYLOAD_IS_CONTENT_ID} is
+     * {@code true}, otherwise authorizable ids.
+     */
     public static final String PAYLOAD_MEMBER_IDS = "memberIds";
 
     /**
-     * {@code true} when {@link #PAYLOAD_MEMBER_IDS} carries content IDs
+     * JCR paths of the members, when the producer resolved them. Value type:
+     * {@code List<String>}. Present on single-member changes; the bulk path
+     * carries ids only and omits this key.
+     */
+    public static final String PAYLOAD_MEMBER_PATHS = "memberPaths";
+
+    /**
+     * Oak membership storage model the change applied to. Value type:
+     * {@code String}. User-management API capture always writes the group's
+     * {@code rep:members}, so this key is {@link #MEMBERSHIP_SOURCE_STATIC}.
+     */
+    public static final String PAYLOAD_MEMBERSHIP_SOURCE = "membershipSource";
+
+    /**
+     * {@code true} when {@link #PAYLOAD_MEMBER_IDS} carries content ids
      * (UUIDs from {@code rep:members}); {@code false} when they are
-     * authorizable IDs. Value type: {@code Boolean}.
+     * authorizable ids. Value type: {@code Boolean}.
      */
     public static final String PAYLOAD_IS_CONTENT_ID = "isContentId";
 
     /**
-     * IDs that failed to stage. Value type: {@code List<String>}; may be
-     * empty but never null.
+     * Ids that failed to stage (already-member, not-found, etc.). Value type:
+     * {@code List<String>}; may be empty but never null. Carried on the bulk
+     * path only.
      */
     public static final String PAYLOAD_FAILED_IDS = "failedIds";
+
+    // ── Membership-source values ──────────────────────────────────────
+
+    /**
+     * {@link #PAYLOAD_MEMBERSHIP_SOURCE} value for changes written to a
+     * group's {@code rep:members} — the model produced by the user-management
+     * API. Other storage models ({@code static-sharded}, {@code dynamic},
+     * {@code dynamic-external}) are not produced by these capture sites.
+     */
+    public static final String MEMBERSHIP_SOURCE_STATIC = "static";
 
     private UserAuditTypes() {
         // constants

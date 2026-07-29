@@ -39,7 +39,7 @@ Commit-attached path (Oak-internal capture sites)
   UserManagerImpl.recordSingleMembershipAuditEvent      [oak-core]
       |
       v
-  UserAuditEvents.memberAdded(groupPath, memberPath)    [oak-core, package-private]
+  UserAuditEvents.memberAdded(groupPath, memberId, memberPath)  [oak-core, package-private]
       |
       v
   AuditEvents.record(root, event)                       [oak-core-spi static facade]
